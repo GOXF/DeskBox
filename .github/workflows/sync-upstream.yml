@@ -1,0 +1,62 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'   # 每 6 小时检查一次上游
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: custom
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Fetch upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Tianyu199509/DeskBox.git
+          git fetch upstream main
+          git fetch origin main
+
+      - name: Mirror upstream/main -> main
+        run: |
+          if [ "$(git rev-parse upstream/main)" != "$(git rev-parse origin/main)" ]; then
+            git push --force origin upstream/main:refs/heads/main
+          else
+            echo "main 已是最新"
+          fi
+
+      - name: Merge upstream into custom
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "custom 已包含上游最新提交"
+            exit 0
+          fi
+          if git merge --no-edit upstream/main -m "chore: 同步上游 $(git rev-parse --short upstream/main)"; then
+            git push origin HEAD:custom
+          else
+            git merge --abort
+            title="上游同步冲突：需要手动合并 $(git rev-parse --short upstream/main)"
+            # fork 默认关闭 Issues 时这里会跳过，失败的运行本身会发邮件提醒
+            if ! gh issue list --state open --search "上游同步冲突 in:title" --json number --jq '.[0].number' 2>/dev/null | grep -q .; then
+              gh issue create --title "$title" --body "自动把 upstream/main 合并进 custom 时有冲突。本地处理：
+          git fetch upstream && git checkout custom && git merge upstream/main
+          解决冲突后 git push origin custom" || true
+            fi
+            exit 1
+          fi
