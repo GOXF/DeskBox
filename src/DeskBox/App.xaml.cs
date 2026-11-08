@@ -1769,6 +1769,7 @@ public partial class App : Application
                 () => ShowReleaseNotesAfterUpdateOnce());
 
             RunOptionalStartupStep("background-update-check", ScheduleBackgroundUpdateCheck);
+            RunOptionalStartupStep("fork-dev-update-check", ScheduleForkDevUpdateCheck); // GOXF fork: local dev builds only
             RunOptionalStartupStep(
                 "update-installer-prune",
                 // Interface-typed property: pruning only exists on the
