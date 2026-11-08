@@ -146,7 +146,8 @@ public sealed class DesktopOrganizationScanner
 
         try
         {
-            FileAttributes attributes = File.GetAttributes(fullPath);
+            // GOXF fork: entries hidden by 「映射整理」 are normal desktop items.
+            FileAttributes attributes = MappedOrganizeHiddenRegistry.EffectiveAttributes(fullPath, File.GetAttributes(fullPath));
             isDirectory = (attributes & FileAttributes.Directory) != 0;
             bool isHiddenOrSystem = (attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0 ||
                                     name.Equals("desktop.ini", StringComparison.OrdinalIgnoreCase);

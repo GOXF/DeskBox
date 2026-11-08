@@ -163,22 +163,52 @@ public sealed partial class MappedOrganizeService : IDisposable
     }
 
     /// <summary>
-    /// Best-effort restore usable from ProcessExit / fatal paths: every entry
-    /// DeskBox hid becomes visible again (membership stays; the next start
-    /// hides the members again).
+    /// Synchronous restore for every exit path (tray exit, restart / update,
+    /// Windows session end, ProcessExit, crash): every entry DeskBox hid
+    /// becomes visible again before the process can end (membership stays;
+    /// the next start hides the members again). Idempotent and fast (one
+    /// attribute write per hidden entry). <paramref name="sessionEnd"/> marks a
+    /// Windows QUERYENDSESSION / ENDSESSION, which another application can
+    /// still cancel (see <see cref="ResumeAfterCancelledSessionEnd"/>).
     /// </summary>
-    public void RestoreIconsForExit()
+    public void RestoreIconsForExit(string reason = "exit", bool sessionEnd = false)
     {
         try
         {
-            _restoredForExit = true;
+            bool first = _exitGate.Restore(sessionEnd);
+            int before = HiddenLedgerCount;
+            long started = Environment.TickCount64;
             ReconcileDesktopVisibility();
-            DesktopIconVisibilityService.Apply(hidden: false);
+            if (first || before > 0)
+            {
+                App.Log($"[MappedOrganize] Restored desktop items for {reason}: ledger {before} -> {HiddenLedgerCount} in {Environment.TickCount64 - started} ms.");
+            }
+
+            if (first)
+            {
+                DesktopIconVisibilityService.Apply(hidden: false);
+            }
         }
         catch (Exception ex)
         {
-            App.Log($"[MappedOrganize] Restoring desktop items on exit failed: {ex.Message}");
+            App.Log($"[MappedOrganize] Restoring desktop items for {reason} failed: {ex.Message}");
         }
+    }
+
+    /// <summary>Another application cancelled the Windows session end: hide the mapped entries again.</summary>
+    public void ResumeAfterCancelledSessionEnd()
+    {
+        if (_isDisposed || !_exitGate.TryResume())
+        {
+            return;
+        }
+
+        App.Log("[MappedOrganize] Session end was cancelled; hiding mapped desktop items again.");
+        Enqueue(() =>
+        {
+            ReconcileDesktopVisibility();
+            return Task.CompletedTask;
+        });
     }
 
     public void SetAutoAssignNewItems(bool enabled)
@@ -633,6 +663,7 @@ public sealed partial class MappedOrganizeService : IDisposable
     private Task OnEntryDeleted(string path)
     {
         _pendingNewEntries.Remove(path);
+        ReleaseIfMovedOffDesktop(path);
         if (MappedOrganizeKeepList.Release(_keptOnDesktop, [path]))
         {
             SaveKeptOnDesktop();
