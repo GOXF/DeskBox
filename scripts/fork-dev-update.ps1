@@ -14,7 +14,12 @@ git fetch origin $Branch
 git checkout -B $Branch "origin/$Branch"
 git log -1 --format="当前提交：%h %s (%cr)"
 
-$props = @("-p:Platform=x64", "-p:RuntimeIdentifier=win-x64")
+$props = @("-p:Platform=x64", "-p:RuntimeIdentifier=win-x64", "-p:WindowsAppSDKSelfContained=true")
+
+if (-not (dotnet nuget list source | Select-String "nuget.org")) {
+    Write-Host "==> 添加 nuget.org 包源" -ForegroundColor Cyan
+    dotnet nuget add source "https://api.nuget.org/v3/index.json" -n nuget.org
+}
 Write-Host "==> 还原依赖" -ForegroundColor Cyan
 dotnet restore .\DeskBox.sln @props
 if ($LASTEXITCODE -ne 0) { throw "restore 失败" }
