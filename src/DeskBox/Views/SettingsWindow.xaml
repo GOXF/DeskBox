@@ -3406,8 +3406,8 @@ Text="DeskBox" />
                                         TextWrapping="Wrap" />
                                     <TextBlock
                                         Style="{StaticResource SettingDescriptionTextStyle}"
-                                        Text="{Binding UpstreamReleaseNoticeText}"
-                                        Visibility="{Binding UpstreamReleaseNoticeVisibility}"
+                                        Text="{x:Bind UpstreamReleaseNoticeText, Mode=OneWay}"
+                                        Visibility="{x:Bind UpstreamReleaseNoticeVisibility, Mode=OneWay}"
                                         TextWrapping="Wrap" />
 
                                     <StackPanel Spacing="6" Visibility="{Binding UpdateProgressVisibility}">

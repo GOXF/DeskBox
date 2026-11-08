@@ -505,7 +505,7 @@ public sealed class AppUpdateServiceTests : IDisposable
     // upstream build would overwrite the fork install.
     [InlineData("https://deskbox.fun/update/DeskBox_Setup.exe", false)]
     [InlineData("https://cdn.deskbox.fun/DeskBox_Setup.exe", false)]
-    [InlineData("https://github.com/GOXF/DeskBox/releases/download/v1.5.2/DeskBox_Setup.exe", false)]
+    [InlineData("https://github.com/Tianyu199509/DeskBox/releases/download/v1.5.2/DeskBox_Setup.exe", false)]
     [InlineData("http://deskbox.fun/update/DeskBox_Setup.exe", false)]
     [InlineData("https://github.com/GOXF/DeskBox/blob/custom/DeskBox_Setup.exe", false)]
     [InlineData("https://github.com/GOXF/DeskBoxEvil/releases/download/v1.0.0/DeskBox_Setup.exe", false)]

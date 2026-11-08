@@ -19,7 +19,7 @@ public sealed class ForkUpdateTests : IDisposable
     public void Defaults_PointAtForkReleasesAndSkipTheUpstreamManifest()
     {
         Assert.Equal("https://api.github.com/repos/GOXF/DeskBox/releases/latest", AppUpdateService.DefaultGitHubLatestReleaseApiUrl);
-        Assert.Equal(string.Empty, AppUpdateService.DefaultManifestUrl);
+        Assert.Empty(AppUpdateService.DefaultManifestUrl);
         Assert.Equal("https://github.com/GOXF/DeskBox/releases/latest", AppUpdateService.DefaultManualDownloadUrl);
         Assert.Equal("https://api.github.com/repos/Tianyu199509/DeskBox/releases/latest", ForkUpdateConfig.UpstreamLatestReleaseApiUrl);
     }
