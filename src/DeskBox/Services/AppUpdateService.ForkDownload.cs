@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using DeskBox.Models;
 
 namespace DeskBox.Services;
 
