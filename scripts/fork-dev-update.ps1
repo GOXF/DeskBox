@@ -42,6 +42,24 @@ try {
 
     $exe = Get-ChildItem .\src\DeskBox\bin -Recurse -Filter DeskBox.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if (-not $exe) { throw "没找到 DeskBox.exe" }
+
+    # 桌面快捷方式「DeskBox 开发版.lnk」→ 刚编译的 DeskBox.exe（失败不影响启动）
+    try {
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        $lnkPath = Join-Path $desktop "DeskBox 开发版.lnk"
+        $shell = New-Object -ComObject WScript.Shell
+        $lnk = $shell.CreateShortcut($lnkPath)
+        $lnk.TargetPath = $exe.FullName
+        $lnk.WorkingDirectory = $exe.DirectoryName
+        $lnk.IconLocation = "$($exe.FullName),0"
+        $lnk.Description = "DeskBox 本地开发版（dev 分支 Debug 构建）"
+        $lnk.Save()
+        Write-Host "==> 已更新桌面快捷方式：$lnkPath" -ForegroundColor Cyan
+    }
+    catch {
+        Write-Host "!! 创建桌面快捷方式失败（不影响运行）：$($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
     Write-Host "==> 启动 $($exe.FullName)" -ForegroundColor Green
     Start-Process $exe.FullName
 }
