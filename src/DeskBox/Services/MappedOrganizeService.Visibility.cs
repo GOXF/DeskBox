@@ -13,6 +13,9 @@ public sealed partial class MappedOrganizeService
     private DesktopOrganizeMode _mode = DesktopOrganizeMode.MoveToWidgets;
     private volatile bool _restoredForExit;
 
+    /// <summary>Entries currently marked 「放回桌面」 (copy; UI thread).</summary>
+    public IReadOnlyCollection<string> KeptOnDesktopSnapshot() => _keptOnDesktop.ToArray();
+
     /// <summary>The organize mode the main process last applied.</summary>
     public DesktopOrganizeMode Mode => _mode;
 

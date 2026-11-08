@@ -82,10 +82,28 @@ Ordinary organization never targets mapped widgets: they are filtered out in
 The item menu row 「移回桌面」 reads 「放回桌面」 in mapped widgets and calls
 `MappedOrganizeService.KeepOnDesktop` (single and multi-select): membership
 removed, attribute restored, path recorded in `data/mapped-organize.kept` so
-automatic sorting and 「一键整理」 skip it (follows renames, dropped on delete).
+automatic sorting of new files and the mapped widget's quick 「一键整理」 skip
+it (follows renames, dropped on delete).
 Dragging it into a mapped widget or confirming a preview that maps it clears
 the mark. Entries deselected in a confirmed mapped preview are kept the same
 way. 「退出映射整理」 clears the list.
+
+### 重新整理桌面
+
+「放回桌面」 entries are re-sorted by the organize preview, not put back where
+they came from: in 「只映射」 mode the preview lists them like any other
+desktop entry (sorted into their category by the normal rules, ticked by
+default — including folders / large files, which the scanner otherwise only
+offers as opt-in: `IncludeKeptOnDesktopItems`, one call in
+`DesktopOrganizationTaskView.ScanAsync`, pure rule
+`MappedOrganizeReorganizePolicy.SelectKeptOptIns`, once per preview so a
+refresh does not re-tick what the user unticked). Confirming maps them and
+clears the mark (`ApplyGroupsAsync`); unticked entries stay kept. Entry
+points: 「重新整理桌面」 in a mapped widget's blank-area menu and in the
+title-bar 「…」 menu of a mapped widget or of a tab group holding one
+(`ContentWidgetWindow.MappedOrganize.cs`, one call in `CreateMoreFlyout`;
+`MappedOrganizeReorganizePolicy.ShouldOfferReorganize`). Both open the
+organize window (an already open window keeps its preview; 刷新 rescans).
 
 ### 拖到桌面 = 放回桌面
 
@@ -103,6 +121,25 @@ moved to the release point through the desktop's `IFolderView`
 (`SelectAndPositionItems`, `DesktopIconPlacementNativeMethods`), first icon
 centred on the cursor, the rest in a column; skipped when 自动排列图标 is on.
 Drops on other folders / widgets and move-mode widgets keep upstream behaviour.
+
+Robustness (fix/mapped-drag-and-reorganize): the gesture is recorded at
+`Items_DragStarting` (`BeginMappedDragTracking`, one call): mapped or not,
+its paths, and a background `MappedDragReleaseTracker` that polls the
+physical buttons (`GetAsyncKeyState`, 8 ms) and probes the desktop **at the
+instant of release** (pure state machine `MappedDragReleaseTracking`). The
+completion-time probe was unreliable: by then Explorer has processed the
+drop, its desktop thread can be busy (the upstream LVM_HITTEST then times out
+and "failed" was read as "on an icon"), and with 「显示隐藏的项目」 on, the
+dragged item's own faded icon can sit under the cursor. The probe is now
+three-state (`DesktopListViewProbeNativeMethods`: blank / icon + label /
+failed); an icon only blocks when its label is not one of the dragged
+entries, a failed hit test does not block (put-back paths are re-checked to
+still exist). The decision runs once per gesture: from drag completion, or
+from the release when WinUI reports completion before the release (stack
+popover closing) or never (1.5 s grace). Every refusal logs
+`[MappedOrganize] DragToDesktop skip reason=<reason> … target= icon= chain=`;
+success logs `DragToDesktop put back`, the release `DragToDesktop released`,
+the start `DragToDesktop tracking`.
 
 ## Multi-monitor / sleep
 
@@ -122,7 +159,11 @@ topology profiles and wake recovery apply unchanged.
   `FileSurfaceContent.SelectionAndMenus.cs` (blank menu call, item-menu
   localizer, 「放回桌面」 interception).
 * `FileSurfaceContent.xaml.cs`: one `TryPutBackMappedDragOnDesktop` call in
-  `CompleteDragItemsSession` (拖到桌面 = 放回桌面).
+  `CompleteDragItemsSession` and one `BeginMappedDragTracking` call in
+  `Items_DragStarting` (拖到桌面 = 放回桌面).
+* `ContentWidgetWindow.Commands.cs`: one `AppendMappedOrganizeMoreMenuItems`
+  call in `CreateMoreFlyout`; `DesktopOrganizationTaskView.xaml.cs`: one
+  `IncludeKeptOnDesktopItems` call in `ScanAsync` (重新整理桌面).
 * `FileService.cs`: DeskBox-hidden members stay displayable (3 conditions).
 * `DesktopAutoOrganizationWatcher.cs`: 只映射 hand-off (one block).
 * `DesktopOrganizationSettingsSection.xaml`: one host panel for the mode card.
@@ -145,7 +186,9 @@ topology profiles and wake recovery apply unchanged.
   attribute DeskBox set (NTFS carries it along); membership and the hidden
   ledger are cleaned up by the desktop watcher, but the file stays hidden at
   the destination.
-* 拖到桌面 = 放回桌面: a drop onto an existing desktop icon is not treated as
-  put-back; icon placement needs 自动排列图标 off (网格对齐 still snaps it).
+* 拖到桌面 = 放回桌面: a drop onto another desktop icon is not treated as
+  put-back (one whose label equals a dragged entry's name is); icon
+  placement needs 自动排列图标 off (网格对齐 still snaps it). Touch / pen
+  drags have no button to track and fall back to the completion-time probe.
 * Not runtime-verified on a real desktop in this change (CI builds and runs
   unit tests only).

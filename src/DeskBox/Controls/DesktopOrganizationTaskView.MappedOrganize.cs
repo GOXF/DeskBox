@@ -15,6 +15,47 @@ namespace DeskBox.Controls;
 public sealed partial class DesktopOrganizationTaskView
 {
     private bool _organizeModeInitialized;
+    private readonly HashSet<string> _keptOnDesktopOptInsApplied = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 「重新整理桌面」: in 「只映射」 mode, entries put back on the desktop are
+    /// sorted by the normal rules and start ticked, including the kinds the
+    /// scanner only offers as opt-in (folders, large files). Confirming maps
+    /// them and clears the 「放回桌面」 mark; unticking keeps it.
+    /// </summary>
+    private void IncludeKeptOnDesktopItems(DesktopOrganizationPlan scanned, bool freshPreview)
+    {
+        try
+        {
+            if (freshPreview)
+            {
+                _keptOnDesktopOptInsApplied.Clear();
+            }
+
+            if (MappedOrganizeService.Current is not { } service ||
+                !ForkOrganizeModePolicy.ConfirmMapsInsteadOfMoving(ForkOrganizeModeSettings.Load()))
+            {
+                return;
+            }
+
+            IReadOnlyCollection<string> kept = service.KeptOnDesktopSnapshot();
+            if (kept.Count == 0)
+            {
+                return;
+            }
+
+            IReadOnlyList<string> optIns = MappedOrganizeReorganizePolicy.SelectKeptOptIns(
+                scanned.SourceItems.Select(item => (item.SourcePath, item.CanOptIn)),
+                kept,
+                _keptOnDesktopOptInsApplied);
+            _optionalIncludedPaths.UnionWith(optIns);
+            App.Log($"[MappedOrganize] Preview: {kept.Count} kept-on-desktop entries, {optIns.Count} opted in.");
+        }
+        catch (Exception ex)
+        {
+            App.Log($"[MappedOrganize] Preview could not include kept-on-desktop entries: {ex.Message}");
+        }
+    }
 
     private void OrganizeModeLink_Loaded(object sender, RoutedEventArgs e)
     {

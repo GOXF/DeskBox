@@ -1531,6 +1531,8 @@ public sealed partial class FileSurfaceContent :
         }
 
         _activeDragSourcePaths = result.SourcePaths.ToArray();
+        // GOXF fork: remember a mapped widget's drag for 「拖到桌面 = 放回桌面」.
+        BeginMappedDragTracking(_activeDragSessionId, _activeDragSourcePaths);
         _activeDragHasStorageItems = result.HasStorageItems;
         // Windows 10 collapses the advertised set to a single effect —
         // Explorer there prompts for every multi-effect drop regardless of
@@ -1666,7 +1668,7 @@ public sealed partial class FileSurfaceContent :
             }
 
             // GOXF fork: a mapped widget's drag released on the desktop is 「放回桌面」.
-            if (TryPutBackMappedDragOnDesktop(movedPaths, handledAsStackMembership))
+            if (TryPutBackMappedDragOnDesktop(movedPaths, handledAsStackMembership, dragSessionId, dropResult))
             {
                 return;
             }

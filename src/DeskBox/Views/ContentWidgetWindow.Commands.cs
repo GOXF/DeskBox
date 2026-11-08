@@ -460,6 +460,8 @@ public sealed partial class ContentWidgetWindow
                     SetFileWidgetFolderOpenBehaviorOverride));
         }
 
+        AppendMappedOrganizeMoreMenuItems(flyout); // GOXF fork: 「重新整理桌面」
+
         WidgetGroupMenuBuilder.Append(
             flyout,
             _config,
