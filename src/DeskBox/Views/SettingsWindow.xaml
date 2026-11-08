@@ -3404,6 +3404,11 @@ Text="DeskBox" />
                                         Style="{StaticResource SettingDescriptionTextStyle}"
                                         Text="{Binding UpdateDetailText}"
                                         TextWrapping="Wrap" />
+                                    <TextBlock
+                                        Style="{StaticResource SettingDescriptionTextStyle}"
+                                        Text="{x:Bind UpstreamReleaseNoticeText, Mode=OneWay}"
+                                        Visibility="{x:Bind UpstreamReleaseNoticeVisibility, Mode=OneWay}"
+                                        TextWrapping="Wrap" />
 
                                     <StackPanel Spacing="6" Visibility="{Binding UpdateProgressVisibility}">
                                         <ProgressBar

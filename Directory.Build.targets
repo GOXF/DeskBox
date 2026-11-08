@@ -1,0 +1,33 @@
+<Project>
+  <!--
+    GOXF/DeskBox fork only (this file does not exist upstream, so upstream
+    version bumps never conflict with it).
+
+    Fork version = upstream base version (<Version> in src/DeskBox/DeskBox.csproj)
+                   + 4th segment ForkRevision, e.g. 1.5.9 + 1 => 1.5.9.1.
+
+    Directory.Build.targets is imported after the project body AND after the
+    SDK's DefaultAssemblyInfo targets have already derived AssemblyVersion /
+    FileVersion / InformationalVersion, so all four properties are set
+    explicitly here (a project-level <Version> alone would not propagate).
+
+    ForkRevision can be overridden with /p:ForkRevision=N or a ForkRevision
+    environment variable (the release-custom workflow does that). Bump the
+    default below when publishing a new fork build on the same upstream base;
+    reset it to 1 after upstream bumps <Version>.
+  -->
+  <PropertyGroup>
+    <ForkRevision Condition="'$(ForkRevision)' == ''">1</ForkRevision>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'DeskBox' and '$(ForkRevision)' != ''">
+    <ForkBaseVersion>$([System.Text.RegularExpressions.Regex]::Match('$(Version)', '^\d+\.\d+\.\d+').Value)</ForkBaseVersion>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'DeskBox' and '$(ForkBaseVersion)' != ''">
+    <Version>$(ForkBaseVersion).$(ForkRevision)</Version>
+    <AssemblyVersion>$(ForkBaseVersion).$(ForkRevision)</AssemblyVersion>
+    <FileVersion>$(ForkBaseVersion).$(ForkRevision)</FileVersion>
+    <InformationalVersion>$(ForkBaseVersion).$(ForkRevision)</InformationalVersion>
+  </PropertyGroup>
+</Project>
