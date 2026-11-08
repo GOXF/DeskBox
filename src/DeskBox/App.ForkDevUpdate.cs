@@ -63,7 +63,7 @@ public partial class App
     {
         if (IsShuttingDown ||
             string.Equals(_forkDevUpdateNotifiedSha, info.RemoteSha, StringComparison.Ordinal) ||
-            !SettingsService.Settings.ShowUpdateToastNotification)
+            !SettingsService.Settings.Core.ShowUpdateToastNotification)
         {
             return;
         }
