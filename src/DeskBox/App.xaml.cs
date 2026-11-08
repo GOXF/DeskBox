@@ -1510,6 +1510,8 @@ public partial class App : Application
             // before the restoration phase starts writing normalized state).
             await startupAutomaticSnapshotTask;
             if (IsShuttingDown) return;
+            // GOXF fork: 映射整理 — show items a killed / crashed / older run left hidden.
+            RunOptionalStartupStep("mapped-organize-recovery", MappedOrganizeStartupRecovery.Run);
             int recoveredDesktopItems = 0;
             if (SuppressFileMutatingStartup)
             {
@@ -2401,6 +2403,9 @@ public partial class App : Application
 
     private void FlushSettingsForEndSession(string reason)
     {
+        // GOXF fork: 映射整理 — show every DeskBox-hidden desktop item before
+        // Windows ends the process (shutdown / restart / sign-out / installer).
+        RestoreMappedOrganizeBeforeExit(reason, sessionEnd: true);
         // The OS ends the process after this flush without the shutdown
         // sequence, so the launch breadcrumb is closed here.
         _startupSessionLedger?.MarkCleanExit();
@@ -6602,6 +6607,9 @@ public partial class App : Application
         // Recorded first so a death anywhere inside teardown still reads as
         // an intentional exit on the next launch (storm-guard semantics).
         _startupSessionLedger?.MarkCleanExit();
+        // GOXF fork: 映射整理 — restore hidden desktop items first, before any
+        // bounded teardown step can time out and skip the later steps.
+        RestoreMappedOrganizeBeforeExit("shutdown");
         bool dependentTeardownCompleted = true;
         try
         {

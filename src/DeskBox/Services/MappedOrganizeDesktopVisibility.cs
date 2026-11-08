@@ -152,6 +152,16 @@ public static class MappedOrganizeHiddenRegistry
         }
     }
 
+    /// <summary>
+    /// Attributes as the desktop organizer should see them: an entry hidden by
+    /// DeskBox (in the ledger) is a normal desktop item, not 「无法整理」.
+    /// </summary>
+    public static FileAttributes EffectiveAttributes(string path, FileAttributes attributes) =>
+        Effective(attributes, (attributes & FileAttributes.Hidden) != 0 && IsHiddenByDeskBox(path));
+
+    public static FileAttributes Effective(FileAttributes attributes, bool hiddenByDeskBox) =>
+        hiddenByDeskBox ? attributes & ~FileAttributes.Hidden : attributes;
+
     internal static void Publish(IEnumerable<string> paths)
     {
         var copy = new HashSet<string>(paths, StringComparer.OrdinalIgnoreCase);
