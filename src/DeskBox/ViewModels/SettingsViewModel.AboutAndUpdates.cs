@@ -312,6 +312,7 @@ public partial class SettingsViewModel
         _updateOperationCts?.Cancel();
         _updateOperationCts = new CancellationTokenSource();
         StartUpstreamReleaseCheck(); // GOXF fork: informational, never awaited
+        StartForkDevUpdateCheck(); // GOXF fork: local dev builds only, never awaited
         IsCheckingForUpdates = true;
         UpdateStatusText = _localizationService.T("Settings.Update.Status.Checking");
         UpdateDetailText = _localizationService.T("Settings.Update.Detail.Checking");

@@ -3409,6 +3409,23 @@ Text="DeskBox" />
                                         Text="{x:Bind UpstreamReleaseNoticeText, Mode=OneWay}"
                                         Visibility="{x:Bind UpstreamReleaseNoticeVisibility, Mode=OneWay}"
                                         TextWrapping="Wrap" />
+                                    <!-- GOXF fork: local dev build channel (only visible for a build inside a git clone) -->
+                                    <StackPanel Spacing="6" Visibility="{x:Bind ForkDevUpdateVisibility, Mode=OneWay}">
+                                        <TextBlock
+                                            Style="{StaticResource SettingDescriptionTextStyle}"
+                                            Text="{x:Bind ForkDevUpdateStatusText, Mode=OneWay}"
+                                            TextWrapping="Wrap" />
+                                        <Button
+                                            HorizontalAlignment="Left"
+                                            Click="ForkDevUpdateButton_Click"
+                                            Style="{StaticResource ActionButtonStyle}"
+                                            Visibility="{x:Bind ForkDevUpdateButtonVisibility, Mode=OneWay}">
+                                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                                <FontIcon FontSize="16" Glyph="&#xE72C;" />
+                                                <TextBlock Text="{x:Bind ForkDevUpdateButtonText, Mode=OneWay}" />
+                                            </StackPanel>
+                                        </Button>
+                                    </StackPanel>
                                     <StackPanel Spacing="4" Visibility="{x:Bind UpdateDownloadProxyVisibility, Mode=OneWay}">
                                         <TextBlock Text="{x:Bind UpdateDownloadProxyLabel, Mode=OneWay}" />
                                         <TextBox
