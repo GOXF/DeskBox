@@ -13,7 +13,8 @@ public sealed class DesktopOrganizationRuleResolver
             .Where(widget =>
                 widget.WidgetKind == WidgetKind.File &&
                 !widget.IsDisabled &&
-                !string.IsNullOrWhiteSpace(widget.MappedFolderPath))
+                !string.IsNullOrWhiteSpace(widget.MappedFolderPath) &&
+                !MappedOrganizeWidgetMetadata.IsMappedOrganize(widget))
             .Select(widget => widget.Id)
             .ToHashSet(StringComparer.Ordinal);
 

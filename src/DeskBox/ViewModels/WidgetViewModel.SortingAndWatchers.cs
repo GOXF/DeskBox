@@ -656,6 +656,12 @@ public partial class WidgetViewModel
         string path,
         int? preferredManualIndex = null)
     {
+        if (IsHiddenByMappedOrganize(path))
+        {
+            RemoveItemByPath(path);
+            return false;
+        }
+
         var item = await _fileService.TryCreateWidgetItemAsync(
             path,
             hideShortcutArrowOverlay: _hideShortcutArrowOverlay,
