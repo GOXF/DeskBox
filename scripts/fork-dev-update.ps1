@@ -19,6 +19,29 @@ try {
     Get-Process DeskBox -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Seconds 1
 
+    # 映射整理：被强制结束的 DeskBox 来不及还原被隐藏的桌面项，这里按记录还原
+    try {
+        $dataRoot = if ($env:DESKBOX_DEV_DATA_ROOT) { $env:DESKBOX_DEV_DATA_ROOT } else { Join-Path $env:LOCALAPPDATA "DeskBox" }
+        $ledger = Join-Path $dataRoot "data\mapped-organize.hidden"
+        if (Test-Path -LiteralPath $ledger) {
+            $restored = 0
+            foreach ($line in Get-Content -LiteralPath $ledger -Encoding UTF8) {
+                $item = $line.Trim()
+                if (-not $item -or -not (Test-Path -LiteralPath $item)) { continue }
+                $entry = Get-Item -LiteralPath $item -Force
+                if ($entry.Attributes -band [IO.FileAttributes]::Hidden) {
+                    $entry.Attributes = $entry.Attributes -band (-bnot [IO.FileAttributes]::Hidden)
+                    $restored++
+                }
+            }
+            Set-Content -LiteralPath $ledger -Value "" -NoNewline
+            if ($restored -gt 0) { Write-Host "==> 已还原 $restored 个被隐藏的桌面项" -ForegroundColor Cyan }
+        }
+    }
+    catch {
+        Write-Host "!! 还原隐藏的桌面项失败（DeskBox 下次启动会再还原）：$($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
     Write-Host "==> 拉取 origin/$Branch" -ForegroundColor Cyan
     git fetch origin $Branch
     if ($LASTEXITCODE -ne 0) { throw "git fetch 失败" }

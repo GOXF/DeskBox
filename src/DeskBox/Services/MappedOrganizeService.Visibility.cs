@@ -13,7 +13,8 @@ public sealed partial class MappedOrganizeService
     private readonly HashSet<string> _keptOnDesktop = new(StringComparer.OrdinalIgnoreCase);
     private FileSystemWatcher? _modeWatcher;
     private DesktopOrganizeMode _mode = DesktopOrganizeMode.MoveToWidgets;
-    private volatile bool _restoredForExit;
+    private readonly MappedOrganizeExitGate _exitGate = new();
+    private readonly Dictionary<string, MappedOrganizeFileIdentity> _hiddenIdentities = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Entries currently marked 「放回桌面」 (copy; UI thread).</summary>
     public IReadOnlyCollection<string> KeptOnDesktopSnapshot() => _keptOnDesktop.ToArray();
@@ -126,6 +127,10 @@ public sealed partial class MappedOrganizeService
             _hiddenLedger.Clear();
             _hiddenLedger.UnionWith(ReadList(HiddenLedgerPath, MappedOrganizeHiddenLedger.Parse));
             MappedOrganizeHiddenRegistry.Publish(_hiddenLedger);
+            foreach (string path in _hiddenLedger)
+            {
+                CaptureIdentity(path);
+            }
         }
 
         _keptOnDesktop.Clear();
@@ -145,7 +150,7 @@ public sealed partial class MappedOrganizeService
     {
         lock (_visibilityGate)
         {
-            List<string> desired = _restoredForExit || _isDisposed
+            List<string> desired = _exitGate.IsRestored || _isDisposed
                 ? new List<string>()
                 : LiveMappedWidgets().SelectMany(MappedOrganizeMembership.GetMembers).ToList();
             MappedOrganizeHiddenLedger.Plan plan = MappedOrganizeHiddenLedger.Reconcile(desired, _hiddenLedger, ProbeAttributes);
@@ -163,6 +168,7 @@ public sealed partial class MappedOrganizeService
             foreach (string path in plan.Forget)
             {
                 ledgerChanged |= _hiddenLedger.Remove(path);
+                _hiddenIdentities.Remove(path);
             }
 
             if (ledgerChanged)
@@ -176,6 +182,7 @@ public sealed partial class MappedOrganizeService
                 if (TrySetHidden(path, hidden: true))
                 {
                     hidden++;
+                    CaptureIdentity(path);
                 }
                 else
                 {
@@ -193,6 +200,7 @@ public sealed partial class MappedOrganizeService
                 {
                     restored++;
                     _hiddenLedger.Remove(path);
+                    _hiddenIdentities.Remove(path);
                     ledgerChanged = true;
                 }
             }
@@ -221,6 +229,12 @@ public sealed partial class MappedOrganizeService
         {
             if (MappedOrganizeHiddenLedger.Rename(_hiddenLedger, oldPath, newPath))
             {
+                string oldKey = MappedOrganizeMembership.NormalizePath(oldPath);
+                if (_hiddenIdentities.Remove(oldKey, out MappedOrganizeFileIdentity identity))
+                {
+                    _hiddenIdentities[MappedOrganizeMembership.NormalizePath(newPath)] = identity;
+                }
+
                 PersistHiddenLedger();
             }
         }

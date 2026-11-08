@@ -77,6 +77,54 @@ Ordinary organization never targets mapped widgets: they are filtered out in
 * Settings warns when Explorer shows hidden items (HKCU …\Explorer\Advanced
   `Hidden`=1): mapped entries then still appear as faded icons.
 
+### Restore before every exit (fix/mapped-hidden-restore)
+
+Goal: whenever DeskBox is not running, no desktop entry stays hidden by it.
+`RestoreIconsForExit(reason, sessionEnd)` is synchronous and idempotent
+(`MappedOrganizeExitGate`); log line `[MappedOrganize] Restored desktop items for <reason>`.
+
+| Exit path | What runs |
+| --- | --- |
+| Tray exit, 重启, in-app update (`ShutdownForUpdate/RestartAsync`), dev「更新并重启」 | first line of `ShutdownApplicationAsync` (before any bounded teardown step can time out), again in the shutdown step |
+| Windows shutdown / restart / sign-out, installer Restart Manager | `WM_QUERYENDSESSION` / `WM_ENDSESSION` on the tray window → `FlushSettingsForEndSession` → restore; a cancelled session end (`WM_ENDSESSION` FALSE) re-hides (`ForkSessionEndSignal`) |
+| `Environment.Exit` / fatal startup | `ProcessExit` |
+| Crash on a background thread | `AppDomain.UnhandledException` (terminating) — best effort |
+| Hard kill (Task Manager, `Stop-Process -Force`) | cannot run; `fork-dev-update.ps1` restores from the ledger after its own force-kill; next start: `MappedOrganizeStartupRecovery` (startup step `mapped-organize-recovery`, before widget restore) shows every ledger entry, logs it, then the service hides the members again; uninstaller as before |
+
+The desktop organizer (`DesktopOrganizationScanner`) reads attributes through
+`MappedOrganizeHiddenRegistry.EffectiveAttributes`, so a ledger entry is a
+normal item, never 「本次无法整理」. Older builds (no ledger support) cannot do
+this — they are why the post-restart desktop showed 0 items.
+
+### Hidden attribute never leaves the desktop
+
+When an entry is hidden its NTFS id (volume serial + file index) is captured.
+A ledger entry the desktop watcher reports as deleted is opened by id
+(`ForkFileIdentityNative`, `OpenFileById` + `GetFinalPathNameByHandle`): if it
+now lives outside the desktop (another folder, cut/paste, dragged out of a
+mapped widget, Recycle Bin) its hidden attribute is cleared there and it leaves
+the ledger (`MappedOrganizeLeakPolicy`). Not covered: a *copy* of a hidden
+entry (copies keep attributes) and a move to another volume (copy + delete).
+
+### Research: hiding icons without file attributes
+
+* 360 桌面助手 / Fences: keep the desktop SysListView32 but position icons
+  under their own fence windows (Fences moves icon positions via
+  LVM_SETITEMPOSITION and draws its own frame; "quick-hide" hides the whole
+  list view). WPS 桌面整理 hides the whole icon layer (SysListView32
+  ShowWindow / Explorer "show desktop icons") and draws every item, mapped or
+  not, in its own windows. None of them touch file attributes.
+* This codebase already has the whole-layer approach: `DesktopIconVisibilityService`
+  (SW_HIDE of the desktop SysListView32, not persisted by Explorer) behind the
+  legacy `desktopIconsHiddenByDeskBox` marker, from the first mapped build.
+  A "hide icon layer + show unmapped items in a DeskBox desktop surface" mode
+  is feasible: needs a full-screen-per-monitor desktop-layer widget that lists
+  unmapped desktop items with free positioning (or a grid), Explorer-restart
+  re-apply (periodic check exists), desktop drop target / context menu / rename
+  / keyboard parity, and blank-area double-click behaviour. Rough effort: 5–8
+  focused dev days for a usable version, more for full Explorer parity
+  (icon positions, multi-monitor layouts, F2/Del/Ctrl+A on the desktop).
+
 ## 「放回桌面」
 
 The item menu row 「移回桌面」 reads 「放回桌面」 in mapped widgets and calls
@@ -217,6 +265,10 @@ topology profiles and wake recovery apply unchanged.
 * `DesktopAutoOrganizationWatcher.cs`: 只映射 hand-off (one block).
 * `DesktopOrganizationSettingsSection.xaml`: one host panel for the mode card.
 * `installer/DeskBox.Uninstall.iss`: include + one call.
+* Exit safety: `App.xaml.cs` 3 lines (startup recovery step, restore at top of
+  `ShutdownApplicationAsync` and `FlushSettingsForEndSession`),
+  `AppLifecycleRecoveryWatcher.cs` (ENDSESSION FALSE signal),
+  `DesktopOrganizationScanner.cs` (effective attributes).
 * `Strings/*.json`: 6 keys inserted after `DesktopOrganization.Preview.Title`
   (zh-CN / zh-TW translated, other locales English fallback).
 
@@ -233,10 +285,9 @@ topology profiles and wake recovery apply unchanged.
   (grouping is per category).
 * The auto/manual switch for mapped widgets stays in the mapped widget's
   blank-area menu.
-* Moving / copying a mapped item out to another folder keeps the Hidden
-  attribute DeskBox set (NTFS carries it along); membership and the hidden
-  ledger are cleaned up by the desktop watcher, but the file stays hidden at
-  the destination.
+* Copying a mapped item to another folder, or moving it to another volume,
+  keeps the Hidden attribute on the copy (moves on the same volume are fixed,
+  see 「Hidden attribute never leaves the desktop」).
 * 拖到桌面 = 放回桌面: a drop onto another desktop icon is not treated as
   put-back (one whose label equals a dragged entry's name is); icon
   placement needs 自动排列图标 off (网格对齐 still snaps it). Touch / pen

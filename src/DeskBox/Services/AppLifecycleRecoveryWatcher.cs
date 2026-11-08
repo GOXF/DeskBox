@@ -145,6 +145,10 @@ internal sealed class AppLifecycleRecoveryWatcher : IDisposable
             {
                 InvokeEndSessionAction("end-session");
             }
+            else
+            {
+                ForkSessionEndSignal.RaiseCancelled(); // GOXF fork: 映射整理 re-hides
+            }
         }
         else if (message == AppLifecycleRecoverySignalClassifier.WmWtsSessionChange)
         {
