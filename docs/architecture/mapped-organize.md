@@ -87,6 +87,23 @@ Dragging it into a mapped widget or confirming a preview that maps it clears
 the mark. Entries deselected in a confirmed mapped preview are kept the same
 way. 「退出映射整理」 clears the list.
 
+### 拖到桌面 = 放回桌面
+
+Dragging items out of a mapped widget and releasing them on the system desktop
+(any monitor) runs the same `KeepOnDesktop`. Explorer sees that drop as a
+same-folder move (a no-op), so DeskBox decides it at drag completion
+(`FileSurfaceContent.MappedDragToDesktop.cs`, hooked once in
+`CompleteDragItemsSession`): the window under the cursor must be the shell
+desktop (`SHELLDLL_DefView`/`SysListView32` under `Progman`/`WorkerW`, shell
+process, not a DeskBox window — `MappedDragToDesktopPolicy.ClassifyTarget`),
+the point must be blank desktop (upstream `DesktopBlankHitTest`; a drop on a
+folder / Recycle Bin icon stays a real move), no mouse button / Esc held, and
+DeskBox must not have handled the drop itself. The put-back entries are then
+moved to the release point through the desktop's `IFolderView`
+(`SelectAndPositionItems`, `DesktopIconPlacementNativeMethods`), first icon
+centred on the cursor, the rest in a column; skipped when 自动排列图标 is on.
+Drops on other folders / widgets and move-mode widgets keep upstream behaviour.
+
 ## Multi-monitor / sleep
 
 Mapped widgets are normal widgets, so the existing monitor binding,
@@ -104,6 +121,8 @@ topology profiles and wake recovery apply unchanged.
 * `DesktopOrganizationTaskView.xaml` (+ `.Actions.cs` one call),
   `FileSurfaceContent.SelectionAndMenus.cs` (blank menu call, item-menu
   localizer, 「放回桌面」 interception).
+* `FileSurfaceContent.xaml.cs`: one `TryPutBackMappedDragOnDesktop` call in
+  `CompleteDragItemsSession` (拖到桌面 = 放回桌面).
 * `FileService.cs`: DeskBox-hidden members stay displayable (3 conditions).
 * `DesktopAutoOrganizationWatcher.cs`: 只映射 hand-off (one block).
 * `DesktopOrganizationSettingsSection.xaml`: one host panel for the mode card.
@@ -122,5 +141,11 @@ topology profiles and wake recovery apply unchanged.
   (grouping is per category).
 * The auto/manual switch for mapped widgets stays in the mapped widget's
   blank-area menu.
+* Moving / copying a mapped item out to another folder keeps the Hidden
+  attribute DeskBox set (NTFS carries it along); membership and the hidden
+  ledger are cleaned up by the desktop watcher, but the file stays hidden at
+  the destination.
+* 拖到桌面 = 放回桌面: a drop onto an existing desktop icon is not treated as
+  put-back; icon placement needs 自动排列图标 off (网格对齐 still snaps it).
 * Not runtime-verified on a real desktop in this change (CI builds and runs
   unit tests only).
