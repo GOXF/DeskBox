@@ -108,6 +108,26 @@ jobs:
         shell: pwsh
         run: dotnet restore .\DeskBox.sln --locked-mode -p:Platform=x64 -p:RuntimeIdentifier=win-x64 --verbosity minimal
 
+      - name: Re-evaluate lock files for the AOT graph (runner only)
+        # The runner SDK can roll forward a patch (global.json latestPatch), which
+        # moves SDK-injected implicit references such as Microsoft.DotNet.ILCompiler
+        # and makes the committed AOT lock entries stale (NU1004). Re-evaluate the
+        # locks in the runner before the publish script snapshots the tree; this
+        # never gets committed.
+        shell: pwsh
+        env:
+          RestoreLockedMode: false
+        run: |
+          $props = @('-p:Platform=x64','-p:RuntimeIdentifier=win-x64','-p:DeskBoxDistribution=Direct',
+            '-p:DeskBoxAotAudit=true','-p:DeskBoxAotSmokeHarness=false','-p:PublishAot=true',
+            '-p:DeskBoxRustNative=true','-p:DeskBoxRustCrtLinkage=Static','-p:SelfContained=true',
+            '-p:WindowsAppSDKSelfContained=true')
+          foreach ($proj in 'src\DeskBox\DeskBox.csproj','src\DeskBox.Updater\DeskBox.Updater.csproj') {
+            dotnet restore $proj --force-evaluate -v:minimal @props
+            if ($LASTEXITCODE -ne 0) { throw "Lock re-evaluation failed for $proj." }
+          }
+          git --no-pager diff --stat
+
       - name: Publish Full Native AOT retail payload
         shell: pwsh
         run: .\scripts\publish-aot-retail.ps1 -Platform x64
