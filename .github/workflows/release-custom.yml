@@ -204,7 +204,7 @@ jobs:
             "基于上游 DeskBox v${{ steps.ver.outputs.base }}，自有修订 ${{ steps.ver.outputs.rev }}。",
             '',
             "### ${since}的自有改动",
-            $changes,
+            ($changes -join "`n"),
             '',
             '### 上游更新',
             "上游 v${{ steps.ver.outputs.base }} 的完整更新内容见 https://github.com/Tianyu199509/DeskBox/releases/tag/v${{ steps.ver.outputs.base }}",
