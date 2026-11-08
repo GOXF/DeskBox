@@ -40,8 +40,6 @@ namespace DeskBox.ViewModels;
     nameof(UpdateProgressValue),
     nameof(UpdateProgressVisibility),
     nameof(UpdateStatusText),
-    nameof(UpstreamReleaseNoticeText),
-    nameof(UpstreamReleaseNoticeVisibility),
     nameof(ViewReleaseNotesButtonText),
 ], [])]
 public partial class SettingsViewModel
