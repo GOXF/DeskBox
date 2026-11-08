@@ -17,7 +17,7 @@
     reset it to 1 after upstream bumps <Version>.
   -->
   <PropertyGroup>
-    <ForkRevision Condition="'$(ForkRevision)' == ''">2</ForkRevision>
+    <ForkRevision Condition="'$(ForkRevision)' == ''">3</ForkRevision>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(MSBuildProjectName)' == 'DeskBox' and '$(ForkRevision)' != ''">
