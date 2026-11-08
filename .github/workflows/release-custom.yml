@@ -1,0 +1,190 @@
+name: Release (GOXF fork installer)
+
+# Builds the fork's own Direct Full Native AOT installer (x64, unsigned) and
+# publishes it as a GitHub Release on this repository, so the in-app updater
+# (pointed at GOXF/DeskBox releases/latest) can update installed copies.
+#
+# Version = upstream base version (<Version> in src/DeskBox/DeskBox.csproj)
+#           + 4th segment ForkRevision, e.g. 1.5.9.1.
+# ForkRevision source, in order: tag (v1.5.9.N push) > workflow_dispatch input
+# > <ForkRevision> in Directory.Build.targets > 1.
+#
+# Fork-only file: upstream files are never edited in git. The Inno script's
+# version lines are patched inside the runner only, after the AOT publish.
+
+on:
+  workflow_dispatch:
+    inputs:
+      fork_revision:
+        description: 'Fork revision (4th version segment). Empty = value in Directory.Build.targets, else 1.'
+        required: false
+        default: ''
+        type: string
+  push:
+    tags:
+      - 'v*.*.*.*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-custom
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build x64 installer and publish release
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 120
+
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: 1
+      DOTNET_NOLOGO: 1
+      RestoreLockedMode: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve fork version
+        id: ver
+        shell: pwsh
+        run: |
+          $csproj = Get-Content -LiteralPath src/DeskBox/DeskBox.csproj -Raw
+          $m = [regex]::Match($csproj, '<Version>\s*(\d+\.\d+\.\d+)\s*</Version>')
+          if (-not $m.Success) { throw 'Could not read <Version> (x.y.z) from src/DeskBox/DeskBox.csproj.' }
+          $base = $m.Groups[1].Value
+
+          $rev = ''
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $t = [regex]::Match($env:GITHUB_REF_NAME, '^v(\d+\.\d+\.\d+)\.(\d+)$')
+            if (-not $t.Success) { throw "Tag '$env:GITHUB_REF_NAME' is not vX.Y.Z.N." }
+            if ($t.Groups[1].Value -ne $base) {
+              throw "Tag base $($t.Groups[1].Value) does not match csproj base version $base."
+            }
+            $rev = $t.Groups[2].Value
+          }
+          if (-not $rev) { $rev = '${{ inputs.fork_revision }}'.Trim() }
+          if (-not $rev -and (Test-Path -LiteralPath Directory.Build.targets)) {
+            $tm = [regex]::Match((Get-Content -LiteralPath Directory.Build.targets -Raw),
+              '<ForkRevision[^>]*>\s*(\d+)\s*</ForkRevision>')
+            if ($tm.Success) { $rev = $tm.Groups[1].Value }
+          }
+          if (-not $rev) { $rev = '1' }
+          if ($rev -notmatch '^\d+$') { throw "Fork revision '$rev' is not a non-negative integer." }
+
+          $version = "$base.$rev"
+          Write-Host "Base $base + ForkRevision $rev => $version"
+          "base=$base" >> $env:GITHUB_OUTPUT
+          "rev=$rev" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=v$version" >> $env:GITHUB_OUTPUT
+          # MSBuild reads environment variables as properties; a conditional
+          # default in Directory.Build.targets picks this up for the app's
+          # own assembly/file version.
+          "ForkRevision=$rev" >> $env:GITHUB_ENV
+
+      - name: Setup pinned .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Toolchain info (Rust, Inno Setup)
+        shell: pwsh
+        run: |
+          dotnet --version
+          rustc -vV
+          cargo --version
+          $iscc = @(
+            (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source,
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+          if (-not $iscc) { throw 'ISCC.exe not found on the runner image.' }
+          Write-Host "ISCC: $iscc"
+          "ISCC_PATH=$iscc" >> $env:GITHUB_ENV
+
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore .\DeskBox.sln --locked-mode -p:Platform=x64 -p:RuntimeIdentifier=win-x64 --verbosity minimal
+
+      - name: Publish Full Native AOT retail payload
+        shell: pwsh
+        run: .\scripts\publish-aot-retail.ps1 -Platform x64
+
+      - name: Check app file version
+        shell: pwsh
+        run: |
+          $exe = '.artifacts\aot-retail\win-x64\publish\DeskBox.exe'
+          $fv = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion
+          Write-Host "DeskBox.exe FileVersion: $fv (release ${{ steps.ver.outputs.version }})"
+          if ($fv -ne '${{ steps.ver.outputs.version }}') {
+            Write-Host "::warning::DeskBox.exe reports $fv, not ${{ steps.ver.outputs.version }}. The fork Directory.Build.targets (ForkRevision) is not applied yet, so the in-app updater may keep offering this release."
+          }
+
+      - name: Compile installer (Inno Setup, version patched in runner only)
+        shell: pwsh
+        run: |
+          $version = '${{ steps.ver.outputs.version }}'
+          $src = 'installer\DeskBox.iss'
+          # Same folder so relative #include/Source paths keep working.
+          $patched = 'installer\DeskBox.fork-release.iss'
+          $text = Get-Content -LiteralPath $src -Raw
+          $text = [regex]::Replace($text, '(?m)^(\s*#define\s+MyAppVersion\s+)"[^"]+"', "`${1}`"$version`"")
+          $text = [regex]::Replace($text, '(?m)^(\s*#define\s+MyAppVersionInfo\s+)"[^"]+"', "`${1}`"$version`"")
+          if ($text -notmatch "#define\s+MyAppVersion\s+`"$([regex]::Escape($version))`"" -or
+              $text -notmatch "#define\s+MyAppVersionInfo\s+`"$([regex]::Escape($version))`"") {
+            throw 'Failed to patch MyAppVersion / MyAppVersionInfo in the Inno script.'
+          }
+          [IO.File]::WriteAllText((Join-Path $PWD $patched), $text, [Text.UTF8Encoding]::new($true))
+
+          $publishDir = (Resolve-Path '.artifacts\aot-retail\win-x64\publish').Path
+          $outDir = Join-Path $PWD '.artifacts\release'
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          $baseName = "DeskBox_Setup_${version}_x64"
+          & $env:ISCC_PATH /Qp /DDeskBoxNativeAot=1 /DDeskBoxBundledRuntime=1 "/DMyAppReleaseDir=$publishDir" "/F$baseName" "/O$outDir" $patched
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed (exit $LASTEXITCODE)." }
+
+          $installer = Join-Path $outDir "$baseName.exe"
+          if (-not (Test-Path -LiteralPath $installer)) { throw "Installer '$installer' was not produced." }
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$installer.sha256", $hash)
+          Write-Host "Installer: $installer"
+          Write-Host "SHA256: $hash"
+          Get-ChildItem -LiteralPath $outDir | Format-Table Name, Length
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deskbox-setup-${{ steps.ver.outputs.version }}-x64
+          if-no-files-found: error
+          retention-days: 14
+          path: .artifacts/release/*
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ steps.ver.outputs.tag }}'
+          $version = '${{ steps.ver.outputs.version }}'
+          $files = @(Get-ChildItem -LiteralPath .artifacts\release -File | ForEach-Object FullName)
+          $notes = @"
+          DeskBox fork build $version (GOXF/DeskBox, branch ${{ github.ref_name }}, commit ${{ github.sha }}).
+
+          Upstream base version ${{ steps.ver.outputs.base }} + fork revision ${{ steps.ver.outputs.rev }}.
+          Unsigned x64 Direct Full Native AOT installer; SHA-256 in the .sha256 file.
+          "@
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag exists; replacing assets."
+            gh release upload $tag @files --clobber --repo $env:GITHUB_REPOSITORY
+            if ($LASTEXITCODE -ne 0) { throw 'gh release upload failed.' }
+            gh release edit $tag --latest --draft=false --prerelease=false --repo $env:GITHUB_REPOSITORY
+            if ($LASTEXITCODE -ne 0) { throw 'gh release edit failed.' }
+          }
+          else {
+            gh release create $tag @files --target $env:GITHUB_SHA --title "DeskBox $version" --notes $notes --latest --repo $env:GITHUB_REPOSITORY
+            if ($LASTEXITCODE -ne 0) { throw 'gh release create failed.' }
+          }
+          gh release view $tag --repo $env:GITHUB_REPOSITORY --json url,tagName,isLatest,assets
