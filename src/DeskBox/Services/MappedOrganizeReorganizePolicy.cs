@@ -3,10 +3,10 @@ using DeskBox.Models;
 namespace DeskBox.Services;
 
 /// <summary>
-/// GOXF fork, 「映射整理」 → 「重新整理桌面」: entries put back on the desktop
+/// GOXF fork, 「映射整理」 → 「整理预览…」: entries put back on the desktop
 /// (「放回桌面」, see <see cref="MappedOrganizeKeepList"/>) are skipped by
-/// automatic sorting of new files and by the mapped widget's quick
-/// 「一键整理」, but the organize preview treats them like any other desktop
+/// automatic sorting of new files (the one-click 「一键整理」 clears the marks
+/// and organizes them, see ForkOneClickOrganizer), and the organize preview treats them like any other desktop
 /// entry: sorted into their category by the normal rules and selected by
 /// default; confirming maps them and clears the mark
 /// (<see cref="MappedOrganizeService.ApplyGroupsAsync"/>), unticking keeps it.
@@ -60,7 +60,7 @@ public static class MappedOrganizeReorganizePolicy
     }
 
     /// <summary>
-    /// Whether a widget's menus offer 「重新整理桌面」: the widget is a mapped
+    /// Whether a widget's menus offer 「一键整理桌面」 / 「整理预览…」: the widget is a mapped
     /// widget, or it is a member of a tab group that holds one.
     /// </summary>
     public static bool ShouldOfferReorganize(

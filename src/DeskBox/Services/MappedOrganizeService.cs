@@ -223,8 +223,9 @@ public sealed partial class MappedOrganizeService : IDisposable
         int assignedCount = 0;
         foreach (MappedOrganizeGroup group in groups.Where(group => group.Paths.Count > 0))
         {
-            WidgetConfig? target = LiveMappedWidgets().FirstOrDefault(widget => string.Equals(
-                MappedOrganizeWidgetMetadata.GetCategory(widget), group.CategoryId, StringComparison.Ordinal));
+            // Same category, else same name: never a second mapped widget for one category.
+            WidgetConfig? target = ForkOneClickOrganizePolicy.FindMappedTarget(
+                LiveMappedWidgets(), group.CategoryId, group.DisplayName);
             if (target is null)
             {
                 target = CreateMappedConfig(group.CategoryId, group.DisplayName);

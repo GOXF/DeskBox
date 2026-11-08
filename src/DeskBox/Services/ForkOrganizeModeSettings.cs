@@ -207,6 +207,14 @@ public static partial class ForkOrganizeModeText
         MenuKeepOnDesktop,
         KeptOnDesktopFormat,
         MenuReorganizeDesktop,
+        MenuOrganizePreview,
+        OneClickDoneTitle,
+        OneClickDoneFormat,
+        OneClickPartialFormat,
+        OneClickNothingTitle,
+        OneClickNothingBody,
+        OneClickFailedTitle,
+        OneClickFailedBody,
     }
 
     /// <summary>UI-culture lookup lives in Helpers/ForkOrganizeModeText.Culture.cs (no App globals in Services).</summary>
@@ -221,9 +229,9 @@ public static partial class ForkOrganizeModeText
         {
             Key.SettingTitle => Pick("整理方式", "整理方式", "Organize mode"),
             Key.SettingDescription => Pick(
-                "「开始整理」和自动整理新文件按此方式执行。",
-                "「開始整理」和自動整理新檔案按此方式執行。",
-                "Used by Start organizing and by automatic organization of new files."),
+                "一键整理桌面、整理预览和自动整理新文件按此方式执行。",
+                "一鍵整理桌面、整理預覽和自動整理新檔案按此方式執行。",
+                "Used by Organize desktop, the organize preview and automatic organization of new files."),
             Key.OptionMove => Pick("移动到格子", "移動到格子", "Move into widgets"),
             Key.OptionMapOnly => Pick("只映射，不移动文件", "只映射，不移動檔案", "Map only, don't move files"),
             Key.MapOnlyNote => Pick(
@@ -261,10 +269,30 @@ public static partial class ForkOrganizeModeText
                 "Start organizing only creates mapped widgets: files stay in the Desktop folder and mapped items are hidden on the desktop. Change it under Settings → Desktop organization → Organize mode."),
             Key.MenuKeepOnDesktop => Pick("放回桌面", "放回桌面", "Put back on desktop"),
             Key.KeptOnDesktopFormat => Pick(
-                "已将 {0} 个项目放回桌面，自动归类不会再收回它们；需要时可用「重新整理桌面」按规则重新整理。",
-                "已將 {0} 個項目放回桌面，自動歸類不會再收回它們；需要時可用「重新整理桌面」按規則重新整理。",
-                "Put {0} items back on the desktop. Automatic sorting leaves them there; use Reorganize desktop to sort them by the rules again."),
-            Key.MenuReorganizeDesktop => Pick("重新整理桌面", "重新整理桌面", "Reorganize desktop"),
+                "已将 {0} 个项目放回桌面，自动归类不会再收回它们；点「一键整理」会把它们一并整理进格子。",
+                "已將 {0} 個項目放回桌面，自動歸類不會再收回它們；點「一鍵整理」會把它們一併整理進格子。",
+                "Put {0} items back on the desktop. Automatic sorting leaves them there; Organize desktop sorts them into widgets again."),
+            Key.MenuReorganizeDesktop => Pick("一键整理桌面", "一鍵整理桌面", "Organize desktop"),
+            Key.MenuOrganizePreview => Pick("整理预览…", "整理預覽…", "Organize with preview…"),
+            Key.OneClickDoneTitle => Pick("桌面已整理", "桌面已整理", "Desktop organized"),
+            Key.OneClickDoneFormat => Pick(
+                "已整理 {0} 个项目（{1}）。",
+                "已整理 {0} 個項目（{1}）。",
+                "Organized {0} items ({1})."),
+            Key.OneClickPartialFormat => Pick(
+                "已整理 {0} 个项目，{1} 个项目未能整理（可在「整理预览…」中查看）。",
+                "已整理 {0} 個項目，{1} 個項目未能整理（可在「整理預覽…」中查看）。",
+                "Organized {0} items; {1} items couldn't be organized (see Organize with preview…)."),
+            Key.OneClickNothingTitle => Pick("桌面已经很整洁", "桌面已經很整潔", "Desktop is already tidy"),
+            Key.OneClickNothingBody => Pick(
+                "没有需要整理的项目。",
+                "沒有需要整理的項目。",
+                "There is nothing to organize."),
+            Key.OneClickFailedTitle => Pick("整理桌面失败", "整理桌面失敗", "Couldn't organize the desktop"),
+            Key.OneClickFailedBody => Pick(
+                "可以从托盘菜单「整理预览…」打开预览重试。",
+                "可以從系統匣選單「整理預覽…」開啟預覽重試。",
+                "Open Organize with preview… from the tray menu to try again."),
             _ => key.ToString(),
         };
     }

@@ -83,6 +83,19 @@ public sealed class DesktopOrganizationPlanner
             }
 
             string displayName = categoryDisplayNameResolver(categoryId);
+            // GOXF fork: a bucket whose category (or name) already has a widget joins it instead of a second one.
+            if (DesktopOrganizationCategoryReuse.FindExistingWidget(categoryId, displayName, items.Select(item => item.Extension), widgets, rules) is { } reuse)
+            {
+                if (!targets.TryGetValue(reuse.Id, out MutableTarget? reused))
+                {
+                    reused = new MutableTarget(reuse.Id, categoryId, reuse.Id, reuse.Name, Path.GetFullPath(reuse.MappedFolderPath!), createsWidget: false);
+                    targets.Add(reuse.Id, reused);
+                }
+
+                reused.Items.AddRange(items);
+                continue;
+            }
+
             string directory = FileService.GetAvailablePath(
                 Path.Combine(normalizedRoot, SanitizeFolderName(displayName)),
                 reservedDirectories);

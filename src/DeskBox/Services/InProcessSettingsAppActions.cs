@@ -51,8 +51,9 @@ public sealed class InProcessSettingsAppActions : ISettingsAppActions
     public void ShowOnboarding(bool resumeProgress = false) =>
         _app.ShowOnboarding(resumeProgress);
 
+    // GOXF fork: the settings 「一键整理桌面」 / 「整理桌面」 buttons organize in one click.
     public void ShowDesktopOrganizationWindow(nint ownerWindowHandle = 0) =>
-        _app.ShowDesktopOrganizationWindow((IntPtr)ownerWindowHandle);
+        _app.OrganizeDesktopOneClick((IntPtr)ownerWindowHandle);
 
     public void OpenReleaseNotesWindow(
         AppUpdateManifest? manifest,

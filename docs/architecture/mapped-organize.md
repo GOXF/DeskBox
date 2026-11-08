@@ -99,11 +99,54 @@ offers as opt-in: `IncludeKeptOnDesktopItems`, one call in
 `MappedOrganizeReorganizePolicy.SelectKeptOptIns`, once per preview so a
 refresh does not re-tick what the user unticked). Confirming maps them and
 clears the mark (`ApplyGroupsAsync`); unticked entries stay kept. Entry
-points: 「重新整理桌面」 in a mapped widget's blank-area menu and in the
+points: 「整理预览…」 in a mapped widget's blank-area menu, in the
 title-bar 「…」 menu of a mapped widget or of a tab group holding one
 (`ContentWidgetWindow.MappedOrganize.cs`, one call in `CreateMoreFlyout`;
-`MappedOrganizeReorganizePolicy.ShouldOfferReorganize`). Both open the
-organize window (an already open window keeps its preview; 刷新 rescans).
+`MappedOrganizeReorganizePolicy.ShouldOfferReorganize`) and in the tray menu.
+The one-click organize below includes 「放回桌面」 entries without a preview.
+
+### 一键整理桌面 (one click, replaces opening the preview)
+
+「整理桌面」 finishes in one click; the preview with its 待整理 / 留在桌面 split
+is no longer the default. Entries that now run `ForkOneClickOrganizer`
+(`Services/ForkOneClickOrganize.cs`, host glue `App.ForkOneClickOrganize.cs`):
+the tray 「整理桌面…」 (`OpenDesktopOrganizationFromTray`), the settings
+buttons 「一键整理桌面」 (桌面整理) and 「整理桌面」 (文件格子) through
+`InProcessSettingsAppActions.ShowDesktopOrganizationWindow` (IPC unchanged),
+the mapped widget's blank-area 「一键整理」 and the title-bar 「…」
+「一键整理桌面」 (formerly 「重新整理桌面」).
+
+* 移动到格子: the preview's untouched default plan is executed
+  (`BuildPlanAsync` → `CreateExecutionPlan(plan, [])` → `ExecuteAsync`), so
+  history, 撤销 and recovery are the same; opt-in kinds (folders, large files)
+  stay on the desktop as in the preview.
+* 只映射: every 「放回桌面」 mark is cleared first
+  (`ReleaseAllKeptOnDesktop`), the plan includes all opt-in kinds (nothing
+  moves), entries go to the mapped widget of their own category when one
+  exists, otherwise to the planner's bucket
+  (`ForkOneClickOrganizePolicy.BuildMappedGroups`), then 「一键整理」 routing
+  sweeps the rest.
+* Result: a notification (with 撤销 when files were moved). A pending
+  interrupted organize, an open preview or a host that is not ready opens the
+  preview instead.
+* The preview stays reachable as 「整理预览…」 (tray menu, mapped widget
+  blank-area menu, title-bar 「…」 menu).
+* Automatic sorting of new files still skips 「放回桌面」 entries.
+
+### Same category → same widget (duplicate 「其他」 fix)
+
+Cause: a widget created by an earlier organize gets a rule for the
+categories it received (e.g. 「其他」 = [Other]). A category with a single
+item (e.g. one video, Media) is merged into the 「其他」 bucket by
+`MergeSmallAndOverflowCategories`; that item matches no rule, so the planner
+proposed a second, new 「其他」. `DesktopOrganizationCategoryReuse` (one call in
+`DesktopOrganizationPlanner.CreatePlan`) now lets a bucket join the widget of
+an enabled rule listing its category (unless the rule excludes one of the
+bucket's extensions), else a widget whose name equals the bucket's name.
+Mapped groups likewise join an existing mapped widget by category, else by
+name (`ForkOneClickOrganizePolicy.FindMappedTarget` in `ApplyGroupsAsync`).
+Limit: in 只映射 mode a real-folder (moved-files) widget named 「其他」 can't
+receive mapped entries, so it still sits next to the mapped 「其他」.
 
 ### 拖到桌面 = 放回桌面
 
@@ -164,6 +207,12 @@ topology profiles and wake recovery apply unchanged.
 * `ContentWidgetWindow.Commands.cs`: one `AppendMappedOrganizeMoreMenuItems`
   call in `CreateMoreFlyout`; `DesktopOrganizationTaskView.xaml.cs`: one
   `IncludeKeptOnDesktopItems` call in `ScanAsync` (重新整理桌面).
+* `App.Tray.cs`: `OpenDesktopOrganizationFromTray` runs the one-click organize,
+  one `CreateForkOrganizePreviewTrayItem` line (整理预览…).
+* `Services/InProcessSettingsAppActions.cs`: `ShowDesktopOrganizationWindow`
+  → `OrganizeDesktopOneClick` (one click from the settings buttons).
+* `DesktopOrganizationPlanner.cs`: one `DesktopOrganizationCategoryReuse` block
+  in `CreatePlan` (no duplicate same-category widget).
 * `FileService.cs`: DeskBox-hidden members stay displayable (3 conditions).
 * `DesktopAutoOrganizationWatcher.cs`: 只映射 hand-off (one block).
 * `DesktopOrganizationSettingsSection.xaml`: one host panel for the mode card.
@@ -175,6 +224,8 @@ topology profiles and wake recovery apply unchanged.
 
 * Manual mode: new desktop files stay unassigned (visible on the desktop)
   until 「一键整理」.
+* The tray item keeps the upstream text 「整理桌面…」 (upstream string; its
+  ellipsis is now slightly misleading).
 * Public Desktop entries need admin rights to change attributes; when that
   fails they stay visible on the desktop as well as in the widget.
 * Hidden entries are also hidden in File Explorer's Desktop folder view.

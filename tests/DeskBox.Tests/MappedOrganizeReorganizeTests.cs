@@ -107,10 +107,11 @@ public sealed class MappedOrganizeReorganizeTests
         string titleMenu = File.ReadAllText(TestPaths.FromRepository("src/DeskBox/Views/ContentWidgetWindow.Commands.cs"));
         Assert.Contains("AppendMappedOrganizeMoreMenuItems(flyout);", titleMenu, StringComparison.Ordinal);
 
-        string blankMenu = File.ReadAllText(TestPaths.FromRepository("src/DeskBox/Controls/WidgetContents/FileSurfaceContent.MappedOrganize.cs"));
-        Assert.Contains("ForkOrganizeModeText.Key.MenuReorganizeDesktop", blankMenu, StringComparison.Ordinal);
+        // 「重新整理桌面」 became the one-click 「一键整理桌面」 (ForkOneClickOrganizeTests).
+        string titleMenuFork = File.ReadAllText(TestPaths.FromRepository("src/DeskBox/Views/ContentWidgetWindow.MappedOrganize.cs"));
+        Assert.Contains("ForkOrganizeModeText.Key.MenuReorganizeDesktop", titleMenuFork, StringComparison.Ordinal);
 
-        Assert.Equal("重新整理桌面", ForkOrganizeModeText.Get(LocalizationService.LanguageChinese, ForkOrganizeModeText.Key.MenuReorganizeDesktop));
-        Assert.Equal("Reorganize desktop", ForkOrganizeModeText.Get("en-US", ForkOrganizeModeText.Key.MenuReorganizeDesktop));
+        Assert.Equal("一键整理桌面", ForkOrganizeModeText.Get(LocalizationService.LanguageChinese, ForkOrganizeModeText.Key.MenuReorganizeDesktop));
+        Assert.Equal("Organize desktop", ForkOrganizeModeText.Get("en-US", ForkOrganizeModeText.Key.MenuReorganizeDesktop));
     }
 }
