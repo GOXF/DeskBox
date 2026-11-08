@@ -36,17 +36,39 @@ public sealed partial class FileSurfaceContent
         return true;
     }
 
-    /// <summary>「重新整理桌面」: opens the organize preview (放回桌面 items included, see MappedOrganizeReorganizePolicy).</summary>
-    internal static void OpenMappedReorganizePreview()
+    /// <summary>
+    /// 「一键整理」 (blank menu) and 「一键整理桌面」 (title 「…」 menu): organize the
+    /// whole desktop in one click by the global 「整理方式」, 「放回桌面」 entries
+    /// included (see ForkOneClickOrganizer).
+    /// </summary>
+    internal static void RunOneClickOrganize()
     {
         try
         {
-            App.Current.ShowDesktopOrganizationWindow();
+            App.Current.OrganizeDesktopOneClick();
         }
         catch (Exception ex)
         {
-            App.Log($"[MappedOrganize] Opening the organize preview failed: {ex.Message}");
+            App.Log($"[MappedOrganize] One-click organize failed to start: {ex.Message}");
         }
+    }
+
+    /// <summary>「整理预览…」: the old organize preview window, kept as a secondary entry.</summary>
+    internal static void OpenOrganizePreview() => App.Current.OpenDesktopOrganizationPreview();
+
+    internal static MenuFlyoutItem CreateOrganizePreviewMenuItem(MenuFlyout flyout)
+    {
+        var preview = new MenuFlyoutItem
+        {
+            Text = ForkOrganizeModeText.Get(ForkOrganizeModeText.Key.MenuOrganizePreview),
+            Icon = new FontIcon { Glyph = "\uE8A1" }
+        };
+        preview.Click += (_, _) =>
+        {
+            flyout.Hide();
+            OpenOrganizePreview();
+        };
+        return preview;
     }
 
     private void AddMappedOrganizeMenuItems(MenuFlyout flyout)
@@ -59,24 +81,13 @@ public sealed partial class FileSurfaceContent
         flyout.Items.Add(new MenuFlyoutSeparator());
 
         MenuFlyoutItem organizeNow = CreateMenuItem("MappedOrganize.Menu.OrganizeNow", "\uE8CB");
-        organizeNow.Click += async (_, _) =>
+        organizeNow.Click += (_, _) =>
         {
             flyout.Hide();
-            await RunAsync(() => service.OrganizeNowAsync());
+            RunOneClickOrganize();
         };
         flyout.Items.Add(organizeNow);
-
-        var reorganize = new MenuFlyoutItem
-        {
-            Text = ForkOrganizeModeText.Get(ForkOrganizeModeText.Key.MenuReorganizeDesktop),
-            Icon = new FontIcon { Glyph = "\uE8B1" }
-        };
-        reorganize.Click += (_, _) =>
-        {
-            flyout.Hide();
-            OpenMappedReorganizePreview();
-        };
-        flyout.Items.Add(reorganize);
+        flyout.Items.Add(CreateOrganizePreviewMenuItem(flyout));
 
         var autoAssign = new ToggleMenuFlyoutItem
         {

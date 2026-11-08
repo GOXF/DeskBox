@@ -6,9 +6,9 @@ namespace DeskBox.Views;
 
 /// <summary>
 /// GOXF fork, 「映射整理」: the title-bar 「…」 menu of a mapped widget — or of a
-/// tab group holding one — offers 「重新整理桌面」, which opens the organize
-/// preview where 「放回桌面」 items are sorted by the rules again
-/// (<see cref="MappedOrganizeReorganizePolicy"/>).
+/// tab group holding one — offers 「一键整理桌面」 (one click, 「放回桌面」 items
+/// included, see ForkOneClickOrganizer) and 「整理预览…」 (the old preview).
+/// Visibility: <see cref="MappedOrganizeReorganizePolicy.ShouldOfferReorganize"/>.
 /// </summary>
 public sealed partial class ContentWidgetWindow
 {
@@ -33,10 +33,11 @@ public sealed partial class ContentWidgetWindow
             reorganize.Click += (_, _) =>
             {
                 flyout.Hide();
-                FileSurfaceContent.OpenMappedReorganizePreview();
+                FileSurfaceContent.RunOneClickOrganize();
             };
             flyout.Items.Add(new MenuFlyoutSeparator());
             flyout.Items.Add(reorganize);
+            flyout.Items.Add(FileSurfaceContent.CreateOrganizePreviewMenuItem(flyout));
         }
         catch (Exception ex)
         {
