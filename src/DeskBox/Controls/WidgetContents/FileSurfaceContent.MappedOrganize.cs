@@ -36,6 +36,19 @@ public sealed partial class FileSurfaceContent
         return true;
     }
 
+    /// <summary>「重新整理桌面」: opens the organize preview (放回桌面 items included, see MappedOrganizeReorganizePolicy).</summary>
+    internal static void OpenMappedReorganizePreview()
+    {
+        try
+        {
+            App.Current.ShowDesktopOrganizationWindow();
+        }
+        catch (Exception ex)
+        {
+            App.Log($"[MappedOrganize] Opening the organize preview failed: {ex.Message}");
+        }
+    }
+
     private void AddMappedOrganizeMenuItems(MenuFlyout flyout)
     {
         if (!ViewModel.IsMappedOrganizeWidget || MappedOrganizeService.Current is not { } service)
@@ -52,6 +65,18 @@ public sealed partial class FileSurfaceContent
             await RunAsync(() => service.OrganizeNowAsync());
         };
         flyout.Items.Add(organizeNow);
+
+        var reorganize = new MenuFlyoutItem
+        {
+            Text = ForkOrganizeModeText.Get(ForkOrganizeModeText.Key.MenuReorganizeDesktop),
+            Icon = new FontIcon { Glyph = "\uE8B1" }
+        };
+        reorganize.Click += (_, _) =>
+        {
+            flyout.Hide();
+            OpenMappedReorganizePreview();
+        };
+        flyout.Items.Add(reorganize);
 
         var autoAssign = new ToggleMenuFlyoutItem
         {

@@ -206,6 +206,7 @@ public static partial class ForkOrganizeModeText
         PreviewTooltipMapOnly,
         MenuKeepOnDesktop,
         KeptOnDesktopFormat,
+        MenuReorganizeDesktop,
     }
 
     /// <summary>UI-culture lookup lives in Helpers/ForkOrganizeModeText.Culture.cs (no App globals in Services).</summary>
@@ -260,9 +261,10 @@ public static partial class ForkOrganizeModeText
                 "Start organizing only creates mapped widgets: files stay in the Desktop folder and mapped items are hidden on the desktop. Change it under Settings → Desktop organization → Organize mode."),
             Key.MenuKeepOnDesktop => Pick("放回桌面", "放回桌面", "Put back on desktop"),
             Key.KeptOnDesktopFormat => Pick(
-                "已将 {0} 个项目放回桌面，之后不会再自动归类它们。",
-                "已將 {0} 個項目放回桌面，之後不會再自動歸類它們。",
-                "Put {0} items back on the desktop. They won't be sorted automatically again."),
+                "已将 {0} 个项目放回桌面，自动归类不会再收回它们；需要时可用「重新整理桌面」按规则重新整理。",
+                "已將 {0} 個項目放回桌面，自動歸類不會再收回它們；需要時可用「重新整理桌面」按規則重新整理。",
+                "Put {0} items back on the desktop. Automatic sorting leaves them there; use Reorganize desktop to sort them by the rules again."),
+            Key.MenuReorganizeDesktop => Pick("重新整理桌面", "重新整理桌面", "Reorganize desktop"),
             _ => key.ToString(),
         };
     }

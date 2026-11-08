@@ -105,6 +105,7 @@ public sealed partial class DesktopOrganizationTaskView : UserControl
             var coordinator = Coordinator;
             DesktopOrganizationPlan scanned = await coordinator.BuildPlanAsync(false, cts.Token);
             if (cts.IsCancellationRequested || generation != _scanGeneration) return;
+            IncludeKeptOnDesktopItems(scanned, freshPreview: previous is null); // GOXF fork: 「放回桌面」 items are re-sorted by the preview.
             DesktopOrganizationPreviewReconciliation? changes = previous is null ? null :
                 DesktopOrganizationPreviewReconciliation.Calculate(previous.SourceItems, scanned.SourceItems,
                     _excludedSourcePaths, _optionalIncludedPaths, _newPaths);

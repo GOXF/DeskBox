@@ -6,15 +6,25 @@ namespace DeskBox.Services;
 /// <summary>Where a mapped-widget drag was released, resolved against the live desktop windows.</summary>
 internal readonly record struct MappedDesktopDropPoint(
     MappedDragDropTargetKind Kind,
-    bool OnIcon,
+    MappedDragIconHit IconHit,
+    string? IconText,
     IntPtr ListView,
     int ClientX,
     int ClientY,
     int AreaTopClient,
-    int AreaBottomClient)
+    int AreaBottomClient,
+    string Chain = "",
+    string? HitFailure = null)
 {
     internal static MappedDesktopDropPoint None { get; } =
-        new(MappedDragDropTargetKind.NotDesktop, false, IntPtr.Zero, 0, 0, 0, 0);
+        new(MappedDragDropTargetKind.NotDesktop, MappedDragIconHit.Blank, null, IntPtr.Zero, 0, 0, 0, 0);
+
+    /// <summary>One-line diagnostics for <c>[MappedOrganize] DragToDesktop …</c> log lines.</summary>
+    internal string Describe() =>
+        $"target={Kind} icon={IconHit}" +
+        (IconText is null ? string.Empty : $" iconText='{IconText}'") +
+        (HitFailure is null ? string.Empty : $" hitFailure={HitFailure}") +
+        $" chain='{Chain}'";
 }
 
 /// <summary>
@@ -22,12 +32,17 @@ internal readonly record struct MappedDesktopDropPoint(
 /// Reads the window under the release point (every monitor: the desktop list
 /// view spans the virtual screen, and Windows 11 may host it under WorkerW),
 /// classifies it with <see cref="MappedDragToDesktopPolicy.ClassifyTarget"/>,
-/// and tells blank desktop apart from an icon with the upstream
-/// <see cref="DesktopBlankHitTest"/>.
+/// and tells blank desktop, an icon (with its label) and a failed hit test
+/// apart with <see cref="DesktopListViewProbeNativeMethods"/>. The shell drag
+/// image (SysDragImage) can still sit under the cursor at the instant of
+/// release; the probe waits briefly for it to go away.
 /// </summary>
 internal static class MappedDragToDesktopTarget
 {
     private const int MaxAncestorDepth = 16;
+    private const int DragImageRetries = 4;
+
+    private static readonly string[] OverlayClasses = ["SysDragImage", "DragImageWindow"];
 
     internal static MappedDesktopDropPoint Probe(Win32Helper.POINT screenPoint)
     {
@@ -45,9 +60,15 @@ internal static class MappedDragToDesktopTarget
     private static MappedDesktopDropPoint ProbeCore(Win32Helper.POINT screenPoint)
     {
         IntPtr hit = Win32Helper.WindowFromPoint(screenPoint);
+        for (int retry = 0; hit != IntPtr.Zero && retry < DragImageRetries && IsOverlay(hit); retry++)
+        {
+            Thread.Sleep(25);
+            hit = Win32Helper.WindowFromPoint(screenPoint);
+        }
+
         if (hit == IntPtr.Zero)
         {
-            return MappedDesktopDropPoint.None;
+            return MappedDesktopDropPoint.None with { Chain = "<no window>" };
         }
 
         var chain = new List<string>();
@@ -94,9 +115,12 @@ internal static class MappedDragToDesktopTarget
         }
 
         MappedDragDropTargetKind kind = MappedDragToDesktopPolicy.ClassifyTarget(chain, ownedByDeskBox, ownedByShell);
+        string chainText = string.Join(">", chain) +
+                           (ownedByDeskBox ? " [DeskBox]" : string.Empty) +
+                           (ownedByShell ? string.Empty : " [not shell]");
         if (kind == MappedDragDropTargetKind.NotDesktop)
         {
-            return MappedDesktopDropPoint.None;
+            return MappedDesktopDropPoint.None with { Chain = chainText };
         }
 
         if (listView == IntPtr.Zero && defView != IntPtr.Zero)
@@ -104,10 +128,23 @@ internal static class MappedDragToDesktopTarget
             listView = Win32Helper.FindWindowEx(defView, IntPtr.Zero, "SysListView32", null);
         }
 
-        // DesktopBlankHitTest answers false both for an icon and for a failed
-        // hit test; either way the drop is left to the upstream handling.
-        bool onIcon = kind == MappedDragDropTargetKind.DesktopIconList &&
-                      !DesktopBlankHitTest.IsBlankDesktopPoint(screenPoint);
+        MappedDragIconHit iconHit = MappedDragIconHit.Blank;
+        string? iconText = null;
+        string? hitFailure = null;
+        if (kind == MappedDragDropTargetKind.DesktopIconList)
+        {
+            DesktopListViewHit listHit = DesktopListViewProbeNativeMethods.HitTest(listView, screenPoint);
+            if (!listHit.Succeeded)
+            {
+                iconHit = MappedDragIconHit.Failed;
+                hitFailure = listHit.Failure;
+            }
+            else if (listHit.ItemIndex >= 0)
+            {
+                iconHit = MappedDragIconHit.Item;
+                iconText = listHit.ItemText;
+            }
+        }
 
         int clientX = screenPoint.X;
         int clientY = screenPoint.Y;
@@ -134,7 +171,15 @@ internal static class MappedDragToDesktopTarget
             areaBottom = work.Bottom + offsetY;
         }
 
-        return new MappedDesktopDropPoint(kind, onIcon, listView, clientX, clientY, areaTop, areaBottom);
+        return new MappedDesktopDropPoint(
+            kind, iconHit, iconText, listView, clientX, clientY, areaTop, areaBottom, chainText, hitFailure);
+    }
+
+    private static bool IsOverlay(IntPtr window)
+    {
+        IntPtr root = Win32Helper.GetAncestor(window, Win32Helper.GA_ROOT);
+        string className = ClassOf(root == IntPtr.Zero ? window : root);
+        return OverlayClasses.Any(overlay => string.Equals(overlay, className, StringComparison.OrdinalIgnoreCase));
     }
 
     private static string ClassOf(IntPtr window)

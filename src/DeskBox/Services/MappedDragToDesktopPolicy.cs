@@ -13,6 +13,22 @@ public enum MappedDragDropTargetKind
     DesktopHost,
 }
 
+/// <summary>What the desktop list view reported under the release point.</summary>
+public enum MappedDragIconHit
+{
+    /// <summary>Blank desktop (no icon under the point), or no icon list there at all.</summary>
+    Blank,
+
+    /// <summary>An icon is under the point (its display text may be known).</summary>
+    Item,
+
+    /// <summary>The cross-process hit test could not run (Explorer busy, access denied, timeout).</summary>
+    Failed,
+}
+
+/// <summary>A 「放回桌面」 verdict plus the reason logged as <c>[MappedOrganize] DragToDesktop skip reason=…</c>.</summary>
+public readonly record struct MappedDragPutBackDecision(bool PutBack, string Reason);
+
 /// <summary>
 /// GOXF fork, 「映射整理」: pure decisions for 「从映射格子拖到桌面 = 放回桌面」.
 /// A mapped item already lives in the desktop folder, so Explorer treats a drop
@@ -94,12 +110,105 @@ public static class MappedDragToDesktopPolicy
         bool droppedOnIcon,
         bool mouseButtonDown = false,
         bool escapePressed = false) =>
-        isMappedWidget &&
-        !handledInternally &&
-        target != MappedDragDropTargetKind.NotDesktop &&
-        !droppedOnIcon &&
-        !mouseButtonDown &&
-        !escapePressed;
+        Evaluate(
+            isMappedWidget,
+            handledInternally,
+            target,
+            droppedOnIcon ? MappedDragIconHit.Item : MappedDragIconHit.Blank,
+            iconText: null,
+            draggedPaths: [],
+            mouseButtonDown,
+            escapePressed).PutBack;
+
+    /// <summary>
+    /// Full verdict with a reason for the diagnostics log. An icon under the
+    /// release point only blocks 「放回桌面」 when it is another entry: with
+    /// 「显示隐藏的项目」 on, the dragged (hidden) entry itself is listed and
+    /// Explorer may already have moved it under the cursor. A hit test that
+    /// could not run does not block either: every put-back path is re-checked
+    /// to still exist on the desktop, so a real move into a folder icon drops
+    /// out there.
+    /// </summary>
+    public static MappedDragPutBackDecision Evaluate(
+        bool isMappedWidget,
+        bool handledInternally,
+        MappedDragDropTargetKind target,
+        MappedDragIconHit iconHit,
+        string? iconText,
+        IReadOnlyCollection<string> draggedPaths,
+        bool mouseButtonDown,
+        bool escapePressed)
+    {
+        if (!isMappedWidget)
+        {
+            return new(false, "not-mapped-widget");
+        }
+
+        if (handledInternally)
+        {
+            return new(false, "handled-internally");
+        }
+
+        if (escapePressed)
+        {
+            return new(false, "escape-pressed");
+        }
+
+        if (mouseButtonDown)
+        {
+            return new(false, "mouse-button-down");
+        }
+
+        if (target == MappedDragDropTargetKind.NotDesktop)
+        {
+            return new(false, "not-desktop");
+        }
+
+        if (iconHit == MappedDragIconHit.Item)
+        {
+            return IsDraggedItemText(iconText, draggedPaths)
+                ? new(true, "own-icon")
+                : new(false, "on-other-icon");
+        }
+
+        return new(true, iconHit == MappedDragIconHit.Failed ? "hit-test-failed" : "blank");
+    }
+
+    /// <summary>
+    /// Whether the desktop label <paramref name="iconText"/> is one of the
+    /// dragged entries: the label is the file name, or the name without its
+    /// extension (extensions hidden, .lnk / .url always).
+    /// </summary>
+    public static bool IsDraggedItemText(string? iconText, IEnumerable<string>? draggedPaths)
+    {
+        if (string.IsNullOrWhiteSpace(iconText) || draggedPaths is null)
+        {
+            return false;
+        }
+
+        string label = iconText.Trim();
+        foreach (string path in draggedPaths)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                continue;
+            }
+
+            string name = Path.GetFileName(Path.TrimEndingDirectorySeparator(path.Trim()));
+            if (name.Length == 0)
+            {
+                continue;
+            }
+
+            if (string.Equals(label, name, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(label, Path.GetFileNameWithoutExtension(name), StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     /// <summary>
     /// The entries to put back: dragged paths that still exist and sit directly
