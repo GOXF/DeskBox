@@ -1,3 +1,5 @@
+using DeskBox.Models;
+
 namespace DeskBox.Services;
 
 /// <summary>
@@ -15,6 +17,29 @@ public sealed partial class MappedOrganizeService
 
     /// <summary>Entries currently marked 「放回桌面」 (copy; UI thread).</summary>
     public IReadOnlyCollection<string> KeptOnDesktopSnapshot() => _keptOnDesktop.ToArray();
+
+    /// <summary>
+    /// One-click 「整理桌面」: clears every 「放回桌面」 mark so those entries are
+    /// organized like any other desktop entry. Returns how many were cleared.
+    /// </summary>
+    public int ReleaseAllKeptOnDesktop()
+    {
+        int count = _keptOnDesktop.Count;
+        if (count > 0)
+        {
+            _keptOnDesktop.Clear();
+            SaveKeptOnDesktop();
+            App.Log($"[MappedOrganize] One-click organize released {count} kept-on-desktop entries.");
+        }
+
+        return count;
+    }
+
+    /// <summary>Categories that already have a (live) mapped widget.</summary>
+    public IReadOnlyCollection<string> MappedCategoryIds() =>
+        LiveMappedWidgets()
+            .Select(MappedOrganizeWidgetMetadata.GetCategory)
+            .ToHashSet(StringComparer.Ordinal);
 
     /// <summary>The organize mode the main process last applied.</summary>
     public DesktopOrganizeMode Mode => _mode;

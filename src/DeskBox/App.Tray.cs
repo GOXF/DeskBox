@@ -115,6 +115,7 @@ public partial class App
 
         _trayCreateWidgetItems.Clear();
         contextMenu.Items.Add(organizeDesktopItem);
+        contextMenu.Items.Add(CreateForkOrganizePreviewTrayItem(contextMenu)); // GOXF fork: 「整理预览…」
         contextMenu.Items.Add(new MenuFlyoutSeparator());
         foreach (var descriptor in new WidgetContentFactory(LocalizationService).GetCreateEntryDescriptors())
         {
@@ -1501,7 +1502,7 @@ public partial class App
     private void OpenDesktopOrganizationFromTray()
     {
         CancelBackgroundMemoryCleanup();
-        ShowDesktopOrganizationWindow();
+        OrganizeDesktopOneClick(); // GOXF fork: one click; the preview is 「整理预览…」
     }
 
     private void OpenAboutSettingsFromTray()

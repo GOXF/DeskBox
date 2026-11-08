@@ -18,7 +18,7 @@ public sealed partial class DesktopOrganizationTaskView
     private readonly HashSet<string> _keptOnDesktopOptInsApplied = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
-    /// 「重新整理桌面」: in 「只映射」 mode, entries put back on the desktop are
+    /// 「整理预览…」: in 「只映射」 mode, entries put back on the desktop are
     /// sorted by the normal rules and start ticked, including the kinds the
     /// scanner only offers as opt-in (folders, large files). Confirming maps
     /// them and clears the 「放回桌面」 mark; unticking keeps it.
