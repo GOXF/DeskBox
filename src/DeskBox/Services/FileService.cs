@@ -483,7 +483,8 @@ public sealed partial class FileService
                     // them launches Steam's install flow, so they remain
                     // useful and must stay visible in the box.
                     bool isFiltered =
-                        entry.Attributes.HasFlag(System.IO.FileAttributes.Hidden) ||
+                        (entry.Attributes.HasFlag(System.IO.FileAttributes.Hidden) &&
+                         !MappedOrganizeHiddenRegistry.IsHiddenByDeskBox(fullPath)) ||
                         entry.FileName.Equals(
                             "desktop.ini",
                             StringComparison.OrdinalIgnoreCase);
@@ -635,7 +636,8 @@ public sealed partial class FileService
         {
             return ClassifyExistingEntry(
                 Path.GetFileName(normalizedPath),
-                File.GetAttributes(normalizedPath));
+                File.GetAttributes(normalizedPath),
+                normalizedPath);
         }
         catch (UnauthorizedAccessException)
         {
@@ -677,7 +679,8 @@ public sealed partial class FileService
         {
             return ClassifyExistingEntry(
                 Path.GetFileName(normalizedPath),
-                File.GetAttributes(normalizedPath));
+                File.GetAttributes(normalizedPath),
+                normalizedPath);
         }
         catch (FileNotFoundException)
         {
@@ -712,13 +715,15 @@ public sealed partial class FileService
     /// </summary>
     private static FolderEntryRefreshStatus ClassifyExistingEntry(
         string name,
-        System.IO.FileAttributes attributes)
+        System.IO.FileAttributes attributes,
+        string? fullPath = null)
     {
         // Stale Steam game shortcuts (.url whose game is uninstalled) are
         // deliberately NOT filtered: opening them launches Steam's install
         // flow, so they remain useful and must stay visible in the box.
         if (name.Equals("desktop.ini", StringComparison.OrdinalIgnoreCase) ||
-            (attributes & System.IO.FileAttributes.Hidden) != 0)
+            ((attributes & System.IO.FileAttributes.Hidden) != 0 &&
+             !MappedOrganizeHiddenRegistry.IsHiddenByDeskBox(fullPath)))
         {
             return FolderEntryRefreshStatus.Filtered;
         }
@@ -861,7 +866,8 @@ public sealed partial class FileService
             }
 
             var attr = File.GetAttributes(path);
-            return (attr & System.IO.FileAttributes.Hidden) == 0;
+            return (attr & System.IO.FileAttributes.Hidden) == 0 ||
+                MappedOrganizeHiddenRegistry.IsHiddenByDeskBox(path);
         }
         catch
         {

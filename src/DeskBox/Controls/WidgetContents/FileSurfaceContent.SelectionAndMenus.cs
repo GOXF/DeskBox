@@ -538,7 +538,7 @@ public sealed partial class FileSurfaceContent
     {
         return new FileItemMenuActions(
             CreateMenuItem,
-            T,
+            LocalizeFileItemMenu,
             ActivateItemAsync,
             cut => RunAsync(
                 () => CopySelectionToClipboardAsync(cut)),
@@ -2053,6 +2053,11 @@ public sealed partial class FileSurfaceContent
     {
         IReadOnlyList<WidgetItem> items = GetSelectedItems();
         if (items.Count == 0)
+        {
+            return;
+        }
+
+        if (TryKeepMappedItemsOnDesktop(items))
         {
             return;
         }
