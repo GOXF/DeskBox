@@ -40,7 +40,9 @@ public sealed class ReleaseNotesKnownVersionsTests
         // pin turns a forgotten append into a red suite on the first build
         // of the next version instead of a silently missing rail entry on
         // every 1.5.9 machine.
-        string current = AppUpdateService.GetCurrentAppVersion();
+        // GOXF fork: the running version carries a 4th fork-revision segment
+        // (1.5.9.1); the known-versions rail lists upstream base versions.
+        string current = ForkUpdateConfig.GetBaseVersion(AppUpdateService.GetCurrentAppVersion());
         Assert.NotEqual("0.0.0", current);
         Assert.Equal(current, ReleaseNotesService.KnownReleaseVersions[0]);
     }

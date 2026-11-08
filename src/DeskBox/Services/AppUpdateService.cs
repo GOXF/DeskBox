@@ -12,9 +12,10 @@ namespace DeskBox.Services;
 
 public sealed partial class AppUpdateService : IAppUpdateService
 {
-    public const string DefaultManifestUrl = "https://deskbox.fun/update/stable.json";
-    public const string DefaultGitHubLatestReleaseApiUrl = "https://api.github.com/repos/Tianyu199509/DeskBox/releases/latest";
-    public const string DefaultManualDownloadUrl = "https://deskbox.fun/download";
+    // GOXF fork: update sources live in ForkUpdateConfig (fork releases only).
+    public const string DefaultManifestUrl = ForkUpdateConfig.ManifestUrl;
+    public const string DefaultGitHubLatestReleaseApiUrl = ForkUpdateConfig.ForkLatestReleaseApiUrl;
+    public const string DefaultManualDownloadUrl = ForkUpdateConfig.ForkReleasesPageUrl;
 
     private readonly HttpClient _httpClient;
     private readonly string _manifestUrl;
@@ -191,10 +192,16 @@ public sealed partial class AppUpdateService : IAppUpdateService
 
     public async Task<AppUpdateCheckResult> CheckForUpdatesAsync(string currentVersion, CancellationToken cancellationToken = default)
     {
-        var manifestResult = await CheckManifestForUpdatesAsync(currentVersion, cancellationToken);
-        if (manifestResult.Status is AppUpdateCheckStatus.UpdateAvailable or AppUpdateCheckStatus.UpToDate)
+        // GOXF fork: no manifest by default (ForkUpdateConfig.ManifestUrl is
+        // empty), so the fork's GitHub latest release is the only source.
+        AppUpdateCheckResult? manifestResult = null;
+        if (!string.IsNullOrWhiteSpace(_manifestUrl))
         {
-            return SetLastCheckResult(manifestResult);
+            manifestResult = await CheckManifestForUpdatesAsync(currentVersion, cancellationToken);
+            if (manifestResult.Status is AppUpdateCheckStatus.UpdateAvailable or AppUpdateCheckStatus.UpToDate)
+            {
+                return SetLastCheckResult(manifestResult);
+            }
         }
 
         var githubResult = await CheckGitHubLatestReleaseForUpdatesAsync(currentVersion, cancellationToken);
@@ -203,7 +210,7 @@ public sealed partial class AppUpdateService : IAppUpdateService
             return SetLastCheckResult(githubResult);
         }
 
-        return SetLastCheckResult(manifestResult);
+        return SetLastCheckResult(manifestResult ?? githubResult);
     }
 
     private async Task<AppUpdateCheckResult> CheckManifestForUpdatesAsync(string currentVersion, CancellationToken cancellationToken)
@@ -707,6 +714,11 @@ public sealed partial class AppUpdateService : IAppUpdateService
     public static async Task<AppUpdateManifest?> FetchContentManifestAsync(
         CancellationToken cancellationToken = default)
     {
+        if (string.IsNullOrWhiteSpace(DefaultManifestUrl))
+        {
+            return null;
+        }
+
         try
         {
             return await FetchContentManifestAsync(DefaultManifestUrl, s_contentHttpClient, cancellationToken);
@@ -756,7 +768,7 @@ public sealed partial class AppUpdateService : IAppUpdateService
         {
             Channel = "direct",
             Version = version.Trim(),
-            ReleaseNotesUrl = $"https://github.com/Tianyu199509/DeskBox/releases/tag/v{version.Trim()}",
+            ReleaseNotesUrl = ForkUpdateConfig.GetReleaseTagUrl(version),
         };
     }
 
@@ -768,32 +780,8 @@ public sealed partial class AppUpdateService : IAppUpdateService
     /// </summary>
     private static bool IsTrustedInstallerDownloadUri(Uri uri)
     {
-        if (!string.Equals(uri.Scheme, "https", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        if (IsHostOrSubdomain(uri, "deskbox.fun"))
-        {
-            return true;
-        }
-
-        // GitHub hosts third-party repositories, so trusting the whole domain
-        // would let a tampered manifest point at any attacker repository with
-        // a matching hash. Only this project's own release downloads count;
-        // the actual asset bytes arrive via redirect from
-        // objects.githubusercontent.com, which the HTTP client follows and
-        // which therefore must never be trusted as a manifest origin itself.
-        return string.Equals(uri.Host, "github.com", StringComparison.OrdinalIgnoreCase) &&
-            uri.AbsolutePath.StartsWith(
-                "/Tianyu199509/DeskBox/releases/download/",
-                StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsHostOrSubdomain(Uri uri, string domain)
-    {
-        return uri.Host.Equals(domain, StringComparison.OrdinalIgnoreCase) ||
-            uri.Host.EndsWith("." + domain, StringComparison.OrdinalIgnoreCase);
+        // GOXF fork: only GOXF/DeskBox release downloads (see ForkUpdateConfig).
+        return ForkUpdateConfig.IsTrustedInstallerDownloadUri(uri);
     }
 
     internal static bool TrySelectInstallerForArchitecture(
