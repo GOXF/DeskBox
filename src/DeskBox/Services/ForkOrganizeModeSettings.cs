@@ -184,7 +184,7 @@ public static class ForkOrganizeModePolicy
 /// merge-conflict reason as SettingsViewModel.ForkUpstream.cs: no upstream
 /// Strings/*.json edits.
 /// </summary>
-public static class ForkOrganizeModeText
+public static partial class ForkOrganizeModeText
 {
     public enum Key
     {
@@ -208,6 +208,7 @@ public static class ForkOrganizeModeText
         KeptOnDesktopFormat,
     }
 
+    /// <summary>UI-culture lookup lives in Helpers/ForkOrganizeModeText.Culture.cs (no App globals in Services).</summary>
     public static string Get(Key key) => Get(CurrentCulture(), key);
 
     public static string Get(string? cultureName, Key key)
@@ -272,17 +273,6 @@ public static class ForkOrganizeModeText
     public static string ModeName(DesktopOrganizeMode mode) =>
         Get(mode == DesktopOrganizeMode.MapOnly ? Key.OptionMapOnly : Key.OptionMove);
 
-    private static string? CurrentCulture()
-    {
-        try
-        {
-            return App.Current?.LocalizationService?.CurrentCultureName;
-        }
-        catch (Exception)
-        {
-            return null;
-        }
-    }
 }
 
 /// <summary>Reads Explorer's 「显示隐藏的项目」 (HKCU …\Explorer\Advanced\Hidden: 1 = show).</summary>
