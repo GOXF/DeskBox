@@ -550,6 +550,13 @@ public sealed class DesktopAutoOrganizationWatcher : IDisposable
                 return;
             }
 
+            // GOXF fork: 整理方式 = 只映射 → never move; mapped routing takes it.
+            if (MappedOrganizeService.TryTakeOverAutoOrganization(workItem.Path))
+            {
+                MarkIgnored(workItem);
+                return;
+            }
+
             DesktopOrganizationFileSnapshot item =
                 _scanner.CreateAutoOrganizationSnapshot(workItem.Path);
             if (!item.IsEligible)

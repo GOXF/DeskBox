@@ -949,10 +949,15 @@ begin
   end;
 end;
 
+#include "DeskBox.ForkMappedOrganize.iss"
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
+  begin
     StopDeskBoxProcess;
+    RestoreMappedOrganizeHiddenDesktopItems;
+  end;
 
   if CurUninstallStep = usPostUninstall then
   begin

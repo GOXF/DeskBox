@@ -45,6 +45,8 @@
                 </StackPanel>
             </toolkit:SettingsCard>
 
+            <StackPanel x:Name="ForkOrganizeModeHost" Margin="0,8,0,0" Spacing="4" Loaded="ForkOrganizeModeHost_Loaded" />
+
             <StackPanel Margin="0,8,0,0" Spacing="4">
                 <toolkit:SettingsCard
                     x:Name="AutoSetupCard"
