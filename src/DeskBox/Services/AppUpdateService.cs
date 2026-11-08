@@ -375,48 +375,48 @@ public sealed partial class AppUpdateService : IAppUpdateService
                 File.Delete(tempPath);
             }
 
-            using var response = await _httpClient.GetAsync(
+            // GOXF fork: try the user's download proxy first (if set), then
+            // github.com directly; a stalled or failed source moves on to the
+            // next. The SHA-256 below still comes from the GitHub API.
+            IReadOnlyList<Uri> candidates = ForkDownloadProxySettings.GetDownloadCandidates(
                 downloadUri,
-                HttpCompletionOption.ResponseHeadersRead,
-                cancellationToken);
-            response.EnsureSuccessStatusCode();
-
-            long? totalBytes = response.Content.Headers.ContentLength;
-            if (totalBytes is null && manifest.Size > 0)
-            {
-                totalBytes = manifest.Size;
-            }
-
+                ForkDownloadProxySettings.Load());
             long bytesReceived = 0;
-            string actualSha256;
-            await using (var remoteStream = await response.Content.ReadAsStreamAsync(cancellationToken))
-            await using (var fileStream = new FileStream(
-                tempPath,
-                FileMode.Create,
-                FileAccess.Write,
-                FileShare.None,
-                bufferSize: 1024 * 128,
-                useAsync: true))
-            using (var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
+            long? totalBytes = null;
+            Exception? lastError = null;
+            bool hashMatched = false;
+            foreach (Uri candidate in candidates)
             {
-                byte[] buffer = new byte[1024 * 128];
-                int bytesRead;
-                while ((bytesRead = await remoteStream.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)) > 0)
+                try
                 {
-                    await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
-                    hash.AppendData(buffer, 0, bytesRead);
-                    bytesReceived += bytesRead;
-                    progress?.Report(new AppUpdateDownloadProgress(bytesReceived, totalBytes));
+                    (bytesReceived, totalBytes, string actualSha256) = await ForkDownloadToFileAsync(
+                        candidate, tempPath, manifest.Size, progress, cancellationToken);
+                    if (string.Equals(actualSha256, NormalizeSha256(manifest.Sha256), StringComparison.OrdinalIgnoreCase))
+                    {
+                        hashMatched = true;
+                        break;
+                    }
+
+                    App.Log($"[Update] Hash mismatch from {candidate.Host}; trying next source.");
+                    lastError = null;
+                }
+                catch (Exception ex) when (
+                    !cancellationToken.IsCancellationRequested &&
+                    ex is HttpRequestException or TaskCanceledException or TimeoutException)
+                {
+                    App.Log($"[Update] Download from {candidate.Host} failed: {ex.GetType().Name}: {ex.Message}");
+                    lastError = ex;
                 }
 
-                await fileStream.FlushAsync(cancellationToken);
-                actualSha256 = Convert.ToHexString(hash.GetHashAndReset());
+                TryDelete(tempPath);
             }
 
-            if (!string.Equals(actualSha256, NormalizeSha256(manifest.Sha256), StringComparison.OrdinalIgnoreCase))
+            if (!hashMatched)
             {
                 TryDelete(tempPath);
-                return AppUpdateDownloadResult.Failed(AppUpdateDownloadFailureKind.HashMismatch);
+                return lastError is null
+                    ? AppUpdateDownloadResult.Failed(AppUpdateDownloadFailureKind.HashMismatch)
+                    : AppUpdateDownloadResult.Failed(AppUpdateDownloadFailureKind.Network, lastError.Message);
             }
 
             File.Move(tempPath, targetPath, overwrite: true);
@@ -428,7 +428,7 @@ public sealed partial class AppUpdateService : IAppUpdateService
             TryDelete(tempPath);
             return AppUpdateDownloadResult.Failed(AppUpdateDownloadFailureKind.Cancelled);
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or TimeoutException)
         {
             TryDelete(tempPath);
             return AppUpdateDownloadResult.Failed(AppUpdateDownloadFailureKind.Network, ex.Message);
