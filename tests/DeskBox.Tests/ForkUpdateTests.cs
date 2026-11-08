@@ -246,3 +246,43 @@ public sealed class ForkUpdateTests : IDisposable
         }
     }
 }
+
+public class ForkDownloadProxyTests
+{
+    private static readonly Uri Original = new("https://github.com/GOXF/DeskBox/releases/download/v1.5.9.3/DeskBox_Setup_1.5.9.3_x64.exe");
+
+    [Fact]
+    public void Prefix_IsPrependedToOriginalUrl()
+    {
+        Uri? uri = DeskBox.Services.ForkDownloadProxySettings.BuildProxiedUri("https://gh-proxy.com/", Original);
+        Assert.Equal("https://gh-proxy.com/" + Original.AbsoluteUri, uri!.AbsoluteUri);
+    }
+
+    [Fact]
+    public void Template_ReplacesUrlPlaceholder()
+    {
+        Uri? uri = DeskBox.Services.ForkDownloadProxySettings.BuildProxiedUri("https://my.vps.example/dl?u={url}", Original);
+        Assert.StartsWith("https://my.vps.example/dl?u=https://github.com/GOXF/", uri!.OriginalString);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("gh-proxy.com")]
+    [InlineData("ftp://x.example/")]
+    public void InvalidOrEmptyProxy_FallsBackToDirectOnly(string proxy)
+    {
+        var candidates = DeskBox.Services.ForkDownloadProxySettings.GetDownloadCandidates(Original, proxy);
+        Assert.Single(candidates);
+        Assert.Equal(Original, candidates[0]);
+    }
+
+    [Fact]
+    public void ValidProxy_IsTriedFirst_ThenDirect()
+    {
+        var candidates = DeskBox.Services.ForkDownloadProxySettings.GetDownloadCandidates(Original, "https://gh-proxy.com");
+        Assert.Equal(2, candidates.Count);
+        Assert.Equal("gh-proxy.com", candidates[0].Host);
+        Assert.Equal(Original, candidates[1]);
+    }
+}

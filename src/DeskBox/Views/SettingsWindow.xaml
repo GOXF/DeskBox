@@ -3409,6 +3409,16 @@ Text="DeskBox" />
                                         Text="{x:Bind UpstreamReleaseNoticeText, Mode=OneWay}"
                                         Visibility="{x:Bind UpstreamReleaseNoticeVisibility, Mode=OneWay}"
                                         TextWrapping="Wrap" />
+                                    <StackPanel Spacing="4" Visibility="{x:Bind UpdateDownloadProxyVisibility, Mode=OneWay}">
+                                        <TextBlock Text="{x:Bind UpdateDownloadProxyLabel, Mode=OneWay}" />
+                                        <TextBox
+                                            PlaceholderText="https://gh-proxy.com/"
+                                            Text="{x:Bind UpdateDownloadProxy, Mode=TwoWay}" />
+                                        <TextBlock
+                                            Style="{StaticResource SettingDescriptionTextStyle}"
+                                            Text="{x:Bind UpdateDownloadProxyStatus, Mode=OneWay}"
+                                            TextWrapping="Wrap" />
+                                    </StackPanel>
 
                                     <StackPanel Spacing="6" Visibility="{Binding UpdateProgressVisibility}">
                                         <ProgressBar
