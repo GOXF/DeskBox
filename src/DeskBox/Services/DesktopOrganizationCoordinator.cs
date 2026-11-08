@@ -73,7 +73,8 @@ public sealed class DesktopOrganizationCoordinator
             .Where(widget =>
                 widget.WidgetKind == WidgetKind.File &&
                 !widget.IsDisabled &&
-                !string.IsNullOrWhiteSpace(widget.MappedFolderPath))
+                !string.IsNullOrWhiteSpace(widget.MappedFolderPath) &&
+                !MappedOrganizeWidgetMetadata.IsMappedOrganize(widget))
             .ToDictionary(widget => widget.Id, StringComparer.Ordinal);
         var targetsByDestination = new Dictionary<string, DesktopOrganizationTargetPlan>(StringComparer.Ordinal);
         var retainedByChoice = new List<DesktopOrganizationFileSnapshot>();
@@ -200,7 +201,8 @@ public sealed class DesktopOrganizationCoordinator
             .Where(widget =>
                 widget.WidgetKind == WidgetKind.File &&
                 !widget.IsDisabled &&
-                !string.IsNullOrWhiteSpace(widget.MappedFolderPath))
+                !string.IsNullOrWhiteSpace(widget.MappedFolderPath) &&
+                !MappedOrganizeWidgetMetadata.IsMappedOrganize(widget))
             .OrderBy(widget => widget.Name, StringComparer.CurrentCultureIgnoreCase)
             .Select(widget => new DesktopOrganizationDestinationOption(
                 widget.Id,

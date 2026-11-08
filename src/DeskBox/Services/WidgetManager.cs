@@ -2687,7 +2687,8 @@ public sealed partial class WidgetManager
     private void SyncMappedWidgetShortcut(WidgetConfig config, string? displayNameOverride = null)
     {
         if (config.FollowsDefaultStoragePath ||
-            string.IsNullOrWhiteSpace(config.MappedFolderPath))
+            string.IsNullOrWhiteSpace(config.MappedFolderPath) ||
+            MappedOrganizeWidgetMetadata.IsMappedOrganize(config))
         {
             RemoveMappedWidgetShortcut(config);
             return;

@@ -71,6 +71,13 @@ public partial class WidgetViewModel
             return [];
         }
 
+        normalizedPaths = ClaimMappedOrganizeDrop(normalizedPaths, out List<string> mappedClaimed);
+        if (normalizedPaths.Count == 0)
+        {
+            LastImportSkippedUndisplayableCount = 0;
+            return mappedClaimed;
+        }
+
         // Entries the widget item list can never represent (hidden files)
         // must not be moved into managed storage: the folder would hold an
         // invisible file no tile can show. The probe does filesystem I/O, so

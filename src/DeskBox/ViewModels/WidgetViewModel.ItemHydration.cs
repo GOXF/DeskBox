@@ -114,6 +114,7 @@ public partial class WidgetViewModel
                 .OrderBy(item => !item.IsFolder)
                 .ThenBy(item => item.Name, NaturalStringComparer.CurrentCultureIgnoreCase)
                 .ToList();
+            items = ApplyMappedOrganizeFilter(items);
         }
         else
         {

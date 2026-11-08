@@ -1551,6 +1551,7 @@ public partial class App : Application
             try
             {
                 await widgetManager.RestoreWidgetsAsync();
+                InitializeMappedOrganize(widgetManager);
             }
             catch (Exception ex)
             {
@@ -1559,6 +1560,7 @@ public partial class App : Application
                 // blocking startup.
                 Log($"[Startup] Optional step 'restore-widgets' failed: {ex}");
                 RecordStartupDegradation("restore-widgets", ex.ToString());
+                InitializeMappedOrganize(widgetManager);
                 if (startupDesktopLayerReadinessTask is not null)
                 {
                     startupDesktopLayerReadinessTask = null;
@@ -6785,6 +6787,7 @@ public partial class App : Application
                 shutdownGrace),
             // Hooks must be removed while their owning tray window still exists.
             ShutdownStep.Sync("global-hotkey", () => { GlobalHotkeyService?.Dispose(); GlobalHotkeyService = null; }),
+            ShutdownStep.Sync("mapped-organize", ShutdownMappedOrganize),
             ShutdownStep.Sync("widgets", () => WidgetManager?.CloseAll()),
             ShutdownStep.Sync("desktop-organization-window", () => { _desktopOrganizationWindow?.CloseForShutdown(); _desktopOrganizationWindow = null; }),
             ShutdownStep.Sync("settings-window", () =>

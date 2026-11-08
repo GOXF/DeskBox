@@ -1311,6 +1311,7 @@ public sealed partial class FileSurfaceContent
             }
         };
         flyout.Items.Add(openFolder);
+        AddMappedOrganizeMenuItems(flyout);
 
         if (hostItems.CloseWidgetItem is not null)
         {

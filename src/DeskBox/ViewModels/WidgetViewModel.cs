@@ -416,6 +416,7 @@ public partial class WidgetViewModel : ObservableObject, IDisposable
         _localizationService.LanguageChanged += OnLanguageChanged;
         InitializeStacks();
         AttachRenderWindowTracking();
+        AttachMappedOrganize();
     }
 
     public WidgetViewModel(
@@ -456,6 +457,7 @@ public partial class WidgetViewModel : ObservableObject, IDisposable
         // short-lived after this point and the waiter exits via _isDisposed.
         _settingsService.SettingsChanged -= OnSettingsChanged;
         _localizationService.LanguageChanged -= OnLanguageChanged;
+        DetachMappedOrganize();
     }
 
     public void SuspendBackgroundActivity()

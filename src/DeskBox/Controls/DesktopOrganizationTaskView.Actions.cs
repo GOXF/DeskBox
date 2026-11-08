@@ -16,6 +16,11 @@ public sealed partial class DesktopOrganizationTaskView
             return;
         }
 
+        if (await TryRunMappedOrganizeAsync(previewPlan))
+        {
+            return;
+        }
+
         DesktopOrganizationPlan plan;
         try
         {
