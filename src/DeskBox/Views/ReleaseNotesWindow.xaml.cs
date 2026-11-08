@@ -519,8 +519,29 @@ public sealed partial class ReleaseNotesWindow : Window
 
         if (AppUpdateManifest.IsSafeReleaseNotesUrl(manifest.ReleaseNotesUrl))
         {
-            Win32Helper.OpenFile(manifest.ReleaseNotesUrl);
+            _ = OpenReleaseNotesUrlAsync(manifest.ReleaseNotesUrl);
         }
+    }
+
+    // ShellExecute on an https URL fails with "no associated app" on machines
+    // whose default-browser association is incomplete; the WinRT launcher
+    // resolves the protocol handler the same way the Start menu does.
+    private static async Task OpenReleaseNotesUrlAsync(string url)
+    {
+        try
+        {
+            if (Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) &&
+                await Launcher.LaunchUriAsync(uri))
+            {
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            App.Log($"[ReleaseNotes] Launcher failed for '{url}': {ex.Message}");
+        }
+
+        Win32Helper.OpenFile(url);
     }
 
     private void CloseButton_Click(object sender, RoutedEventArgs e) => Close();

@@ -45,6 +45,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Resolve fork version
         id: ver
@@ -189,22 +191,38 @@ jobs:
           $tag = '${{ steps.ver.outputs.tag }}'
           $version = '${{ steps.ver.outputs.version }}'
           $files = @(Get-ChildItem -LiteralPath .artifacts\release -File | ForEach-Object FullName)
-          $notes = @"
-          DeskBox fork build $version (GOXF/DeskBox, branch ${{ github.ref_name }}, commit ${{ github.sha }}).
-
-          Upstream base version ${{ steps.ver.outputs.base }} + fork revision ${{ steps.ver.outputs.rev }}.
-          Unsigned x64 Direct Full Native AOT installer; SHA-256 in the .sha256 file.
-          "@
+          git fetch --tags --force origin main 2>$null
+          $prev = git tag --list 'v*.*.*.*' --sort=-v:refname | Where-Object { $_ -ne $tag } | Select-Object -First 1
+          $range = @('HEAD', '--not', 'origin/main')
+          if ($prev) { $range += $prev }
+          $changes = @(git log --no-merges --pretty='- %s (%h)' @range -- . ':!.github')
+          if ($changes.Count -eq 0) { $changes = @('- 无自有改动（仅同步上游）') }
+          $since = if ($prev) { "自 $prev 以来" } else { '相对上游' }
+          $notes = @(
+            "## DeskBox $version（GOXF 自有版本）",
+            '',
+            "基于上游 DeskBox v${{ steps.ver.outputs.base }}，自有修订 ${{ steps.ver.outputs.rev }}。",
+            '',
+            "### ${since}的自有改动",
+            $changes,
+            '',
+            '### 上游更新',
+            "上游 v${{ steps.ver.outputs.base }} 的完整更新内容见 https://github.com/Tianyu199509/DeskBox/releases/tag/v${{ steps.ver.outputs.base }}",
+            '',
+            "x64 安装包，未签名；SHA-256 见 .sha256 文件。提交 ${{ github.sha }}。"
+          ) -join "`n"
+          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          Set-Content -LiteralPath $notesFile -Value $notes -Encoding utf8NoBOM
           gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Release $tag exists; replacing assets."
             gh release upload $tag @files --clobber --repo $env:GITHUB_REPOSITORY
             if ($LASTEXITCODE -ne 0) { throw 'gh release upload failed.' }
-            gh release edit $tag --latest --draft=false --prerelease=false --repo $env:GITHUB_REPOSITORY
+            gh release edit $tag --latest --draft=false --prerelease=false --notes-file $notesFile --repo $env:GITHUB_REPOSITORY
             if ($LASTEXITCODE -ne 0) { throw 'gh release edit failed.' }
           }
           else {
-            gh release create $tag @files --target $env:GITHUB_SHA --title "DeskBox $version" --notes $notes --latest --repo $env:GITHUB_REPOSITORY
+            gh release create $tag @files --target $env:GITHUB_SHA --title "DeskBox $version" --notes-file $notesFile --latest --repo $env:GITHUB_REPOSITORY
             if ($LASTEXITCODE -ne 0) { throw 'gh release create failed.' }
           }
           gh release view $tag --repo $env:GITHUB_REPOSITORY --json url,tagName,isDraft,isPrerelease,assets
