@@ -6,19 +6,21 @@ namespace DeskBox.Services;
 /// <summary>
 /// Runtime owner of 「映射整理」 (virtual desktop organize): creates the
 /// mapped widgets, keeps membership in sync with the Desktop folders, routes
-/// new desktop entries, and hides the native desktop icons while at least one
-/// mapped widget exists. Files are never moved, renamed or deleted here.
+/// new desktop entries, and hides exactly the mapped entries on the desktop
+/// (hidden attribute, see <see cref="MappedOrganizeHiddenLedger"/>) while
+/// unmapped / 「放回桌面」 entries stay visible. Files are never moved, renamed
+/// or deleted here; the only file-system write is the hidden attribute of
+/// entries DeskBox itself hid, always restored from the ledger.
 ///
 /// Threading: every membership mutation runs on the UI dispatcher (the same
 /// thread that owns <see cref="SettingsService.Settings"/>); file-system
 /// watcher callbacks only marshal paths onto it.
 /// </summary>
-public sealed class MappedOrganizeService : IDisposable
+public sealed partial class MappedOrganizeService : IDisposable
 {
     private const string StateFileName = "mapped-organize.state";
     private const string AutoAssignKey = "autoAssignNewItems";
     private const string IconsHiddenKey = "desktopIconsHiddenByDeskBox";
-    private static readonly TimeSpan IconWatchdogInterval = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan ExpectedIncomingLifetime = TimeSpan.FromMinutes(2);
 
     private static readonly HashSet<string> TransientExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -32,11 +34,11 @@ public sealed class MappedOrganizeService : IDisposable
     private readonly DispatcherQueue _dispatcherQueue;
     private readonly DesktopOrganizationClassifier _classifier = new();
     private readonly string _statePath;
+    private readonly string _stateDirectory;
     private readonly List<FileSystemWatcher> _watchers = [];
     private readonly Dictionary<string, (string WidgetId, DateTimeOffset Expires)> _expectedIncoming =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _pendingNewEntries = new(StringComparer.OrdinalIgnoreCase);
-    private DispatcherQueueTimer? _iconWatchdog;
     private bool _autoAssignNewItems = true;
     private bool _iconsHiddenByDeskBox;
     private bool _pendingFlushScheduled;
@@ -53,9 +55,8 @@ public sealed class MappedOrganizeService : IDisposable
         _widgetManager = widgetManager;
         _localizationService = localizationService;
         _dispatcherQueue = dispatcherQueue;
-        _statePath = Path.Combine(
-            stateDirectory ?? DeskBoxDataPathService.Current.DataDirectory,
-            StateFileName);
+        _stateDirectory = stateDirectory ?? DeskBoxDataPathService.Current.DataDirectory;
+        _statePath = Path.Combine(_stateDirectory, StateFileName);
     }
 
     /// <summary>Process-wide instance set by the App host once widgets are restored.</summary>
@@ -97,10 +98,34 @@ public sealed class MappedOrganizeService : IDisposable
     public void Initialize()
     {
         LoadState();
-        bool hadMappedWidgets = HasMappedWidgets;
-        if (_iconsHiddenByDeskBox && !hadMappedWidgets)
+        LoadVisibilityState();
+        if (_iconsHiddenByDeskBox)
         {
-            App.Log("[MappedOrganize] Startup found a stale hidden-icons marker without mapped widgets; restoring icons.");
+            // Builds before per-item hiding hid the whole desktop list view.
+            App.Log("[MappedOrganize] Startup found the legacy hidden-icons marker; showing the desktop list view.");
+            DesktopIconVisibilityService.Apply(hidden: false);
+            _iconsHiddenByDeskBox = false;
+            SaveState();
+        }
+
+        bool hadMappedWidgets = HasMappedWidgets;
+        var startup = ForkOrganizeModePolicy.OnStartup(
+            ForkOrganizeModeSettings.Exists(),
+            ForkOrganizeModeSettings.Load(),
+            hadMappedWidgets);
+        _mode = startup.Mode;
+        if (startup.Persist is { } persist)
+        {
+            ForkOrganizeModeSettings.TrySave(persist);
+        }
+
+        StartModeWatcher();
+        _widgetManager.WidgetRemoved += OnWidgetRemoved;
+        if (startup.Action == OrganizeModeTransitionAction.DissolveMapping)
+        {
+            App.Log("[MappedOrganize] Organize mode is move-to-widgets but mapped widgets remain; leaving mapped organize.");
+            _ = DissolveAllAsync();
+            return;
         }
 
         if (hadMappedWidgets)
@@ -116,8 +141,8 @@ public sealed class MappedOrganizeService : IDisposable
             StartWatchers();
         }
 
-        _widgetManager.WidgetRemoved += OnWidgetRemoved;
         ApplyIconState();
+        RaiseMembershipChanged(LiveMappedWidgets().Select(widget => widget.Id));
         if (hadMappedWidgets && _autoAssignNewItems)
         {
             _ = AssignUnassignedAsync(createOtherWidget: true);
@@ -133,23 +158,26 @@ public sealed class MappedOrganizeService : IDisposable
         }
 
         StopWatchers();
-        _iconWatchdog?.Stop();
-        _iconWatchdog = null;
+        StopModeWatcher();
         RestoreIconsForExit();
     }
 
-    /// <summary>Best-effort restore usable from ProcessExit / fatal paths.</summary>
+    /// <summary>
+    /// Best-effort restore usable from ProcessExit / fatal paths: every entry
+    /// DeskBox hid becomes visible again (membership stays; the next start
+    /// hides the members again).
+    /// </summary>
     public void RestoreIconsForExit()
     {
         try
         {
+            _restoredForExit = true;
+            ReconcileDesktopVisibility();
             DesktopIconVisibilityService.Apply(hidden: false);
-            _iconsHiddenByDeskBox = false;
-            SaveState();
         }
         catch (Exception ex)
         {
-            App.Log($"[MappedOrganize] Restoring desktop icons on exit failed: {ex.Message}");
+            App.Log($"[MappedOrganize] Restoring desktop items on exit failed: {ex.Message}");
         }
     }
 
@@ -173,8 +201,23 @@ public sealed class MappedOrganizeService : IDisposable
     /// group (re-using an existing mapped widget of that category), membership
     /// written, files untouched.
     /// </summary>
-    public async Task<int> ApplyGroupsAsync(IReadOnlyList<MappedOrganizeGroup> groups)
+    public async Task<int> ApplyGroupsAsync(
+        IReadOnlyList<MappedOrganizeGroup> groups,
+        IReadOnlyCollection<string>? keepOnDesktop = null)
     {
+        // A confirmed preview is explicit: what it maps is no longer 「放回桌面」,
+        // and what the user deselected stays on the desktop.
+        bool keptChanged = MappedOrganizeKeepList.Release(_keptOnDesktop, groups.SelectMany(group => group.Paths));
+        if (keepOnDesktop is not null)
+        {
+            keptChanged |= MappedOrganizeKeepList.Keep(_keptOnDesktop, keepOnDesktop.Where(IsDesktopEntryPath));
+        }
+
+        if (keptChanged)
+        {
+            SaveKeptOnDesktop();
+        }
+
         var created = new List<(WidgetConfig Config, DesktopOrganizationRect? Bounds)>();
         var touched = new HashSet<string>(StringComparer.Ordinal);
         int assignedCount = 0;
@@ -209,9 +252,9 @@ public sealed class MappedOrganizeService : IDisposable
         RaiseMembershipChanged(touched);
         if (_autoAssignNewItems)
         {
-            // Everything the preview left out (folders, retained buckets,
-            // hidden-by-choice) would be invisible once the native icons are
-            // hidden, so it is routed by the same rules right away.
+            // Everything the preview did not list (folders, retained buckets)
+            // is routed by the same rules right away; entries the user
+            // deselected are 「放回桌面」 and stay visible.
             await AssignUnassignedAsync(createOtherWidget: true);
         }
 
@@ -232,6 +275,11 @@ public sealed class MappedOrganizeService : IDisposable
         if (desktopPaths.Count == 0)
         {
             return [];
+        }
+
+        if (MappedOrganizeKeepList.Release(_keptOnDesktop, desktopPaths))
+        {
+            SaveKeptOnDesktop();
         }
 
         IReadOnlyList<string> changed = MappedOrganizeMembership.Assign(
@@ -265,6 +313,12 @@ public sealed class MappedOrganizeService : IDisposable
     /// <summary>Turns the mode off: dissolves every mapped widget (membership only) and restores the icons.</summary>
     public async Task DissolveAllAsync()
     {
+        if (_keptOnDesktop.Count > 0)
+        {
+            _keptOnDesktop.Clear();
+            SaveKeptOnDesktop();
+        }
+
         foreach (WidgetConfig widget in LiveMappedWidgets().ToList())
         {
             await _widgetManager.RemoveWidgetAsync(widget.Id);
@@ -312,9 +366,11 @@ public sealed class MappedOrganizeService : IDisposable
         }
 
         List<(string Path, bool IsDirectory)> entries = await Task.Run(() => EnumerateDesktopEntries(onlyPaths));
-        IReadOnlyList<string> unassigned = MappedOrganizeMembership.FindUnassigned(
-            _settingsService.Settings.WidgetLayout.Widgets,
-            entries.Select(entry => entry.Path));
+        IReadOnlyList<string> unassigned = MappedOrganizeKeepList.FilterUnassigned(
+            MappedOrganizeMembership.FindUnassigned(
+                _settingsService.Settings.WidgetLayout.Widgets,
+                entries.Select(entry => entry.Path)),
+            _keptOnDesktop);
         if (unassigned.Count == 0)
         {
             return 0;
@@ -386,7 +442,9 @@ public sealed class MappedOrganizeService : IDisposable
             {
                 var info = new FileInfo(path);
                 FileAttributes attributes = File.GetAttributes(path);
-                if ((attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0 ||
+                bool hiddenByUser = (attributes & FileAttributes.Hidden) != 0 &&
+                                    !MappedOrganizeHiddenRegistry.IsHiddenByDeskBox(path);
+                if (hiddenByUser || (attributes & FileAttributes.System) != 0 ||
                     TransientExtensions.Contains(info.Extension) ||
                     string.Equals(info.Name, "desktop.ini", StringComparison.OrdinalIgnoreCase))
                 {
@@ -490,55 +548,8 @@ public sealed class MappedOrganizeService : IDisposable
         });
     }
 
-    private void ApplyIconState()
-    {
-        bool shouldHide = HasMappedWidgets;
-        if (shouldHide && !_iconsHiddenByDeskBox)
-        {
-            // Durable marker first: a crash after hiding must be recoverable.
-            _iconsHiddenByDeskBox = true;
-            SaveState();
-        }
-
-        DesktopIconVisibilityService.Apply(shouldHide);
-        if (!shouldHide && _iconsHiddenByDeskBox)
-        {
-            _iconsHiddenByDeskBox = false;
-            SaveState();
-        }
-
-        if (shouldHide)
-        {
-            EnsureIconWatchdog();
-        }
-        else
-        {
-            _iconWatchdog?.Stop();
-        }
-    }
-
-    private void EnsureIconWatchdog()
-    {
-        if (_iconWatchdog is null)
-        {
-            _iconWatchdog = _dispatcherQueue.CreateTimer();
-            _iconWatchdog.Interval = IconWatchdogInterval;
-            _iconWatchdog.IsRepeating = true;
-            _iconWatchdog.Tick += (_, _) =>
-            {
-                // Explorer restarts recreate a visible list view.
-                if (!_isDisposed && HasMappedWidgets)
-                {
-                    DesktopIconVisibilityService.Apply(hidden: true);
-                }
-            };
-        }
-
-        if (!_iconWatchdog.IsRunning)
-        {
-            _iconWatchdog.Start();
-        }
-    }
+    /// <summary>Makes the desktop match the membership: mapped entries hidden, everything else visible.</summary>
+    private void ApplyIconState() => ReconcileDesktopVisibility();
 
     private void StartWatchers()
     {
@@ -621,6 +632,11 @@ public sealed class MappedOrganizeService : IDisposable
     private Task OnEntryDeleted(string path)
     {
         _pendingNewEntries.Remove(path);
+        if (MappedOrganizeKeepList.Release(_keptOnDesktop, [path]))
+        {
+            SaveKeptOnDesktop();
+        }
+
         IReadOnlyList<string> changed = MappedOrganizeMembership.RemovePath(_settingsService.Settings.WidgetLayout.Widgets, path);
         if (changed.Count > 0)
         {
@@ -634,6 +650,7 @@ public sealed class MappedOrganizeService : IDisposable
     private Task OnEntryRenamed(string oldPath, string newPath)
     {
         _pendingNewEntries.Remove(oldPath);
+        RenameVisibilityRecords(oldPath, newPath, out bool wasKept);
         IReadOnlyList<string> changed = MappedOrganizeMembership.RenamePath(_settingsService.Settings.WidgetLayout.Widgets, oldPath, newPath);
         if (changed.Count > 0)
         {
@@ -642,8 +659,9 @@ public sealed class MappedOrganizeService : IDisposable
             return Task.CompletedTask;
         }
 
-        // A download finishing (x.crdownload -> x.zip) is a new visible entry.
-        return OnEntryCreated(newPath);
+        // A download finishing (x.crdownload -> x.zip) is a new visible entry;
+        // a renamed 「放回桌面」 entry stays where the user put it.
+        return wasKept ? Task.CompletedTask : OnEntryCreated(newPath);
     }
 
     private void SchedulePendingFlush()
@@ -711,6 +729,9 @@ public sealed class MappedOrganizeService : IDisposable
 
     private void RaiseMembershipChanged(IEnumerable<string> widgetIds)
     {
+        // Hide / restore first: the widget reload that follows must already
+        // see its members as DeskBox-hidden (MappedOrganizeHiddenRegistry).
+        ReconcileDesktopVisibility();
         var ids = widgetIds.ToHashSet(StringComparer.Ordinal);
         if (ids.Count == 0)
         {

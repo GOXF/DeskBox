@@ -41,23 +41,51 @@ Ordinary organization never targets mapped widgets: they are filtered out in
 `DesktopOrganizationRuleResolver.Resolve`, `CreateExecutionPlan` and
 `GetDestinationOptions`.
 
-## Native desktop icons (user accepted hiding)
+## Global 「整理方式」 (organize mode)
 
-Choice: hide the desktop `SysListView32` (child of the desktop
-`SHELLDLL_DefView`) with `ShowWindow(SW_HIDE)`
-(`Services/DesktopIconVisibilityService.cs`), **not** Explorer's persisted
-"Show desktop icons" setting.
+* Settings → 桌面整理 → 「整理方式」: 「移动到格子」 (default, upstream) /
+  「只映射，不移动文件」. Stored in `<data root>/fork-organize.json`
+  (`{"organizeMode":"move|mapOnly"}`, `Services/ForkOrganizeModeSettings.cs`),
+  written by the settings process, read by the main process at use time and
+  watched by `MappedOrganizeService` (FileSystemWatcher).
+* The preview no longer has a checkbox: its footer shows the current mode
+  (link opens the setting) and 「开始整理」 follows it.
+* Automatic organization of new files: in 「只映射」 mode the upstream
+  `DesktopAutoOrganizationWatcher` never moves; it hands the settled file to
+  `MappedOrganizeService.TryTakeOverAutoOrganization` (mapped routing).
+* Switching back to 「移动到格子」 dissolves every mapped widget and restores
+  every hidden desktop item. Startup: installs that already have mapped widgets
+  but no mode file adopt 「只映射」.
 
-* Not persisted by Explorer → no failure mode can leave the user permanently
-  without icons (Explorer restart / sign-out always shows them again).
-* Hidden while ≥1 mapped widget exists; shown when the last one is dissolved,
-  on DeskBox shutdown (`ShutdownStep "mapped-organize"`), and best-effort in
-  `AppDomain.ProcessExit`.
-* Crash safety: `desktopIconsHiddenByDeskBox` is written *before* hiding. On
-  the next start `MappedOrganizeService.Initialize` either re-applies (mapped
-  widgets exist) or restores (none left). It runs even if widget restore fails.
-* Explorer restarts recreate a visible list view; a 4 s dispatcher timer
-  re-hides it while mapped widgets exist.
+## Desktop visibility: per item (replaces hiding the whole list view)
+
+* Only mapped entries are hidden, by setting `FILE_ATTRIBUTE_HIDDEN`.
+  Unmapped and 「放回桌面」 entries stay visible as normal desktop icons.
+* Ledger `data/mapped-organize.hidden` lists every path DeskBox hid; it is
+  written *before* an attribute is set. Files that were already hidden are
+  never recorded and never touched. Pure rules: `MappedOrganizeHiddenLedger`.
+* Restore (`Reconcile` with nothing desired / member removed): entry leaves its
+  widget, 「放回桌面」, 「退出映射整理」, switching to move mode, DeskBox exit
+  (shutdown step + ProcessExit), next start after a crash (members re-hidden,
+  stale records restored), and the uninstaller
+  (`installer/DeskBox.ForkMappedOrganize.iss`, after the process is stopped).
+* `MappedOrganizeHiddenRegistry` lets the widget folder loader
+  (`FileService`: snapshot filter, `ClassifyExistingEntry`, `ShouldDisplayEntry`)
+  keep listing DeskBox-hidden members; it is seeded lazily from the ledger.
+* The legacy `desktopIconsHiddenByDeskBox` marker (whole list view hidden by
+  older builds) is repaired once at startup.
+* Settings warns when Explorer shows hidden items (HKCU …\Explorer\Advanced
+  `Hidden`=1): mapped entries then still appear as faded icons.
+
+## 「放回桌面」
+
+The item menu row 「移回桌面」 reads 「放回桌面」 in mapped widgets and calls
+`MappedOrganizeService.KeepOnDesktop` (single and multi-select): membership
+removed, attribute restored, path recorded in `data/mapped-organize.kept` so
+automatic sorting and 「一键整理」 skip it (follows renames, dropped on delete).
+Dragging it into a mapped widget or confirming a preview that maps it clears
+the mark. Entries deselected in a confirmed mapped preview are kept the same
+way. 「退出映射整理」 clears the list.
 
 ## Multi-monitor / sleep
 
@@ -74,17 +102,25 @@ topology profiles and wake recovery apply unchanged.
 * `DesktopOrganizationRuleResolver.cs`, `DesktopOrganizationCoordinator.cs`:
   exclude mapped widgets.
 * `DesktopOrganizationTaskView.xaml` (+ `.Actions.cs` one call),
-  `FileSurfaceContent.SelectionAndMenus.cs` (one call).
+  `FileSurfaceContent.SelectionAndMenus.cs` (blank menu call, item-menu
+  localizer, 「放回桌面」 interception).
+* `FileService.cs`: DeskBox-hidden members stay displayable (3 conditions).
+* `DesktopAutoOrganizationWatcher.cs`: 只映射 hand-off (one block).
+* `DesktopOrganizationSettingsSection.xaml`: one host panel for the mode card.
+* `installer/DeskBox.Uninstall.iss`: include + one call.
 * `Strings/*.json`: 6 keys inserted after `DesktopOrganization.Preview.Title`
   (zh-CN / zh-TW translated, other locales English fallback).
 
 ## Known gaps
 
-* Manual mode: new desktop files stay unassigned (and therefore invisible
-  while icons are hidden) until 「一键整理」.
+* Manual mode: new desktop files stay unassigned (visible on the desktop)
+  until 「一键整理」.
+* Public Desktop entries need admin rights to change attributes; when that
+  fails they stay visible on the desktop as well as in the widget.
+* Hidden entries are also hidden in File Explorer's Desktop folder view.
 * Preview "use existing widget" destination choices are ignored in mapped mode
   (grouping is per category).
-* No dedicated entry in the Settings window yet; the auto/manual switch is in
-  the mapped widget's blank-area menu.
+* The auto/manual switch for mapped widgets stays in the mapped widget's
+  blank-area menu.
 * Not runtime-verified on a real desktop in this change (CI builds and runs
   unit tests only).

@@ -228,8 +228,8 @@
             <Grid ColumnDefinitions="*,Auto,Auto,Auto,Auto" ColumnSpacing="8">
                 <TextBlock x:Name="FooterSummaryText" VerticalAlignment="Center" TextWrapping="Wrap"
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                <CheckBox x:Name="MapOnlyCheckBox" Grid.Column="1" MinWidth="0" VerticalAlignment="Center"
-                          Loaded="MapOnlyCheckBox_Loaded" />
+                <HyperlinkButton x:Name="OrganizeModeLink" Grid.Column="1" MinWidth="0" VerticalAlignment="Center"
+                                 Loaded="OrganizeModeLink_Loaded" Click="OrganizeModeLink_Click" />
                 <Button x:Name="UndoButton" Grid.Column="1" Click="UndoButton_Click" Visibility="Collapsed" />
                 <Button x:Name="AbandonUndoButton" Grid.Column="2" Click="AbandonUndoButton_Click" Visibility="Collapsed" />
                 <Button x:Name="CancelButton" Grid.Column="3" Click="CancelButton_Click" />
