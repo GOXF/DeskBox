@@ -30,4 +30,56 @@
     <FileVersion>$(ForkBaseVersion).$(ForkRevision)</FileVersion>
     <InformationalVersion>$(ForkBaseVersion).$(ForkRevision)</InformationalVersion>
   </PropertyGroup>
+
+  <!--
+    GOXF fork: local test channel. Debug builds of DeskBox embed the git
+    commit they were built from (AssemblyMetadata ForkGitSha / ForkGitBranch)
+    so the app can compare it with the tip of origin/dev. Failure-tolerant:
+    no git / not a clone => nothing embedded, the app then reads .git at
+    runtime. Release / CI / installer builds skip it (opt in with
+    /p:ForkEmbedGitInfo=true).
+  -->
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'DeskBox' and '$(ForkEmbedGitInfo)' == '' and '$(Configuration)' == 'Debug'">
+    <ForkEmbedGitInfo>true</ForkEmbedGitInfo>
+  </PropertyGroup>
+
+  <Target
+    Name="ForkEmbedGitInfoMetadata"
+    BeforeTargets="GetAssemblyAttributes"
+    Condition="'$(MSBuildProjectName)' == 'DeskBox' and '$(ForkEmbedGitInfo)' == 'true'">
+    <Exec
+      Command="git rev-parse HEAD"
+      WorkingDirectory="$(MSBuildThisFileDirectory)"
+      ConsoleToMSBuild="true"
+      EchoOff="true"
+      IgnoreExitCode="true"
+      IgnoreStandardErrorWarningFormat="true"
+      StandardOutputImportance="low"
+      StandardErrorImportance="low"
+      ContinueOnError="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="ForkGitShaRaw" />
+      <Output TaskParameter="ExitCode" PropertyName="ForkGitShaExitCode" />
+    </Exec>
+    <Exec
+      Command="git rev-parse --abbrev-ref HEAD"
+      WorkingDirectory="$(MSBuildThisFileDirectory)"
+      ConsoleToMSBuild="true"
+      EchoOff="true"
+      IgnoreExitCode="true"
+      IgnoreStandardErrorWarningFormat="true"
+      StandardOutputImportance="low"
+      StandardErrorImportance="low"
+      ContinueOnError="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="ForkGitBranchRaw" />
+      <Output TaskParameter="ExitCode" PropertyName="ForkGitBranchExitCode" />
+    </Exec>
+    <PropertyGroup>
+      <ForkGitSha Condition="'$(ForkGitShaExitCode)' == '0'">$([System.Text.RegularExpressions.Regex]::Match('$(ForkGitShaRaw)', '[0-9a-fA-F]{40,64}').Value)</ForkGitSha>
+      <ForkGitBranch Condition="'$(ForkGitBranchExitCode)' == '0'">$(ForkGitBranchRaw.Trim())</ForkGitBranch>
+    </PropertyGroup>
+    <ItemGroup>
+      <AssemblyMetadata Include="ForkGitSha" Value="$(ForkGitSha)" Condition="'$(ForkGitSha)' != ''" />
+      <AssemblyMetadata Include="ForkGitBranch" Value="$(ForkGitBranch)" Condition="'$(ForkGitSha)' != '' and '$(ForkGitBranch)' != ''" />
+    </ItemGroup>
+  </Target>
 </Project>

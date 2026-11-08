@@ -1665,6 +1665,12 @@ public sealed partial class FileSurfaceContent :
                 return;
             }
 
+            // GOXF fork: a mapped widget's drag released on the desktop is 「放回桌面」.
+            if (TryPutBackMappedDragOnDesktop(movedPaths, handledAsStackMembership))
+            {
+                return;
+            }
+
             bool allowReleaseRecovery = ShouldRecoverUnhandledSourceDrop(
                 dropResult, handledAsStackMembership);
             if (allowReleaseRecovery && fromStackPopover &&
