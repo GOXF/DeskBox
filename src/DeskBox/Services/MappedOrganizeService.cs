@@ -780,13 +780,13 @@ public sealed class MappedOrganizeService : IDisposable
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_statePath)!);
-            string temporary = _statePath + ".tmp";
-            File.WriteAllLines(temporary,
+            // Two short lines; a torn write reads back as defaults (auto on,
+            // marker off) and Explorer never persists the hidden list view.
+            File.WriteAllLines(_statePath,
             [
                 $"{AutoAssignKey}={(_autoAssignNewItems ? "true" : "false")}",
                 $"{IconsHiddenKey}={(_iconsHiddenByDeskBox ? "true" : "false")}"
             ]);
-            File.Move(temporary, _statePath, overwrite: true);
         }
         catch (Exception ex)
         {
