@@ -856,11 +856,15 @@ public sealed partial class AppUpdateService : IAppUpdateService
             MirrorUrl = DefaultManualDownloadUrl,
             Sha256 = sha256,
             Size = Math.Max(0, installerAsset.Size),
+            ReleaseDate = release.PublishedAt is { } publishedAt
+                ? publishedAt.ToLocalTime().ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
+                : string.Empty,
             ReleaseNotesUrl = release.HtmlUrl,
             ReleaseNotes = string.IsNullOrWhiteSpace(release.Body)
                 ? []
                 : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                 {
+                    ["zh-CN"] = release.Body,
                     ["en-US"] = release.Body
                 },
             Summary = []
@@ -1061,6 +1065,9 @@ public sealed partial class AppUpdateService : IAppUpdateService
 
         [JsonPropertyName("body")]
         public string Body { get; set; } = string.Empty;
+
+        [JsonPropertyName("published_at")]
+        public DateTimeOffset? PublishedAt { get; set; }
 
         public GitHubReleaseAsset[] Assets { get; set; } = [];
     }
