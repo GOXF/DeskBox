@@ -165,15 +165,54 @@ public sealed class ContextMenuWin11AlignmentContractTests
             CountOccurrences(builder, "if (!isNamespaceShortcut)") == 2,
             "Open file location and Compress both hide for namespace links");
 
-        // The empty-bin state check must stay off the right-tap callback
-        // frame (shell aggregate query on a low-priority UI pass instead).
+        // Empty-bin state must NEVER run SHQueryRecycleBinW on the UI STA
+        // thread or mutate MenuFlyoutItem.IsEnabled after flyout.Opened (1.5.9
+        // / 1.6.0 freeze + 0xC000027B popup crash): pre-ShowAt reads come from
+        // the background RecycleBinEmptyStateCache, and EmptyRecycleBinAsync
+        // runs on ShellLaunchService's modal STA pool.
         Assert.Contains(
-            "ScheduleRecycleBinEmptyStateCheck(row)",
+            "RecycleBinEmptyStateCache.Shared.EnsureWarm(",
             builder,
             StringComparison.Ordinal);
         Assert.Contains(
-            "DispatcherQueuePriority.Low",
+            "RecycleBinEmptyStateCache.Shared.TryGetKnownEmptyState(out bool isEmpty)",
             builder,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "ScheduleRecycleBinEmptyStateCheck",
+            builder,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "ShellRecycleBinInterop.TryQuery",
+            builder,
+            StringComparison.Ordinal);
+
+        int emptyRowStart = builder.IndexOf(
+            "private static void AddEmptyRecycleBinRow(",
+            StringComparison.Ordinal);
+        int openWithHelperStart = builder.IndexOf(
+            "private static void AddOpenWithRow(",
+            StringComparison.Ordinal);
+        Assert.True(emptyRowStart >= 0 && openWithHelperStart > emptyRowStart);
+        string emptyRowRegion = builder[emptyRowStart..openWithHelperStart];
+        Assert.DoesNotContain(
+            "flyout.Opened",
+            emptyRowRegion,
+            StringComparison.Ordinal);
+
+        string selectionAndMenus = ReadRepositoryFile(
+            "src/DeskBox/Controls/WidgetContents/FileSurfaceContent.SelectionAndMenus.cs");
+        Assert.Contains(
+            "ShellLaunchService.EmptyRecycleBinAsync(",
+            selectionAndMenus,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "ShellRecycleBinInterop.TryQueryTotalItemCount",
+            selectionAndMenus,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "ShellRecycleBinInterop.TryEmptyAllBins(",
+            selectionAndMenus,
             StringComparison.Ordinal);
 
         // Host verbs: the surface supplies create-shortcut and empty-bin.
@@ -223,15 +262,18 @@ public sealed class ContextMenuWin11AlignmentContractTests
     [Fact]
     public void MenuMaterial_DirectAcrylic()
     {
-        // Direct acrylic: an explicit DesktopAcrylicBackdrop on the implicit
-        // presenter style (the default SystemBackdrop is null, which reads
-        // as solid) with the platform's own near-transparent default
-        // background. No first-paint solid override and no reveal animation
-        // — both retired by choice (2026-10-21); if first-frame bare text
-        // ever shows up, the lever is a constant low-alpha Background, not
-        // an animation.
+        // Direct acrylic: ThemedMenuAcrylicBackdrop on the implicit presenter
+        // styles (MenuFlyoutPresenter and CommandBarFlyoutCommandBar) resolves
+        // Light/Dark from the presenter / owning XamlRoot.Content instead of
+        // WinUI's built-in DesktopAcrylicBackdrop, whose PopupRoot-scoped
+        // GetDefaultSystemBackdropConfiguration stays pinned to the startup OS
+        // theme (painting dark #2C2C2C acrylic behind black Light-mode text).
         string appXaml = ReadRepositoryFile("src/DeskBox/App.xaml");
         Assert.Contains(
+            "<helpers:ThemedMenuAcrylicBackdrop />",
+            appXaml,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
             "<media:DesktopAcrylicBackdrop />",
             appXaml,
             StringComparison.Ordinal);
@@ -239,6 +281,38 @@ public sealed class ContextMenuWin11AlignmentContractTests
             "DeskBoxMenuFallbackBackgroundBrush",
             appXaml,
             StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(Microsoft.UI.Xaml.ElementTheme.Light, Microsoft.UI.Xaml.ElementTheme.Default, Microsoft.UI.Xaml.ElementTheme.Light, Microsoft.UI.Xaml.ElementTheme.Light, Microsoft.UI.Xaml.ElementTheme.Light, true, Microsoft.UI.Xaml.ElementTheme.Light, true, false)]
+    [InlineData(Microsoft.UI.Xaml.ElementTheme.Default, Microsoft.UI.Xaml.ElementTheme.Default, Microsoft.UI.Xaml.ElementTheme.Light, Microsoft.UI.Xaml.ElementTheme.Light, Microsoft.UI.Xaml.ElementTheme.Dark, true, Microsoft.UI.Xaml.ElementTheme.Light, true, false)]
+    [InlineData(Microsoft.UI.Xaml.ElementTheme.Dark, Microsoft.UI.Xaml.ElementTheme.Default, Microsoft.UI.Xaml.ElementTheme.Dark, Microsoft.UI.Xaml.ElementTheme.Dark, Microsoft.UI.Xaml.ElementTheme.Dark, true, Microsoft.UI.Xaml.ElementTheme.Dark, false, true)]
+    [InlineData(Microsoft.UI.Xaml.ElementTheme.Dark, Microsoft.UI.Xaml.ElementTheme.Default, Microsoft.UI.Xaml.ElementTheme.Light, Microsoft.UI.Xaml.ElementTheme.Light, Microsoft.UI.Xaml.ElementTheme.Dark, true, Microsoft.UI.Xaml.ElementTheme.Light, false, true)]
+    [InlineData(Microsoft.UI.Xaml.ElementTheme.Light, Microsoft.UI.Xaml.ElementTheme.Default, Microsoft.UI.Xaml.ElementTheme.Dark, Microsoft.UI.Xaml.ElementTheme.Dark, Microsoft.UI.Xaml.ElementTheme.Light, true, Microsoft.UI.Xaml.ElementTheme.Dark, true, false)]
+    [InlineData(Microsoft.UI.Xaml.ElementTheme.Default, Microsoft.UI.Xaml.ElementTheme.Default, Microsoft.UI.Xaml.ElementTheme.Default, Microsoft.UI.Xaml.ElementTheme.Default, Microsoft.UI.Xaml.ElementTheme.Default, false, Microsoft.UI.Xaml.ElementTheme.Light, true, false)]
+    [InlineData(Microsoft.UI.Xaml.ElementTheme.Default, Microsoft.UI.Xaml.ElementTheme.Default, Microsoft.UI.Xaml.ElementTheme.Default, Microsoft.UI.Xaml.ElementTheme.Default, Microsoft.UI.Xaml.ElementTheme.Default, false, Microsoft.UI.Xaml.ElementTheme.Default, true, true)]
+    public void ThemedMenuAcrylicBackdrop_ResolvesThemeAcrossAppAndOsMismatch(
+        Microsoft.UI.Xaml.ElementTheme presenterRequested,
+        Microsoft.UI.Xaml.ElementTheme popupRequested,
+        Microsoft.UI.Xaml.ElementTheme rootRequested,
+        Microsoft.UI.Xaml.ElementTheme rootActual,
+        Microsoft.UI.Xaml.ElementTheme presenterActual,
+        bool presenterIsLoaded,
+        Microsoft.UI.Xaml.ElementTheme appEffective,
+        bool systemIsDark,
+        bool expectedIsDark)
+    {
+        bool actual = DeskBox.Helpers.ThemedMenuAcrylicBackdrop.ResolveIsDarkTheme(
+            presenterRequested,
+            popupRequested,
+            rootRequested,
+            rootActual,
+            presenterActual,
+            presenterIsLoaded,
+            appEffective,
+            systemIsDark);
+
+        Assert.Equal(expectedIsDark, actual);
     }
 
     [Fact]
@@ -352,7 +426,7 @@ public sealed class ContextMenuWin11AlignmentContractTests
     public void SearchResultsMenu_KeepsRunAsAdministratorEntry()
     {
         string searchWindow = ReadRepositoryFile(
-            "src/DeskBox/Views/SearchPopupWindow.xaml.cs");
+            "src/DeskBox/Views/SearchPopupWindow.ResultsAndPreview.cs");
 
         Assert.Contains(
             "ElevatedFileLauncher.CanRunAsAdministrator(item.DetailPath",

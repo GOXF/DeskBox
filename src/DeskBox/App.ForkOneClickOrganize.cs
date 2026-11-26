@@ -1,6 +1,5 @@
 using DeskBox.Services;
-using H.NotifyIcon.Core;
-using Microsoft.UI.Xaml.Controls;
+using DeskBox.Platform;
 
 namespace DeskBox;
 
@@ -78,7 +77,7 @@ public partial class App
             ShowForkOneClickOrganizeNotification(result);
             if (result.Outcome == ForkOneClickOrganizeOutcome.Organized)
             {
-                _settingsWindow?.RefreshDesktopOrganizationState();
+                _inProcessFallbackSettingsWindow?.RefreshDesktopOrganizationState();
                 _ = PushSettingsIpcEventAsync(SettingsIpcMethods.HostDesktopOrgRefresh, null);
             }
         }
@@ -163,37 +162,6 @@ public partial class App
             return;
         }
 
-        try
-        {
-            _trayIcon?.ShowNotification(
-                title,
-                message,
-                NotificationIcon.Info,
-                customIconHandle: null,
-                largeIcon: true,
-                sound: false,
-                respectQuietTime: true,
-                realtime: false,
-                timeout: TimeSpan.FromSeconds(6));
-        }
-        catch (Exception ex)
-        {
-            Log($"[OneClickOrganize] Tray notification failed: {ex.Message}");
-        }
-    }
-
-    /// <summary>Tray: 「整理预览…」 right below 「整理桌面…」 (which is one click now).</summary>
-    private MenuFlyoutItem CreateForkOrganizePreviewTrayItem(MenuFlyout contextMenu)
-    {
-        var item = new MenuFlyoutItem
-        {
-            Text = ForkOrganizeModeText.Get(ForkOrganizeModeText.Key.MenuOrganizePreview),
-            Width = TrayMenuItemWidth,
-            Icon = new FontIcon { Glyph = "\uE8A1" }
-        };
-        AttachTrayMenuItemInteraction(
-            item,
-            () => RunTraySettingsActionAsync(contextMenu, () => OpenDesktopOrganizationPreview()));
-        return item;
+        _ = TryShowTrayBalloonNotification(title, message, TrayBalloonIconKind.Info, largeIcon: true);
     }
 }

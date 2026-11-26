@@ -8,6 +8,12 @@ public sealed class AppUpdateManifest
     public string ReleaseDate { get; set; } = string.Empty;
     public string MinimumSupportedVersion { get; set; } = string.Empty;
     public bool Mandatory { get; set; }
+    public bool Notify { get; set; } = true;
+    public string NotifyMode { get; set; } = "normal";
+    public bool PushPaused { get; set; }
+    public string PublicVersion { get; set; } = string.Empty;
+    public List<string> BlockedVersions { get; set; } = [];
+    public bool ServerControlled { get; set; }
     public string DownloadUrl { get; set; } = string.Empty;
     /// <summary>
     /// Optional architecture-specific installer metadata. Older manifests can
@@ -152,6 +158,49 @@ public sealed class AppUpdateManifest
         return Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) &&
             uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase);
     }
+
+    public bool IsMandatoryForVersion(string? currentVersion)
+    {
+        if (Mandatory || string.Equals(NotifyMode, "mandatory", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return !string.IsNullOrWhiteSpace(MinimumSupportedVersion) &&
+            !string.IsNullOrWhiteSpace(currentVersion) &&
+            Services.AppUpdateService.IsRemoteVersionNewer(currentVersion, MinimumSupportedVersion);
+    }
+
+    public bool ShouldSuppressToastNotification(string? currentVersion)
+    {
+        if (IsMandatoryForVersion(currentVersion))
+        {
+            return false;
+        }
+
+        return !Notify || string.Equals(NotifyMode, "silent", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public bool IsVersionBlocked(string? version)
+    {
+        if (string.IsNullOrWhiteSpace(version) || BlockedVersions.Count == 0)
+        {
+            return false;
+        }
+
+        string normalized = NormalizeVersionToken(version);
+        return BlockedVersions.Any(blocked =>
+            !string.IsNullOrWhiteSpace(blocked) &&
+            string.Equals(NormalizeVersionToken(blocked), normalized, StringComparison.OrdinalIgnoreCase));
+    }
+
+    internal static string NormalizeVersionToken(string value)
+    {
+        string trimmed = value.Trim();
+        return trimmed.StartsWith('v') || trimmed.StartsWith('V')
+            ? trimmed[1..].Trim()
+            : trimmed;
+    }
 }
 
 public enum AppUpdateCheckStatus
@@ -244,16 +293,21 @@ public sealed class AppUpdateInstallResult
 {
     // JsonConstructor: see AppUpdateDownloadResult (batch 3c-3a).
     [System.Text.Json.Serialization.JsonConstructor]
-    internal AppUpdateInstallResult(bool success, string? errorMessage)
+    internal AppUpdateInstallResult(bool success, string? errorMessage, bool blockedByPolicy = false)
     {
         Success = success;
         ErrorMessage = errorMessage;
+        BlockedByPolicy = blockedByPolicy;
     }
 
     public bool Success { get; }
     public string? ErrorMessage { get; }
+    public bool BlockedByPolicy { get; }
 
-    public static AppUpdateInstallResult Started() => new(true, null);
+    public static AppUpdateInstallResult Started() => new(true, null, false);
 
-    public static AppUpdateInstallResult Failed(string errorMessage) => new(false, errorMessage);
+    public static AppUpdateInstallResult Failed(string errorMessage) => new(false, errorMessage, false);
+
+    public static AppUpdateInstallResult PolicyBlocked(string? errorMessage = null) =>
+        new(false, errorMessage, blockedByPolicy: true);
 }

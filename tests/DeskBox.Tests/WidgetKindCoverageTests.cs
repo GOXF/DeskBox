@@ -36,16 +36,17 @@ public sealed class WidgetKindCoverageTests
         }
     }
 
-    [Fact]
-    public void LegacyProductivityKind_IsNotRegisteredAsActiveContent()
+    [Theory]
+    [InlineData(WidgetKind.Productivity)]
+    public void LegacyWidgetKinds_AreNotRegisteredAsActiveContent(WidgetKind legacyKind)
     {
         var registry = WidgetRegistry.Default;
         var factory = TestServices.CreateWidgetContentFactory();
 
-        Assert.False(registry.IsKnown(WidgetKind.Productivity));
-        Assert.Throws<NotSupportedException>(() => factory.GetDescriptor(WidgetKind.Productivity));
-        Assert.False(factory.HasImplementedContent(WidgetKind.Productivity));
-        Assert.False(factory.CanShowInCreateEntry(WidgetKind.Productivity));
+        Assert.False(registry.IsKnown(legacyKind));
+        Assert.Throws<NotSupportedException>(() => factory.GetDescriptor(legacyKind));
+        Assert.False(factory.HasImplementedContent(legacyKind));
+        Assert.False(factory.CanShowInCreateEntry(legacyKind));
     }
 
     [Fact]

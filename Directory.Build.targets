@@ -1,7 +1,6 @@
 <Project>
   <!--
-    GOXF/DeskBox fork only (this file does not exist upstream, so upstream
-    version bumps never conflict with it).
+    GOXF/DeskBox fork version metadata, alongside upstream AOT lock settings.
 
     Fork version = upstream base version (<Version> in src/DeskBox/DeskBox.csproj)
                    + 4th segment ForkRevision, e.g. 1.5.9 + 1 => 1.5.9.1.
@@ -17,7 +16,7 @@
     reset it to 1 after upstream bumps <Version>.
   -->
   <PropertyGroup>
-    <ForkRevision Condition="'$(ForkRevision)' == ''">3</ForkRevision>
+    <ForkRevision Condition="'$(ForkRevision)' == ''">1</ForkRevision>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(MSBuildProjectName)' == 'DeskBox' and '$(ForkRevision)' != ''">
@@ -82,4 +81,7 @@
       <AssemblyMetadata Include="ForkGitBranch" Value="$(ForkGitBranch)" Condition="'$(ForkGitSha)' != '' and '$(ForkGitBranch)' != ''" />
     </ItemGroup>
   </Target>
+  <PropertyGroup>
+    <NuGetLockFilePath Condition="'$(PublishAot)' == 'true'">$(MSBuildProjectDirectory)\packages.aot.lock.json</NuGetLockFilePath>
+  </PropertyGroup>
 </Project>

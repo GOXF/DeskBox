@@ -1,0 +1,41 @@
+using DeskBox.Services;
+using Microsoft.UI.Dispatching;
+using Microsoft.UI.Xaml;
+using WinRT;
+
+namespace DeskBox;
+
+internal static class DeskBoxMainProgram
+{
+    [STAThread]
+    private static int Main(string[] args)
+    {
+        if (DeskBoxAgentCliEntry.TryIntercept(args, out int cliExitCode))
+        {
+            return cliExitCode;
+        }
+
+#if DESKBOX_PGO_INSTRUMENTATION
+        if (PgoProfileSeedRunner.TryIntercept(args, out int pgoExitCode))
+        {
+            return pgoExitCode;
+        }
+#endif
+
+        if (App.TryForwardSameChannelSecondaryLaunchBeforeXaml(out int secondaryExitCode))
+        {
+            return secondaryExitCode;
+        }
+
+        ComWrappersSupport.InitializeComWrappers();
+        Application.Start(_params =>
+        {
+            var context = new DispatcherQueueSynchronizationContext(
+                DispatcherQueue.GetForCurrentThread());
+            SynchronizationContext.SetSynchronizationContext(context);
+            _ = new App();
+        });
+
+        return 0;
+    }
+}

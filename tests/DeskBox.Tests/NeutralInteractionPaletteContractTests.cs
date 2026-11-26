@@ -1,3 +1,6 @@
+using DeskBox.Helpers;
+using Microsoft.UI.Xaml;
+
 namespace DeskBox.Tests;
 
 /// <summary>
@@ -39,11 +42,11 @@ public sealed class NeutralInteractionPaletteContractTests
     {
         string visuals = Read("src/DeskBox/Controls/WidgetContents/FileSurfaceContent.ItemVisuals.cs");
         string surface = Read("src/DeskBox/Controls/WidgetContents/FileSurfaceContent.xaml.cs");
-        string todo = Read("src/DeskBox/Controls/WidgetContents/TodoWidgetContent.DragDrop.cs");
+        string todoRowVisuals = Read("src/DeskBox/Controls/Todo/TodoRowVisualController.cs");
         string quickCapture = Read("src/DeskBox/Controls/WidgetContents/QuickCaptureSurfaceContent.xaml.cs");
         string stackPopover = Read("src/DeskBox/Controls/WidgetContents/FileSurfaceContent.StackPopover.cs");
 
-        string reorderDrop = MethodBody(todo, "void ApplyTodoReorderDropState(");
+        string reorderDrop = MethodBody(todoRowVisuals, "void ApplyReorderDropState(");
         Assert.Contains("NeutralInteractionBrush.Line(", reorderDrop, StringComparison.Ordinal);
         Assert.DoesNotContain("GetEffectiveAccentColor", reorderDrop, StringComparison.Ordinal);
 
@@ -78,7 +81,7 @@ public sealed class NeutralInteractionPaletteContractTests
         string todo = Read("src/DeskBox/Controls/WidgetContents/TodoWidgetContent.EditingAndUndo.cs");
         string titleSwitcher = Read("src/DeskBox/Controls/WidgetGroupTitleSwitcher.xaml.cs");
         string styleCache = Read("src/DeskBox/Controls/FileItemSurfaceStyleCache.cs");
-        string groupDrop = Read("src/DeskBox/Controls/WidgetShell.xaml.cs");
+        string groupDrop = Read("src/DeskBox/Controls/WidgetGroupDropOverlay.xaml.cs");
 
         string todoHover = MethodBody(todo, "void SetTodoItemHoverState(");
         Assert.Contains("NeutralInteractionBrush.Fill(", todoHover, StringComparison.Ordinal);
@@ -174,8 +177,11 @@ public sealed class NeutralInteractionPaletteContractTests
         string searchPopup = Read("src/DeskBox/Views/SearchPopupWindow.xaml.cs");
 
         string gotFocus = MethodBody(searchPopup, "void SearchTextBox_GotFocus(");
-        Assert.Contains("NeutralInteractionBrush.Line(", gotFocus, StringComparison.Ordinal);
+        string inputWell = MethodBody(searchPopup, "void ApplySearchInputWellVisuals(");
+        Assert.Contains("ApplySearchInputWellVisuals();", gotFocus, StringComparison.Ordinal);
+        Assert.Contains("SearchPopupSurfacePolicy.ResolveInputWellVisuals(", inputWell, StringComparison.Ordinal);
         Assert.DoesNotContain("GetEffectiveAccentColor", gotFocus, StringComparison.Ordinal);
+        Assert.DoesNotContain("GetEffectiveAccentColor", inputWell, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -310,6 +316,39 @@ public sealed class NeutralInteractionPaletteContractTests
 
         Assert.Contains("\"WidgetPivotSegmentedStyle\"", helper, StringComparison.Ordinal);
         Assert.Contains("x:Key=\"WidgetPivotSegmentedStyle\"", appXaml, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    // Unloaded element with Default requested theme uses appEffectiveTheme instead of startup OS ActualTheme.
+    [InlineData(ElementTheme.Default, false, ElementTheme.Light, ElementTheme.Dark, ElementTheme.Dark)]
+    [InlineData(ElementTheme.Default, false, ElementTheme.Dark, ElementTheme.Light, ElementTheme.Light)]
+    // Explicit nearest RequestedTheme wins whether unloaded or loaded, even if appEffectiveTheme differs.
+    [InlineData(ElementTheme.Light, false, ElementTheme.Dark, ElementTheme.Dark, ElementTheme.Light)]
+    [InlineData(ElementTheme.Dark, false, ElementTheme.Light, ElementTheme.Light, ElementTheme.Dark)]
+    [InlineData(ElementTheme.Light, true, ElementTheme.Dark, ElementTheme.Dark, ElementTheme.Light)]
+    [InlineData(ElementTheme.Dark, true, ElementTheme.Light, ElementTheme.Light, ElementTheme.Dark)]
+    // Loaded element with Default requested theme honors its live elementActualTheme.
+    [InlineData(ElementTheme.Default, true, ElementTheme.Dark, ElementTheme.Light, ElementTheme.Dark)]
+    [InlineData(ElementTheme.Default, true, ElementTheme.Light, ElementTheme.Dark, ElementTheme.Light)]
+    // Null appEffectiveTheme falls back to elementActualTheme; Default everywhere falls back to Light.
+    [InlineData(ElementTheme.Default, false, ElementTheme.Dark, null, ElementTheme.Dark)]
+    [InlineData(ElementTheme.Default, false, ElementTheme.Light, null, ElementTheme.Light)]
+    [InlineData(ElementTheme.Default, false, ElementTheme.Default, null, ElementTheme.Light)]
+    [InlineData(ElementTheme.Default, true, ElementTheme.Default, null, ElementTheme.Light)]
+    public void ResolveElementThemeCore_PrefersExplicitAndAppThemeOverUnloadedStartupActualTheme(
+        ElementTheme nearestExplicitRequestedTheme,
+        bool isElementLoaded,
+        ElementTheme elementActualTheme,
+        ElementTheme? appEffectiveTheme,
+        ElementTheme expected)
+    {
+        ElementTheme actual = NeutralInteractionBrush.ResolveElementThemeCore(
+            nearestExplicitRequestedTheme,
+            isElementLoaded,
+            elementActualTheme,
+            appEffectiveTheme);
+
+        Assert.Equal(expected, actual);
     }
 
     private static string Read(string relativePath) =>

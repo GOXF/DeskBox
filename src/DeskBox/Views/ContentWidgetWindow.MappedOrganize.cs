@@ -19,8 +19,8 @@ public sealed partial class ContentWidgetWindow
             if (MappedOrganizeService.Current is null ||
                 !MappedOrganizeReorganizePolicy.ShouldOfferReorganize(
                     _config,
-                    App.Current.SettingsService.Settings.WidgetLayout.Widgets,
-                    App.Current.SettingsService.Settings.WidgetLayout.WidgetGroups))
+                    SettingsService.Settings.WidgetLayout.Widgets,
+                    SettingsService.Settings.WidgetLayout.WidgetGroups))
             {
                 return;
             }

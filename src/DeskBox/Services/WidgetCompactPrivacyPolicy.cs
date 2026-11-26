@@ -9,6 +9,8 @@ public static class WidgetCompactPrivacyPolicy
             WidgetKind.File or
             WidgetKind.Todo or
             WidgetKind.QuickCapture or
+            WidgetKind.Clipboard or
+            WidgetKind.Search or
             WidgetKind.Music;
 
     public static string ResolveContentMode(
@@ -20,7 +22,7 @@ public static class WidgetCompactPrivacyPolicy
         bool hidesSmartDetail =
             HidesSensitiveContent(enabled, widgetKind) &&
             normalized == SettingsService.WidgetCompactContentModeSmart &&
-            widgetKind is WidgetKind.File or WidgetKind.Todo or WidgetKind.QuickCapture;
+            widgetKind is WidgetKind.File or WidgetKind.Todo or WidgetKind.QuickCapture or WidgetKind.Clipboard or WidgetKind.Search;
         return hidesSmartDetail
             ? SettingsService.WidgetCompactContentModeSummary
             : normalized;

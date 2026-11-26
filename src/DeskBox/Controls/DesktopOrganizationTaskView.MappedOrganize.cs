@@ -1,55 +1,35 @@
 using DeskBox.Models;
 using DeskBox.Services;
+using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 
 namespace DeskBox.Controls;
 
-/// <summary>
-/// Fork feature 「映射整理」: the preview follows the global 「整理方式」 setting
-/// (设置 → 桌面整理). The footer shows the current mode read-only with a link
-/// to the setting; in 「只映射」 mode confirming the preview creates
-/// mapped-organize widgets that only record membership and no file leaves the
-/// Desktop folders.
-/// </summary>
+/// <summary>Fork-specific mapped organize behavior integrated with the workbench session.</summary>
 public sealed partial class DesktopOrganizationTaskView
 {
     private bool _organizeModeInitialized;
     private readonly HashSet<string> _keptOnDesktopOptInsApplied = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>
-    /// 「整理预览…」: in 「只映射」 mode, entries put back on the desktop are
-    /// sorted by the normal rules and start ticked, including the kinds the
-    /// scanner only offers as opt-in (folders, large files). Confirming maps
-    /// them and clears the 「放回桌面」 mark; unticking keeps it.
-    /// </summary>
-    private void IncludeKeptOnDesktopItems(DesktopOrganizationPlan scanned, bool freshPreview)
+    private void IncludeKeptOnDesktopItems(DesktopOrganizationPlan scanned)
     {
         try
         {
-            if (freshPreview)
-            {
-                _keptOnDesktopOptInsApplied.Clear();
-            }
-
             if (MappedOrganizeService.Current is not { } service ||
                 !ForkOrganizeModePolicy.ConfirmMapsInsteadOfMoving(ForkOrganizeModeSettings.Load()))
             {
                 return;
             }
 
-            IReadOnlyCollection<string> kept = service.KeptOnDesktopSnapshot();
-            if (kept.Count == 0)
-            {
-                return;
-            }
-
             IReadOnlyList<string> optIns = MappedOrganizeReorganizePolicy.SelectKeptOptIns(
                 scanned.SourceItems.Select(item => (item.SourcePath, item.CanOptIn)),
-                kept,
+                service.KeptOnDesktopSnapshot(),
                 _keptOnDesktopOptInsApplied);
-            _optionalIncludedPaths.UnionWith(optIns);
-            App.Log($"[MappedOrganize] Preview: {kept.Count} kept-on-desktop entries, {optIns.Count} opted in.");
+            if (optIns.Count > 0)
+            {
+                Session.IncludeItems(optIns);
+            }
         }
         catch (Exception ex)
         {
@@ -92,12 +72,12 @@ public sealed partial class DesktopOrganizationTaskView
         ToolTipService.SetToolTip(OrganizeModeLink, ForkOrganizeModeText.Get(mode == DesktopOrganizeMode.MapOnly
             ? ForkOrganizeModeText.Key.PreviewTooltipMapOnly
             : ForkOrganizeModeText.Key.PreviewTooltipMove));
-        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(
+        AutomationProperties.SetName(
             OrganizeModeLink,
             ForkOrganizeModeText.Get(ForkOrganizeModeText.Key.SettingTitle));
     }
 
-    /// <summary>Returns true when the mapped path handled the confirm click.</summary>
+    /// <summary>Returns true when map-only mode handled the confirm click.</summary>
     private async Task<bool> TryRunMappedOrganizeAsync(DesktopOrganizationPlan previewPlan)
     {
         DesktopOrganizeMode mode = ForkOrganizeModeSettings.Load();
@@ -116,30 +96,13 @@ public sealed partial class DesktopOrganizationTaskView
             return true;
         }
 
-        // Entries the user deselected in the preview stay on the desktop
-        // (「放回桌面」) instead of being swept up by automatic sorting.
-        List<string> keepOnDesktop = previewPlan.Targets
-            .SelectMany(target =>
-                _targetSelections.TryGetValue(target.SourceBucketId, out DesktopOrganizationTargetSelection? selection) &&
-                !selection.IsSelected
-                    ? target.Items.Select(item => item.SourcePath)
-                    : target.Items.Where(item => _excludedSourcePaths.Contains(item.SourcePath)).Select(item => item.SourcePath))
-            .ToList();
-        List<MappedOrganizeGroup> groups = previewPlan.Targets
-            .Where(target => !_targetSelections.TryGetValue(target.SourceBucketId, out DesktopOrganizationTargetSelection? selection) ||
-                             selection.IsSelected)
-            .GroupBy(target => target.CategoryId, StringComparer.Ordinal)
-            .Select(group => new MappedOrganizeGroup(
-                group.Key,
-                ResolveMappedCategoryName(group.Key),
-                group.First().PlannedBounds,
-                group.SelectMany(target => target.Items)
-                    .Where(item => !_excludedSourcePaths.Contains(item.SourcePath))
-                    .Select(item => item.SourcePath)
-                    .ToList()))
-            .Where(group => group.Paths.Count > 0)
-            .ToList();
-        if (groups.Count == 0)
+        MappedOrganizePreviewProjection projection = ForkOneClickOrganizePolicy.BuildMappedPreviewProjection(
+            previewPlan,
+            Session.BuildTargetSelectionsForExecution(),
+            Session.ExcludedSourcePaths,
+            service.KeptOnDesktopSnapshot().ToHashSet(StringComparer.OrdinalIgnoreCase),
+            ResolveMappedCategoryName);
+        if (projection.Groups.Count == 0)
         {
             ResultInfo.Severity = InfoBarSeverity.Warning;
             ResultInfo.Title = T("DesktopOrganization.Preview.NothingSelectedTitle");
@@ -154,11 +117,14 @@ public sealed partial class DesktopOrganizationTaskView
         OrganizeModeLink.IsEnabled = false;
         try
         {
-            int count = await service.ApplyGroupsAsync(groups, keepOnDesktop);
+            int count = await service.ApplyGroupsAsync(
+                projection.Groups,
+                projection.KeepOnDesktop,
+                projection.SkipAutoAssignPaths);
             _hasCompletedExecution = true;
             ResultInfo.Severity = InfoBarSeverity.Success;
             ResultInfo.Title = T("DesktopOrganization.Result.SuccessTitle");
-            ResultInfo.Message = Format("MappedOrganize.Result.Success", count, groups.Count);
+            ResultInfo.Message = Format("MappedOrganize.Result.Success", count, projection.Groups.Count);
             ResultInfo.IsOpen = true;
             ExecuteButton.Visibility = Visibility.Collapsed;
             CancelButton.Visibility = Visibility.Collapsed;
@@ -183,6 +149,9 @@ public sealed partial class DesktopOrganizationTaskView
             CancelButton.IsEnabled = true;
             OrganizeModeLink.IsEnabled = true;
             DoneButton.IsEnabled = true;
+            DeferredDesktopOrganizationClosePolicy.CompleteIfRequested(
+                ref _closeAfterExecutionStops,
+                () => CloseRequested?.Invoke(this, EventArgs.Empty));
         }
 
         return true;

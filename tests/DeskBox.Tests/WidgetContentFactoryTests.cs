@@ -13,8 +13,10 @@ public sealed class WidgetContentFactoryTests
     [InlineData(WidgetKind.Tags, "Tags", WidgetContentStage.Placeholder, false, WidgetContentAvailability.Planned)]
     [InlineData(WidgetKind.Music, "Music", WidgetContentStage.Implemented, false, WidgetContentAvailability.Available)]
     [InlineData(WidgetKind.SystemMonitor, "System Monitor", WidgetContentStage.Placeholder, false, WidgetContentAvailability.Planned)]
-    [InlineData(WidgetKind.Search, "Search", WidgetContentStage.Implemented, false, WidgetContentAvailability.Available)]
     [InlineData(WidgetKind.Glance, "Glance", WidgetContentStage.Implemented, false, WidgetContentAvailability.Available)]
+    [InlineData(WidgetKind.Custom, "Custom", WidgetContentStage.Implemented, false, WidgetContentAvailability.Available)]
+    [InlineData(WidgetKind.Clipboard, "Clipboard", WidgetContentStage.Implemented, false, WidgetContentAvailability.Available)]
+    [InlineData(WidgetKind.Search, "Search", WidgetContentStage.Implemented, false, WidgetContentAvailability.Available)]
     public void GetDescriptor_ReturnsContentMetadata(
         WidgetKind widgetKind,
         string title,
@@ -52,8 +54,10 @@ public sealed class WidgetContentFactoryTests
             WidgetKind.Weather,
             WidgetKind.Tags,
             WidgetKind.SystemMonitor,
-            WidgetKind.Search,
-            WidgetKind.Glance
+            WidgetKind.Glance,
+            WidgetKind.Custom,
+            WidgetKind.Clipboard,
+            WidgetKind.Search
         ], descriptors.Select(descriptor => descriptor.WidgetKind));
     }
 
@@ -65,8 +69,10 @@ public sealed class WidgetContentFactoryTests
     [InlineData(WidgetKind.Music, WidgetChromeCategory.Display, WidgetChromeMode.Overlay)]
     [InlineData(WidgetKind.Weather, WidgetChromeCategory.Display, WidgetChromeMode.Overlay)]
     [InlineData(WidgetKind.SystemMonitor, WidgetChromeCategory.Display, WidgetChromeMode.Overlay)]
-    [InlineData(WidgetKind.Search, WidgetChromeCategory.Interactive, WidgetChromeMode.Standard)]
     [InlineData(WidgetKind.Glance, WidgetChromeCategory.Display, WidgetChromeMode.Overlay)]
+    [InlineData(WidgetKind.Custom, WidgetChromeCategory.Interactive, WidgetChromeMode.Standard)]
+    [InlineData(WidgetKind.Clipboard, WidgetChromeCategory.Interactive, WidgetChromeMode.Standard)]
+    [InlineData(WidgetKind.Search, WidgetChromeCategory.Display, WidgetChromeMode.Overlay)]
     public void GetDescriptor_ReturnsChromeDefaults(
         WidgetKind widgetKind,
         WidgetChromeCategory expectedCategory,
@@ -96,15 +102,12 @@ public sealed class WidgetContentFactoryTests
     }
 
     [Fact]
-    public void NewSearchWidget_UsesOverlayChromeWithoutChangingOtherFeatureDefaults()
+    public void ApplyDefaultFeatureWidgetChromeMode_LeavesFeatureDefaultsUnset()
     {
-        var search = new WidgetConfig();
         var weather = new WidgetConfig();
 
-        WidgetManager.ApplyDefaultFeatureWidgetChromeMode(search, WidgetKind.Search);
         WidgetManager.ApplyDefaultFeatureWidgetChromeMode(weather, WidgetKind.Weather);
 
-        Assert.Equal(WidgetChromeMode.Overlay, WidgetChromeModeNames.GetOverrideMode(search));
         Assert.Equal(WidgetChromeMode.System, WidgetChromeModeNames.GetOverrideMode(weather));
     }
 
@@ -121,8 +124,10 @@ public sealed class WidgetContentFactoryTests
             WidgetKind.Todo,
             WidgetKind.Music,
             WidgetKind.Weather,
-            WidgetKind.Search,
-            WidgetKind.Glance
+            WidgetKind.Glance,
+            WidgetKind.Custom,
+            WidgetKind.Clipboard,
+            WidgetKind.Search
         ], descriptors.Select(descriptor => descriptor.WidgetKind));
         Assert.DoesNotContain(descriptors, descriptor => descriptor.WidgetKind == WidgetKind.File);
         Assert.DoesNotContain(descriptors, descriptor => descriptor.IsPlanned);
@@ -141,6 +146,8 @@ public sealed class WidgetContentFactoryTests
     [InlineData(WidgetKind.SystemMonitor, false, true, false, false, true)]
     [InlineData(WidgetKind.Search, true, false, false, true, false)]
     [InlineData(WidgetKind.Glance, true, false, false, true, false)]
+    [InlineData(WidgetKind.Custom, true, false, false, true, false)]
+    [InlineData(WidgetKind.Clipboard, true, false, false, true, false)]
     [InlineData(WidgetKind.Productivity, false, false, false, false, false)]
     public void ContentCapabilityQueries_ReturnExpectedReadOnlyState(
         WidgetKind widgetKind,

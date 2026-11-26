@@ -19,7 +19,7 @@ namespace DeskBox.Helpers;
 /// or by the app's effective theme when the caller owns no tree yet; a bare
 /// application-scope lookup would follow the system theme and invert the
 /// colors whenever the app's theme override disagrees with it.
-/// <see cref="ResolveThemedResource"/> and <see cref="IsDarkTheme"/>
+/// <see cref="ResolveThemedResource(string, DependencyObject?)"/> and <see cref="IsDarkTheme"/>
 /// generalize the same resolution to any resource or painting decision.
 ///
 /// The resolved color is a snapshot: it does not follow a later theme flip,
@@ -51,6 +51,15 @@ public static class NeutralInteractionBrush
         ResolveElementTheme(scope) == ElementTheme.Dark;
 
     /// <summary>
+    /// Returns the explicit <see cref="ElementTheme.Light"/> or
+    /// <see cref="ElementTheme.Dark"/> effective theme for <paramref name="scope"/>,
+    /// suitable for synchronizing popup-hosted surfaces (<c>ContentDialog</c>,
+    /// <c>TeachingTip</c>, <c>Flyout</c>) that live under <c>PopupRoot</c>.
+    /// </summary>
+    public static ElementTheme ResolveEffectiveElementTheme(DependencyObject? scope) =>
+        ResolveElementTheme(scope);
+
+    /// <summary>
     /// Resolves a themed resource — a <see cref="Brush"/>, or a
     /// <see cref="Color"/> wrapped as a brush — for the scope element's
     /// effective theme. Lookup order mirrors element-scope XAML resolution:
@@ -78,15 +87,31 @@ public static class NeutralInteractionBrush
             }
         }
 
-        foreach (string themeKey in IsDarkTheme(scope)
-                     ? DarkThemeDictionaryKeys
-                     : LightThemeDictionaryKeys)
+        return ResolveThemedResource(key, ResolveElementTheme(scope));
+    }
+
+    /// <summary>
+    /// Resolves a themed resource directly for an explicit <see cref="ElementTheme"/>
+    /// (<see cref="ElementTheme.Light"/> or <see cref="ElementTheme.Dark"/>) without
+    /// requiring an attached visual tree scope.
+    /// </summary>
+    public static Brush? ResolveThemedResource(string key, ElementTheme explicitTheme)
+    {
+        bool isDark = explicitTheme switch
         {
-            if (TryGetThemedDictionaryValue(
-                    Application.Current.Resources,
-                    themeKey,
-                    key,
-                    out object? value))
+            ElementTheme.Dark => true,
+            ElementTheme.Light => false,
+            _ => (App.Current?.ThemeService?.EffectiveTheme ?? ElementTheme.Light) == ElementTheme.Dark
+        };
+
+        if (Application.Current?.Resources is not { } appResources)
+        {
+            return null;
+        }
+
+        foreach (string themeKey in isDark ? DarkThemeDictionaryKeys : LightThemeDictionaryKeys)
+        {
+            if (TryGetThemedDictionaryValue(appResources, themeKey, key, out object? value))
             {
                 return AsBrush(value);
             }
@@ -118,12 +143,90 @@ public static class NeutralInteractionBrush
 
     private static ElementTheme ResolveElementTheme(DependencyObject? scope)
     {
-        ElementTheme theme = scope is FrameworkElement element
-            ? element.ActualTheme
-            : ElementTheme.Default;
-        return theme == ElementTheme.Default
-            ? App.Current.ThemeService?.EffectiveTheme ?? ElementTheme.Light
-            : theme;
+        if (scope is FrameworkElement element)
+        {
+            ElementTheme nearestRequested = ElementTheme.Default;
+            for (DependencyObject? current = element;
+                 current is not null;
+                 current = VisualTreeHelper.GetParent(current))
+            {
+                if (current is FrameworkElement candidate &&
+                    candidate.RequestedTheme is ElementTheme.Light or ElementTheme.Dark)
+                {
+                    nearestRequested = candidate.RequestedTheme;
+                    break;
+                }
+            }
+
+            return ResolveElementThemeCore(
+                nearestRequested,
+                element.IsLoaded,
+                element.ActualTheme,
+                App.Current?.ThemeService?.EffectiveTheme);
+        }
+
+        return ResolveElementThemeCore(
+            ElementTheme.Default,
+            isElementLoaded: false,
+            ElementTheme.Default,
+            App.Current?.ThemeService?.EffectiveTheme);
+    }
+
+    /// <summary>
+    /// Resolves the effective <see cref="ElementTheme"/> for a scope element.
+    /// An unloaded WinUI element with <see cref="ElementTheme.Default"/> reports
+    /// <c>Application.Current.RequestedTheme</c> (pinned to the startup OS theme)
+    /// as its <c>ActualTheme</c>, so unloaded elements fall back to the app's
+    /// effective theme first.
+    /// </summary>
+    internal static ElementTheme ResolveElementThemeCore(
+        ElementTheme nearestExplicitRequestedTheme,
+        bool isElementLoaded,
+        ElementTheme elementActualTheme,
+        ElementTheme? appEffectiveTheme)
+    {
+        if (nearestExplicitRequestedTheme is ElementTheme.Light or ElementTheme.Dark)
+        {
+            return nearestExplicitRequestedTheme;
+        }
+
+        if (isElementLoaded && elementActualTheme is ElementTheme.Light or ElementTheme.Dark)
+        {
+            return elementActualTheme;
+        }
+
+        if (appEffectiveTheme is ElementTheme.Light or ElementTheme.Dark)
+        {
+            return appEffectiveTheme.Value;
+        }
+
+        if (elementActualTheme is ElementTheme.Light or ElementTheme.Dark)
+        {
+            return elementActualTheme;
+        }
+
+        return ElementTheme.Light;
+    }
+
+    internal static bool TryResolveBrushBackedColorKey(string resourceKey, out string colorKey)
+    {
+        if (string.Equals(resourceKey, "ApplicationPageBackgroundThemeBrush", StringComparison.Ordinal))
+        {
+            colorKey = "SolidBackgroundFillColorBase";
+            return true;
+        }
+
+        const string suffix = "Brush";
+        if (!string.IsNullOrEmpty(resourceKey) &&
+            resourceKey.Length > suffix.Length &&
+            resourceKey.EndsWith(suffix, StringComparison.Ordinal))
+        {
+            colorKey = resourceKey[..^suffix.Length];
+            return true;
+        }
+
+        colorKey = string.Empty;
+        return false;
     }
 
     private static bool TryGetThemedDictionaryValue(
@@ -134,10 +237,53 @@ public static class NeutralInteractionBrush
     {
         value = null;
         if (dictionary.ThemeDictionaries.TryGetValue(themeKey, out object? themedObject) &&
-            themedObject is ResourceDictionary themed &&
-            themed.TryGetValue(resourceKey, out value))
+            themedObject is ResourceDictionary themed)
         {
-            return true;
+            // WinUI's XamlControlsResources defines *Brush entries inside
+            // unattached ResourceDictionaries with Color="{ThemeResource ...}",
+            // which stay pinned to Application.RequestedTheme (startup system
+            // theme) instead of themeKey. Prefer the underlying Color struct
+            // token when present so Light/Dark overrides resolve accurately.
+            if (TryResolveBrushBackedColorKey(resourceKey, out string colorKey) &&
+                themed.TryGetValue(colorKey, out object? colorToken) &&
+                colorToken is Color)
+            {
+                value = colorToken;
+                return true;
+            }
+
+            if (string.Equals(resourceKey, "ControlElevationBorderBrush", StringComparison.Ordinal) &&
+                themed.TryGetValue("ControlStrokeColorDefault", out object? strokeDefaultObj) &&
+                strokeDefaultObj is Color strokeDefault)
+            {
+                Color strokeSecondary = themed.TryGetValue("ControlStrokeColorSecondary", out object? strokeSecObj) &&
+                                        strokeSecObj is Color sc
+                    ? sc
+                    : strokeDefault;
+                bool isLightDict = string.Equals(themeKey, "Light", StringComparison.OrdinalIgnoreCase);
+                var elevationBrush = new LinearGradientBrush
+                {
+                    StartPoint = new Windows.Foundation.Point(0.5, 0.0),
+                    EndPoint = new Windows.Foundation.Point(0.5, 1.0)
+                };
+                elevationBrush.GradientStops.Add(new GradientStop
+                {
+                    Offset = isLightDict ? 0.90 : 0.0,
+                    Color = isLightDict ? strokeDefault : strokeSecondary
+                });
+                elevationBrush.GradientStops.Add(new GradientStop
+                {
+                    Offset = isLightDict ? 1.0 : 0.10,
+                    Color = isLightDict ? strokeSecondary : strokeDefault
+                });
+                value = elevationBrush;
+                return true;
+            }
+
+            if (themed.TryGetValue(resourceKey, out value))
+            {
+                return true;
+            }
         }
 
         foreach (ResourceDictionary merged in dictionary.MergedDictionaries)

@@ -4,9 +4,20 @@ namespace DeskBox.Services;
 
 public sealed class DesktopOrganizationPlanner
 {
-    public const int MaxNewWidgetCount = 4;
+    public const int MaxNewWidgetCount = 5;
     public const int MinimumRecommendedItemCount = 5;
+    // Preserve the fork's two-item threshold: lone categories merge into the
+    // Other bucket, which can then reuse an existing Other-rule destination.
     public const int MinimumStandaloneCategoryItemCount = 2;
+
+    private static readonly System.Collections.Frozen.FrozenSet<string> ReservedDeviceNames =
+        System.Collections.Frozen.FrozenSet.ToFrozenSet(
+        [
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+        ],
+        StringComparer.OrdinalIgnoreCase);
 
     private readonly DesktopOrganizationRuleResolver _ruleResolver;
 
@@ -22,7 +33,8 @@ public sealed class DesktopOrganizationPlanner
         IReadOnlyCollection<DesktopOrganizationRule> rules,
         Func<string, string>? categoryDisplayNameResolver = null,
         bool includePersonalDesktop = true,
-        bool includePublicDesktop = false)
+        bool includePublicDesktop = false,
+        IReadOnlySet<string>? optedInSourcePaths = null)
     {
         string normalizedRoot = Path.GetFullPath(storageRootPath);
         categoryDisplayNameResolver ??= categoryId => categoryId;
@@ -32,6 +44,11 @@ public sealed class DesktopOrganizationPlanner
             (item.SourceScope == DesktopOrganizationSourceScope.Public ? includePublicDesktop : includePersonalDesktop)
                 ? item
                 : item with { ExclusionReason = DesktopOrganizationExclusionReason.SourceNotSelected }).ToList();
+
+        if (includePersonalDesktop && includePublicDesktop)
+        {
+            DesktopOrganizationScanner.ApplyQuickBatchLimit(selectedItems, optedInSourcePaths);
+        }
 
         foreach (DesktopOrganizationFileSnapshot item in selectedItems.Where(item => item.IsEligible))
         {
@@ -99,6 +116,7 @@ public sealed class DesktopOrganizationPlanner
             string directory = FileService.GetAvailablePath(
                 Path.Combine(normalizedRoot, SanitizeFolderName(displayName)),
                 reservedDirectories);
+            reservedDirectories.Add(directory);
             var target = new MutableTarget(
                 $"category:{categoryId}",
                 categoryId,
@@ -129,11 +147,22 @@ public sealed class DesktopOrganizationPlanner
     private static void MergeSmallAndOverflowCategories(
         IDictionary<string, List<DesktopOrganizationFileSnapshot>> categories)
     {
+        foreach (string emptyKey in categories
+                     .Where(pair => pair.Value.Count == 0)
+                     .Select(pair => pair.Key)
+                     .ToList())
+        {
+            categories.Remove(emptyKey);
+        }
+
         var other = categories.TryGetValue(DesktopOrganizationCategoryIds.Other, out var existingOther)
             ? existingOther
             : [];
         categories[DesktopOrganizationCategoryIds.Other] = other;
 
+        // Keep the fork's prior behavior: categories with fewer than two
+        // items join Other, letting the Other rule/widget remain the stable
+        // destination instead of producing one-off category widgets.
         foreach (string categoryId in categories.Keys
                      .Where(categoryId => categoryId != DesktopOrganizationCategoryIds.Other)
                      .ToList())
@@ -147,6 +176,16 @@ public sealed class DesktopOrganizationPlanner
             categories.Remove(categoryId);
         }
 
+        if (categories.Count <= MaxNewWidgetCount)
+        {
+            if (other.Count == 0)
+            {
+                categories.Remove(DesktopOrganizationCategoryIds.Other);
+            }
+
+            return;
+        }
+
         while (categories.Count(pair => pair.Value.Count > 0) > MaxNewWidgetCount)
         {
             var smallest = categories
@@ -154,7 +193,7 @@ public sealed class DesktopOrganizationPlanner
                     pair.Key != DesktopOrganizationCategoryIds.Other &&
                     pair.Value.Count > 0)
                 .OrderBy(pair => pair.Value.Count)
-                .ThenBy(pair => GetCategoryOrder(pair.Key))
+                .ThenByDescending(pair => GetCategoryOrder(pair.Key))
                 .First();
             other.AddRange(smallest.Value);
             categories.Remove(smallest.Key);
@@ -203,13 +242,44 @@ public sealed class DesktopOrganizationPlanner
         return int.MaxValue;
     }
 
-    private static string SanitizeFolderName(string name)
+    internal static string SanitizeFolderName(string name)
     {
-        string sanitized = string.Concat(name.Select(character =>
-            Path.GetInvalidFileNameChars().Contains(character) ? '_' : character)).Trim();
-        return string.IsNullOrWhiteSpace(sanitized)
-            ? DesktopOrganizationCategoryIds.Other
-            : sanitized;
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return DesktopOrganizationCategoryIds.Other;
+        }
+
+        char[] invalidChars = Path.GetInvalidFileNameChars();
+        string cleaned = string.Concat(name.Trim().Select(character =>
+            character == '/' || character == '\\' || char.IsControl(character) || invalidChars.Contains(character)
+                ? '_'
+                : character))
+            .Trim()
+            .TrimEnd('.', ' ');
+
+        if (string.IsNullOrWhiteSpace(cleaned) || cleaned.All(ch => ch == '.'))
+        {
+            return DesktopOrganizationCategoryIds.Other;
+        }
+
+        const int maxLength = 80;
+        if (cleaned.Length > maxLength)
+        {
+            cleaned = cleaned[..maxLength].TrimEnd('.', ' ');
+            if (string.IsNullOrWhiteSpace(cleaned))
+            {
+                return DesktopOrganizationCategoryIds.Other;
+            }
+        }
+
+        int dotIndex = cleaned.IndexOf('.');
+        string stem = (dotIndex >= 0 ? cleaned[..dotIndex] : cleaned).TrimEnd(' ');
+        if (ReservedDeviceNames.Contains(stem))
+        {
+            cleaned = $"_{cleaned}";
+        }
+
+        return cleaned;
     }
 
     private sealed class MutableTarget(

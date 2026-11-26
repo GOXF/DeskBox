@@ -69,15 +69,6 @@ public sealed class IdleWidgetZOrderPolicyTests
     }
 
     [Fact]
-    public void ShouldNormalizeIdlePeerOrder_OnlyRunsWhileDropShadowsAreEnabled()
-    {
-        Assert.True(IdleWidgetZOrderPolicy.ShouldNormalizeIdlePeerOrder(
-            windowDropShadowEnabled: true));
-        Assert.False(IdleWidgetZOrderPolicy.ShouldNormalizeIdlePeerOrder(
-            windowDropShadowEnabled: false));
-    }
-
-    [Fact]
     public void MatchesRequestedOrder_AcceptsAlreadyAppliedOrder()
     {
         var requested = Handles(10, 20, 30);
@@ -119,6 +110,22 @@ public sealed class IdleWidgetZOrderPolicyTests
             requested,
             peersObservedAboveHighest: Array.Empty<IntPtr>(),
             peersObservedFromHighestDown: Handles(10, 20)));
+    }
+
+    [Fact]
+    public void OrderHighestToLowest_PlacesExpandedCapsuleAndLeaseAboveLowerCollapsedRows()
+    {
+        var candidates = new[]
+        {
+            new IdleWidgetZOrderCandidate(new IntPtr(1), "0:0:1920:1080", Top: 100, Left: 20, StableKey: "row1-expanded", HasExpandedLease: false, IsExpandedCapsule: true),
+            new IdleWidgetZOrderCandidate(new IntPtr(2), "0:0:1920:1080", Top: 300, Left: 20, StableKey: "row2-collapsed"),
+            new IdleWidgetZOrderCandidate(new IntPtr(3), "0:0:1920:1080", Top: 500, Left: 20, StableKey: "row3-lease", HasExpandedLease: true, IsExpandedCapsule: true)
+        };
+
+        IReadOnlyList<IdleWidgetZOrderCandidate> ordered =
+            IdleWidgetZOrderPolicy.OrderHighestToLowest(candidates);
+
+        Assert.Equal(new long[] { 3, 1, 2 }, Handles(ordered));
     }
 
     private static IntPtr[] Handles(params long[] handles) =>

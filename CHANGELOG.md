@@ -1,5 +1,79 @@
 # Changelog
 
+## 1.6.2 - 2026-11-25
+
+### English
+
+#### New features
+
+- **Desktop Search widget returns.** A redesigned desktop Search widget with adaptive Micro, Compact Bar, Medium, and Large layouts. Type `+ ` to add a todo, `; ` to capture a quick note, `> ` to run a command, or enter an expression to calculate directly; optionally display pinned/recent searches and recently opened items with an auto-blur privacy mask on pointer exit.
+- **Standalone Quick Paste (`Alt+V`).** Global clipboard capture and the `Alt+V` Quick Paste popup can now run independently without keeping a Clipboard widget on the desktop.
+- **Refined menu acrylic & text contrast.** Context menus and transient flyouts adopt theme-aware acrylic surfaces and cleaner text shadows for better legibility across light and dark wallpapers.
+
+#### Fixes & Performance
+
+- **Instant `F7` icon reveal, zero-flash wake & gentler memory trimming.** Preserves visible first-screen file icons and warm compressed icon bytes across hidden states so `F7` / double-click wake displays icons immediately instead of reloading row by row; relaxes working-set trim thresholds to eliminate hover and short-hide page-fault stalls, pre-applies wipe clips and extends DWM commit grace to prevent first-frame wake flashes, restores custom/panoramic backgrounds on wake, stops Glance photo blink on desktop refresh, and narrows fullscreen occlusion checks to exclusive fullscreen and presentation mode.
+- **Capsule Z-order, stack popovers & zero-ghost batch hide.** Keeps expanded capsules above lower-row collapsed capsules across desktop clicks and group restacks while blocking pointer-through hover activation from occluded widgets; cancels deferred layer-restore timers and suppresses `SWP_SHOWWINDOW` during layer demotion so hidden capsules never reappear on the desktop; fixes unactivated stack popover outside-click light-dismiss, post-context-menu rename focus grace, and close-button interaction-lease leaks.
+- **Reliable rename, Custom Widget `<input>` focus & Todo `All`-view reordering.** Fixed unresponsive Rename/Edit actions and IME composition interruptions across files, folders, stacks, stack popovers, widget titles, Todo items, and Quick Capture notes in desktop-pinned mode; added host keyboard activation, smart-capsule collapse protection, and live retained-patch updates while typing or composing CJK IME in Custom Widget `<input>` / `<textarea>` controls; fixed Todo drag-to-reorder in the `All` filter so active and completed partitions reorder independently without snapping back.
+- **Clipboard image copy, non-ASCII / `.lnk` / Store launch & Windows 10 stability.** Fixed NativeAOT WinRT marshaling failures when copying Clipboard History images, probing `System.Kind`, and formatting system traditional calendars; fixed "The directory name is invalid" errors when invoking Shell context-menu commands in non-ASCII/CJK folders, opening `.lnk` shortcuts with quoted working directories, or launching Microsoft Store virtualized `LocalCache` files (while preserving NTFS symlinks and junctions); resolved Windows 10 `DesktopAcrylicController` cross-compositor crashes, Windows 10 solid-backdrop theme contrast, Quick Capture popout/double-tap crashes, companion IPC UI-thread shutdown hangs (`0x8001010E`) and false restore failure prompts, manual-launch startup settling waits, UIPI-elevated foreground hook false alarms, 65-second AI co-creation keep-alive drops, and Smart App Control / policy-block installer diagnostics.
+- **Out-of-process pickers & resilient diagnostics.** Moved folder and file open pickers into the isolated out-of-process native proxy (with dark-theme sync and automatic cleanup on host exit) so slow network drives or Shell extensions never freeze DeskBox; fixed desktop-floor Z-order restacking storms above wallpaper helpers, Recycle Bin probe stalls, Workshop desktop-placement animation races, capsule drag/cancel-merge jumps, and added a 15-second standalone emergency fallback when exporting diagnostics bundles.
+
+### 中文
+
+#### 新功能
+
+- **桌面搜索组件回归。** 全新设计自适应微尺寸图标、紧凑横条、中等卡片与大尺寸面板布局；支持输入 `+ ` 快速新建待办、`; ` 快速记录随记、`> ` 执行快捷指令或直接输入算式求值，可选展示搜索历史与最近打开项目，并支持指针离开自动模糊的桌面隐私遮罩。
+- **快捷粘贴弹窗（`Alt+V`）支持独立运行。** 无需在桌面常驻剪贴板格子，即可单独开启全局剪贴板采集与 `Alt+V` 快捷粘贴弹窗。
+- **菜单亚克力质感与文字可读性优化。** 应用内右键菜单与弹出浮层升级主题自适应亚克力背景与清晰文字阴影，深浅色壁纸下阅读更舒适。
+
+#### 修复与性能优化
+
+- **`F7` 唤起图标秒显、零闪烁唤醒与内存回收调优。** 隐藏期间保留展开态文件格子首屏可见图标与热区压缩缓存，按 `F7` 或双击桌面唤起时第 0 帧即带齐图标不再逐排蹦出；回调工作集裁剪静默阈值以消除日常悬停与短时切换的缺页卡顿，修复唤起首帧闪烁、自定义/全景背景丢失与桌面右键刷新时时光格子照片闪白，并将全屏遮挡判定收窄至独占全屏与演示模式。
+- **胶囊展开层级、叠放弹窗外点收起与批量隐藏零残留。** 多排胶囊上下排列时展开面板始终压住下方未展开胶囊且点击桌面不掉层，阻断被遮挡胶囊悬停穿透串点；批量隐藏时取消延迟层恢复定时器并禁止隐藏态层降级重新点亮窗口，彻底根除隐藏后个别胶囊残留桌面；修复叠放弹窗点击外部不自动收起、右键菜单重命名瞬态误关及关闭按钮交互锁泄漏。
+- **重命名、自定义组件 `<input>` 焦点与待办「全部」拖拽全面修复。** 修复桌面钉住模式下文件、文件夹、叠放标题、叠放弹窗内项目、盒子标题、待办事项及随记点击「重命名 / 编辑」无反应或输入法选词中断的问题；补齐自定义组件输入框点击获焦、打字期智能胶囊防自动收起与输入法组词期原地局部刷新保护；修复待办「全部」视图下无法上下拖拽调整顺序及已完成分区排序回弹的问题。
+- **剪贴板图片复制、中文目录右键打开与 Windows 10 / 商店版稳定性加固。** 修复 NativeAOT 下剪贴板历史点击图片复制失效、`System.Kind` 探测异常及和历/伊斯兰历等系统传统历法空白；修复含中文路径的系统右键菜单、带双引号起始目录的 `.lnk` 快捷方式及微软商店版 `LocalCache` 虚拟化路径打开时报「目录名称无效」（同时完整保留用户 NTFS 符号链接与目录联接）；根治 Windows 10 点击开始菜单收起胶囊触发的跨 `Compositor` 闪退、Windows 10 纯色回退深浅色错位、随记双击与独立小窗关闭闪退、设置伴侣进程触发重启/更新时的 `0x8001010E` 5 秒卡死与误报恢复失败、手动启动白等 5 秒、管理员前台窗口触发的钩子误重绑、工坊 AI 二创 65 秒断流，以及 Windows 安全策略拦截更新安装器时的明确指引。
+- **彻底解决选目录/选文件假死与应急诊断加固。** 将文件夹与文件打开选择器迁入独立原生代理进程（同步深色主题并在宿主退出时自动清理），避免第三方外壳扩展或慢速网络盘卡死主界面；修复特定壁纸辅助窗口下的桌面底层反复重排、回收站状态探测卡顿、工坊新建组件放置桌面动画闪退、智能胶囊拖拽/取消合并跳变，并为一键导出诊断包增加 15 秒独立应急导出兜底。
+
+## 1.6.0 - 2026-11-23
+
+### English
+
+#### New features
+
+- **Declarative Custom Widgets, QuickJS Script Sandbox & Widget Studio.** Build, customize, and share native WinUI 3 desktop widgets with zero WebView overhead. Interactive widgets pair declarative UI (`manifest.json`) with an air-gapped QuickJS script sandbox (`logic.js`) enforced by strict instruction-count, wall-clock, and memory quotas plus per-widget capability gates (Internet, LAN/localhost, clipboard/system, local files, command execution). Widget Studio supports three authoring channels — **Direct API (BYOK)**, **External Coding Agents** (`--mcp` stdio bridge & CLI skills with native **host approval and stage-and-preview confirmation** before applying changes), and **zero-setup Web AI prompt handoff** — alongside **14 localized official templates across 13 languages** (System Monitor with CPU/RAM/GPU/VRAM/Top Processes/Drives plus Recycle Bin drop target and Search launcher, AI Usage Monitor, Pomodoro & Sedentary Posture Guardian, Statutory Holiday & Payday Countdown, World Clock with 24-hour meeting scrubber, Ambient Focus noise mixer, Dev Toolbox, Quick Actions Hub, Weather Desk, Todo Agenda, and more), ECDSA P-256 signed remote catalog/prompt updates, `.dbxwidget` import/export, and `deskbox://` deep links.
+- **Clipboard History widget, global Quick Paste popup (`Alt+V`) & offline image OCR.** Capture text, HTML/RTF, images, files, and color swatches with instant search, a keyboard-first `Alt+V` Quick Paste popup that pastes directly back into the active window, on-device offline image OCR for indexing and extracting text from screenshots, built-in text transforms, optional webpage URL title fetching (off by default, skipping one-time auth and internal links), pinning, and per-app exclusion rules. Uses keyed HMAC-SHA256 deduplication, content-addressed externalization for large entries, automatic local DPAPI encryption and UI masking for sensitive secrets, and optional decrypted portable export for cross-PC migration.
+- **Unified Global Search popup (`Alt+D`) & standalone Search widget retirement.** Adds a built-in instant calculator, quick command palette, one-keystroke web search fallback, and Recommendation Edit Mode with custom app folders, multi-select drag-to-reorder, and batch hide/unhide. The standalone desktop Search widget smoothly retires in favor of the unified global search popup.
+- **Widget Groups, Desktop Organization workbench & window layering.** Combine any widget types into tabbed groups with connected Windows 11 tabs or equal-width tabs, overflow scroll arrows and `Ctrl+Wheel` pan, spring-animated tab reordering, native acrylic merge/detach placement previews, and reliable inactive-tab detaching and merge-undo. Reworked Desktop Organization around a dedicated preview-and-routing workbench with per-widget file rules, custom extension/exclusion filters, automatic background filing for newly settled desktop files, and history review, plus a choice between desktop-pinned bottom layering and normal window layering.
+- **Todo, QuickCapture, Music & Glance upgrades.** Todo adds natural-language date/time/recurrence input (English & Chinese), full-text search, an overdue bar with one-click reschedule and undo, batch checklist paste, bidirectional Todo ↔ QuickCapture conversion, and task export. QuickCapture adds an independent popout pinned note window, multi-note merge with undo, IME-safe inline composer shortcuts (`Enter` to save, `Ctrl+Enter` / `Shift+Enter` for newline), Markdown list continuation, and live folder mirror sync. Music adds real-time audio spectrum visualization and synchronized scrolling lyrics via LRCLIB and local `.lrc` files; Glance adds multiple face styles and holiday/agenda integration.
+- **Unified file drag-and-drop & elevated-session outbound drag.** Streamlined file drag behavior under a single unified setting with a master drag-and-drop result hint toggle covering inbound and outbound drops (including Explorer optimized moves) and a Windows 10 Move-mode `Ctrl`-to-copy modifier hint. When DeskBox runs elevated above a standard Explorer shell, dragging files out of widgets automatically switches to a cursor-tracked pointer drag engine with lexical cycle protection.
+
+#### Fixes & Architecture
+
+- **Isolated companion processes & native host services.** Settings (`--settings`) and Widget Studio (`--studio`) run in short-lived companion processes over current-user authenticated named-pipe IPC so all UI memory is reclaimed immediately on close, paired with out-of-process `DeskBox.ThumbnailProxy.exe` Shell thumbnail extraction and resilient media session proxy recovery. Replaced `EverythingSdk.dll` and `H.NotifyIcon` with a zero-dependency native IPC client and self-drawn Win32 tray host, and included the statically linked `deskbox_qjs.dll` QuickJS sandbox module in Direct and Store Native AOT audits.
+- **Windows 10 motion smoothness & Z-order hardening.** Preserves frosted acrylic during widget drag, resize, and hover-expand on physical GPUs while automatically simplifying controller acrylic during motion on software/remote sessions (Hyper-V, RDP, WARP) or sustained frame overruns; eliminates `F7` quick-reveal band-split delays and callback-reentrant window activation races.
+- **Resilient Store persistence, backup safety & diagnostics.** Microsoft Store builds store settings and widget data under `%UserProfile%\DeskBox\.appdata` so MSIX package resets or reinstalls never wipe user data. Portable backup restores from untrusted foreign archives automatically strip machine-bound credentials and high-risk custom widget permissions, unknown future schema fields are preserved non-destructively on load/save, and privacy-filtered diagnostics bundles preserve valid Studio archive JSON/JS structure while redacting personal paths and secrets.
+- **Dual licensing.** Adopted a Dual-Licensing model starting in 1.6.0 (`GPL-3.0-only` + Commercial License, see `LICENSING.md`) with an explicit copyleft exemption for independent `.dbxwidget` custom widgets and trademark reservation.
+- **Upgrade note:** Profiles that create Custom Widgets or Clipboard History widgets in 1.6.0 should not be downgraded to 1.5.9 or earlier, as older builds do not recognize these widget types and would omit them on save. Back up your configuration before testing older versions.
+
+### 中文
+
+#### 新功能
+
+- **声明式自定义组件、QuickJS 隔离脚本沙箱与组件工坊（Widget Studio）。** 基于原生 WinUI 3 渲染引擎打造桌面组件（零 WebView 常驻开销）；交互式组件可通过隔离的 QuickJS 脚本沙箱（`logic.js`）编写状态逻辑，受单次执行时长、指令步数与内存配额硬限保护，并配套按组件独立授权的能力门禁（公网、局域网/本机、剪贴板与系统控制、本地文件读写、终端命令执行）。组件工坊提供**自有 API 直连**、**外部编程智能体接入**（`--mcp` 标准输入输出桥接与 CLI Skill，外部提交变更须经**原生宿主授权与暂存预览确认**后方才应用到桌面）与**零配置网页 AI 提示词协同**三大通道；内置覆盖 13 种语言的 **14 款官方精选模板**（含集成 CPU/内存/显卡/显存/高占用进程/磁盘卡片及回收站投放与快捷搜索入口的系统监控、AI 用量监控、番茄钟与久坐微动作守护、法定节假日与发薪日倒数、带 24 小时会议推演滑杆的世界时钟、专注白噪音混音台、文本与开发工具箱、快捷动作面板、桌面天气、待办日程等），支持 ECDSA P-256 签名远程目录/提示词热更新、`.dbxwidget` 导入导出与 `deskbox://` 协议深链。
+- **剪贴板历史组件、全局快捷粘贴弹窗（`Alt+V`）与离线图片 OCR。** 自动采集文本、富文本（HTML/RTF）、图片、文件列表与颜色值，支持即时检索、`Alt+V` 全局快捷粘贴弹窗（选中即回填当前焦点窗口）、本机离线图片 OCR 识图与文字检索、内置文本快捷转换、可选网页链接标题自动抓取（默认关闭，自动跳过一次性登录鉴权与内网链接）、置顶与来源应用排除规则；底层采用带密钥 HMAC-SHA256 去重、大体积条目自动外置落盘、敏感凭据本机 DPAPI 静态加密与界面脱敏展示，并支持可选导出解密快照以便跨电脑迁移。
+- **统一全局搜索弹窗（`Alt+D`）增强与独立搜索组件退场。** 全局搜索弹窗新增内置即时计算器、命令面板快捷指令、一键网页搜索兜底跳转，以及推荐区编辑模式（支持应用文件夹分组、单选/多选拖拽排序与批量隐藏/恢复）；原独立桌面「搜索」格子平滑退场并统一收敛至全局搜索弹窗。
+- **全类型格子分组、桌面整理工作台与窗口层级模式。** 支持将任意类型格子合并为标签组（提供 Windows 11 联通标签与等宽并列标签、溢出滚动箭头与 `Ctrl+滚轮` 平移、弹簧动画拖拽重排、原生亚克力合并/拆出落点预览，以及稳健的非激活标签拆出与合并撤销）；重构桌面整理预览与分流工作台，支持按文件格子绑定整理规则、自定义扩展名与排除项、新落盘桌面文件的自动后台归档与整理记录回溯，并新增桌面底层钉住与普通窗口层级切换。
+- **待办、随记、音乐与时光组件全面升级。** 待办新增中英文自然语言日期/时间/重复规则解析、全文检索、逾期汇总栏一键顺延与撤销、多行清单批量粘贴拆分、待办与随记双向互转及任务导出；随记支持独立置顶小窗、多条笔记合并与撤销、输入法友好的行内快捷输入（`Enter` 保存、`Ctrl+Enter` / `Shift+Enter` 换行）、Markdown 列表自动续行与本地目录镜像同步；音乐组件新增实时音频频谱动效及基于 LRCLIB 与本地 `.lrc` 的同步滚动歌词；时光组件新增多款表盘样式并联动节假日与今日日程。
+- **文件拖放体验统一与提权会话安全拖出。** 收敛统一文件拖放行为设置，整合「拖放结果提示」总开关（完整覆盖拖入、拖出及资源管理器同盘优化移动提示）与 Windows 10 移动模式下起拖按住 `Ctrl` 临时复制提示；当 DeskBox 高于资源管理器权限运行时，向外拖出文件自动切换至带目录环路防护的指针跟踪安全拖拽链路。
+
+#### 修复与架构优化
+
+- **伴侣宿主进程隔离与原生底座升级。** 设置中心（`--settings`）与组件工坊（`--studio`）以同源 `DeskBox.exe` 短生命周期伴侣进程承载并通过当前用户鉴权命名管道通信，关闭窗口即刻彻底释放对应界面内存；搭配独立 `DeskBox.ThumbnailProxy.exe` 缩略图隔离提取与系统媒体会话代理容错恢复。移除外部 `EverythingSdk.dll` 与 `H.NotifyIcon` 依赖，全面切换至零外部依赖原生 IPC 客户端与自绘 Win32 托盘宿主，并将静态链接的 `deskbox_qjs.dll` QuickJS 沙箱模块纳入直装版与商店版 Native AOT 符号及产物审计。
+- **Windows 10 动画帧率自适应与窗口层级稳定性加固。** 在物理显卡环境下全程保留拖拽、缩放与胶囊悬停展开时的亚克力磨砂质感，在虚拟化/远程桌面会话（Hyper-V、RDP、WARP）或连续帧超时场景下自动平滑降级交互期背景采样以消除掉帧，并修复 `F7` 快捷唤起时的同组窗口分层延迟与系统回调重入竞态。
+- **商店持久化目录、备份安全边界与诊断脱敏加固。** 微软商店版将数据根目录迁至 `%UserProfile%\DeskBox\.appdata` 持久化路径，避免应用重置或重装清空用户数据；导入非本机外源备份包时自动剥离设备绑定凭据与高风险自定义组件权限，读写设置时无损保留未知高版本字段，并升级诊断包结构化脱敏器以在抹除个人路径与密钥的同时完整保留工坊归档 JSON 与脚本语法结构。
+- **双轨开源与商业授权。** 自 1.6.0 起实行「`GPL-3.0-only` + 商业授权」双轨发布（详见 `LICENSING.md`），明确独立 `.dbxwidget` 自定义组件免传染豁免与品牌标识保留边界。
+- **升级提示：** 在 1.6.0 中创建「自定义组件」或「剪贴板」格子后，请勿直接降级覆盖安装 1.5.9 及更早版本（旧版无法识别新增组件类型并在保存配置时将其忽略）；如需回退旧版请先导出备份。
+
 ## 1.5.9 - 2026-10-23
 
 ### English

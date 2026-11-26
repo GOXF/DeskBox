@@ -44,6 +44,11 @@ public sealed partial class FileSurfaceContent
         }
 
         Canvas.SetZIndex(editor, 40);
+        DeskBox.Helpers.ImeCompositionGuard.AttachAncestors(editor);
+        if (_stackPopoverTitleEditor is { } titleEditor)
+        {
+            DeskBox.Helpers.ImeCompositionGuard.AttachAncestors(titleEditor);
+        }
         editor.KeyDown += StackPopoverItemRenameEditor_KeyDown;
         editor.LostFocus += StackPopoverItemRenameEditor_LostFocus;
         AutomationProperties.SetName(editor, T("Common.Rename"));
@@ -72,6 +77,7 @@ public sealed partial class FileSurfaceContent
         {
             if (ReferenceEquals(_stackPopoverItemRenameTarget, item))
             {
+                ActivateStackPopoverInput();
                 SelectItemNameForRename(editor, item.IsFolder);
             }
             return;
@@ -84,6 +90,11 @@ public sealed partial class FileSurfaceContent
         if (_itemRenameTarget is not null)
         {
             CancelItemRename();
+        }
+
+        if (_stackPopoverTitleEditing)
+        {
+            CommitStackPopoverTitleRename();
         }
 
         WidgetItem? renameItem = FindDisplayedItem(item);
@@ -164,6 +175,7 @@ public sealed partial class FileSurfaceContent
         SetItemsViewScrollingSuspended(true);
         App.Current?.WidgetManager?.BeginWidgetInteraction(
             "surface-stack-popover-item-rename-opened");
+        ActivateStackPopoverInput();
         SelectItemNameForRename(editor, renameItem.IsFolder);
     }
 
@@ -274,6 +286,11 @@ public sealed partial class FileSurfaceContent
         object sender,
         KeyRoutedEventArgs e)
     {
+        if (DeskBox.Helpers.ImeCompositionGuard.IsImeCompositionKeyEvent(e))
+        {
+            return;
+        }
+
         if (e.Key == Windows.System.VirtualKey.Enter)
         {
             e.Handled = true;
@@ -296,9 +313,12 @@ public sealed partial class FileSurfaceContent
             return;
         }
 
-        if (InlineEditorFocus.TryRecoverFocusWithinGrace(
+        if (DeskBox.Helpers.TransientInputFocusGuard.ShouldDeferInlineEditorBlurCommit(
+                sender as Control,
                 _stackPopoverItemRenameOpenedAtTick,
-                sender as TextBox))
+                _stackPopoverHostWindow?.WindowHandle ?? default,
+                () => IsStackPopoverItemRenameEditing,
+                CommitStackPopoverItemRenameAsync))
         {
             return;
         }
@@ -434,7 +454,12 @@ public sealed partial class FileSurfaceContent
             return;
         }
 
-        HideStackPopoverForReuse();
+        bool restoreOwnerForeground = _stackPopoverCleanupRestoreOwnerForeground;
+        HideStackPopoverForReuse(restoreOwnerForeground);
+        if (!restoreOwnerForeground)
+        {
+            App.Current?.WidgetManager?.NotifyTransientPopupDismissedFromWidget(_hostWindowHandle);
+        }
     }
 
     private void ReleaseStackPopoverItemRenameEditor()

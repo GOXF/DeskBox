@@ -60,6 +60,26 @@ public sealed class ForkHiddenRestoreTests
     }
 
     [Fact]
+    public void RuntimeHiddenLedger_RestoresLegacyEntriesButNeverHidesNewOnes()
+    {
+        var files = new Dictionary<string, FileAttributes?>(StringComparer.OrdinalIgnoreCase)
+        {
+            [D("legacy-hidden.png")] = FileAttributes.Archive | FileAttributes.Hidden,
+            [D("visible.png")] = FileAttributes.Archive,
+        };
+
+        MappedOrganizeHiddenLedger.Plan plan = MappedOrganizeHiddenLedger.PlanRestoreOnly(
+            [D("legacy-hidden.png"), D("visible.png"), D("gone.png")],
+            path => files.TryGetValue(path, out FileAttributes? value) ? value : null);
+
+        Assert.Empty(plan.ToHide);
+        Assert.Equal(new[] { D("legacy-hidden.png") }, plan.ToUnhide);
+        Assert.Equal(2, plan.Forget.Count);
+        Assert.Contains(D("visible.png"), plan.Forget);
+        Assert.Contains(D("gone.png"), plan.Forget);
+    }
+
+    [Fact]
     public void LeakPolicy_ClassifiesWhereTheEntryWent()
     {
         static bool IsDesktop(string path) =>

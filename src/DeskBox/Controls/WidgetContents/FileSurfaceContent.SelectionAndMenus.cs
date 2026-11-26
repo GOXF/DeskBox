@@ -1,4 +1,4 @@
-﻿using DeskBox.Helpers;
+using DeskBox.Helpers;
 using DeskBox.Models;
 using DeskBox.Platform;
 using DeskBox.Services;
@@ -57,7 +57,6 @@ public sealed partial class FileSurfaceContent
             e.GetCurrentPoint(pointerSurface).Properties.IsRightButtonPressed;
         _selectionPressOnRowBlank = false;
         if ((!isLeftButtonPressed && !isRightButtonPressed) ||
-            Win32Helper.IsKeyPressed(Windows.System.VirtualKey.Shift) ||
             !CanStartBoxSelection(e.OriginalSource, e))
         {
             return;
@@ -82,14 +81,15 @@ public sealed partial class FileSurfaceContent
         _selectionStartPoint =
             e.GetCurrentPoint(selectionOverlay).Position;
         _selectionCurrentPoint = _selectionStartPoint;
-        _selectionSnapshot =
-            Win32Helper.IsKeyPressed(Windows.System.VirtualKey.Control)
-                ? GetSelectedItems().ToList()
-                : [];
+        bool additiveMarquee =
+            Win32Helper.IsKeyPressed(Windows.System.VirtualKey.Control) ||
+            Win32Helper.IsKeyPressed(Windows.System.VirtualKey.Shift);
+        _selectionSnapshot = additiveMarquee
+            ? listView.SelectedItems.OfType<WidgetItem>().Distinct().ToList()
+            : [];
         _selectionHits = [];
 
-        if (!Win32Helper.IsKeyPressed(
-                Windows.System.VirtualKey.Control))
+        if (!additiveMarquee)
         {
             listView.SelectedItems.Clear();
             UpdateSelectionCommandBar();
@@ -111,6 +111,11 @@ public sealed partial class FileSurfaceContent
         UIElement pointerSurface,
         PointerRoutedEventArgs e)
     {
+        if (TryHandleElevatedPointerMoved(e))
+        {
+            return;
+        }
+
         if (!_selectionPointerPressed)
         {
             return;
@@ -132,6 +137,7 @@ public sealed partial class FileSurfaceContent
             _isBoxSelecting = true;
             pointerSurface.CapturePointer(e.Pointer);
             CacheSelectionHits(listView, selectionOverlay);
+            BeginMarqueeAutoScroll(listView);
         }
 
         UpdateSelectionRectangle(listView);
@@ -154,6 +160,11 @@ public sealed partial class FileSurfaceContent
         UIElement pointerSurface,
         PointerRoutedEventArgs e)
     {
+        if (TryHandleElevatedPointerReleased(e))
+        {
+            return;
+        }
+
         bool wasBoxSelecting = _isBoxSelecting;
         bool completedRightMarquee =
             wasBoxSelecting && _selectionStartedWithRightButton;
@@ -197,6 +208,7 @@ public sealed partial class FileSurfaceContent
         object sender,
         PointerRoutedEventArgs e)
     {
+        HandleElevatedPointerCaptureLost(e.Pointer.PointerId);
         if (sender is ListViewBase listView)
         {
             HandleItemsPointerCaptureLost(listView);
@@ -256,7 +268,7 @@ public sealed partial class FileSurfaceContent
         _selectionHits = [];
         foreach (WidgetItem item in listView.Items
                      .OfType<WidgetItem>()
-                     .Where(item => item is not WidgetStackItem))
+                     .Where(item => item is not WidgetStackItem { IsExpanded: true }))
         {
             if (listView.ContainerFromItem(item) is not SelectorItem container ||
                 container.Visibility != Visibility.Visible ||
@@ -384,8 +396,39 @@ public sealed partial class FileSurfaceContent
             ? popoverRectangle
             : SelectionRectangle;
 
+    private void CancelBoxSelection(ListViewBase listView)
+    {
+        if (!_isBoxSelecting && !_selectionPointerPressed)
+        {
+            return;
+        }
+
+        WidgetItem[] snapshot = _selectionSnapshot.ToArray();
+        ResetBoxSelectionState();
+        _isSynchronizingSelection = true;
+        try
+        {
+            listView.SelectedItems.Clear();
+            foreach (WidgetItem item in snapshot)
+            {
+                if (listView.Items.Contains(item))
+                {
+                    listView.SelectedItems.Add(item);
+                }
+            }
+        }
+        finally
+        {
+            _isSynchronizingSelection = false;
+        }
+
+        UpdateSelectionCommandBar();
+        RefreshItemSelectionVisuals();
+    }
+
     private void ResetBoxSelectionState()
     {
+        StopInteractiveAutoScroll(InteractiveAutoScrollMode.MarqueeSelection);
         _selectionPointerPressed = false;
         _isBoxSelecting = false;
         _selectionSnapshot = [];
@@ -588,7 +631,46 @@ public sealed partial class FileSurfaceContent
             CanCompressSelection,
             CompressSelectionAsync,
             CreateItemShortcutAsync: CreateItemShortcutAsync,
-            EmptyRecycleBinAsync: EmptyRecycleBinAsync);
+            EmptyRecycleBinAsync: EmptyRecycleBinAsync,
+            AcquireMenuCloseRenameHandoff: AcquireMenuCloseRenameHandoff);
+    }
+
+    private IDisposable AcquireMenuCloseRenameHandoff()
+    {
+        _pendingMenuRenameHandoffDepth++;
+        if (IsStackPopoverInteractionActive)
+        {
+            _stackPopoverCleanupPending = false;
+        }
+
+        return new MenuCloseRenameHandoffScope(this);
+    }
+
+    private void ReleaseMenuCloseRenameHandoff()
+    {
+        if (_pendingMenuRenameHandoffDepth > 0)
+        {
+            _pendingMenuRenameHandoffDepth--;
+        }
+
+        if (_pendingMenuRenameHandoffDepth == 0 &&
+            !_stackPopoverContextMenuOpen &&
+            !_stackPopoverSystemContextMenuOpen &&
+            IsStackPopoverInteractionActive &&
+            _stackPopoverCleanupPending)
+        {
+            CompleteStackPopoverContextMenu();
+        }
+    }
+
+    private sealed class MenuCloseRenameHandoffScope(FileSurfaceContent owner) : IDisposable
+    {
+        private FileSurfaceContent? _owner = owner;
+
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref _owner, null)?.ReleaseMenuCloseRenameHandoff();
+        }
     }
 
     private OpenWithMenuPayload? GetOpenWithMenuItems(WidgetItem item)
@@ -640,15 +722,27 @@ public sealed partial class FileSurfaceContent
         };
         chooseApp.Click += (_, _) =>
         {
-            if (!ShellOpenWithHelper.ShowChooseAppDialog(
-                    _hostWindowHandle,
-                    item.Path))
+            UiDispatch.PostAfterCallback(async () =>
             {
-                ShowFeedback(new WidgetFeedbackRequest(
-                    T("Widget.Error.OperationIncomplete"),
-                    WidgetFeedbackSeverity.Warning,
-                    "open-with-choose"));
-            }
+                if (_isDisposed)
+                {
+                    return;
+                }
+
+                bool shown = await RunWithDialogOwnerAsync(
+                    item,
+                    ownerHwnd => ShellLaunchService.ShowChooseAppDialogAsync(
+                        ownerHwnd,
+                        item.Path,
+                        _lifetimeCancellation.Token));
+                if (!shown && !_isDisposed)
+                {
+                    ShowFeedback(new WidgetFeedbackRequest(
+                        T("Widget.Error.OperationIncomplete"),
+                        WidgetFeedbackSeverity.Warning,
+                        "open-with-choose"));
+                }
+            });
         };
         items.Add(chooseApp);
 
@@ -839,15 +933,27 @@ public sealed partial class FileSurfaceContent
             return;
         }
 
-        if (!ShellContextMenuHelper.ShowProperties(
-                _hostWindowHandle,
-                item.Path))
+        UiDispatch.PostAfterCallback(async () =>
         {
-            ShowFeedback(new WidgetFeedbackRequest(
-                T("Widget.Error.OperationIncomplete"),
-                WidgetFeedbackSeverity.Warning,
-                "file-properties"));
-        }
+            if (_isDisposed)
+            {
+                return;
+            }
+
+            bool shown = await RunWithDialogOwnerAsync(
+                item,
+                ownerHwnd => ShellLaunchService.ShowFilePropertiesAsync(
+                    ownerHwnd,
+                    item.Path,
+                    _lifetimeCancellation.Token));
+            if (!shown && !_isDisposed)
+            {
+                ShowFeedback(new WidgetFeedbackRequest(
+                    T("Widget.Error.OperationIncomplete"),
+                    WidgetFeedbackSeverity.Warning,
+                    "file-properties"));
+            }
+        });
     }
 
     /// <summary>
@@ -859,7 +965,8 @@ public sealed partial class FileSurfaceContent
     /// </summary>
     private async Task CreateItemShortcutAsync(WidgetItem item)
     {
-        if (TryBlockTransferMutation(new[] { item }))
+        if (TryBlockTransferMutation(new[] { item }) ||
+            TryBlockStoreVirtualizedDestination(Path.GetDirectoryName(item.Path)))
         {
             return;
         }
@@ -872,10 +979,20 @@ public sealed partial class FileSurfaceContent
                 return;
             }
 
+            bool isDirectory = Directory.Exists(item.Path);
             string linkPath = FileService.GetAvailablePath(
-                Path.Combine(directory, GetShortcutDisplayName(item.Path)));
+                Path.Combine(directory, GetShortcutDisplayName(item.Path, isDirectory)));
 
-            if (item.NamespaceShortcutKind != NamespaceShortcutKind.None &&
+            if (!isDirectory &&
+                ShortcutHelper.IsShortcutPath(item.Path) &&
+                File.Exists(item.Path))
+            {
+                DropStagingFileOps.CopyShortcutFilePreservingStreams(
+                    item.Path,
+                    linkPath);
+                ShortcutHelper.InvalidateStoredMetadataCache(linkPath);
+            }
+            else if (item.NamespaceShortcutKind != NamespaceShortcutKind.None &&
                 !string.IsNullOrWhiteSpace(item.NamespaceShortcutParsingName))
             {
                 ShortcutHelper.CreateShellNamespaceShortcut(
@@ -883,7 +1000,7 @@ public sealed partial class FileSurfaceContent
                     item.NamespaceShortcutParsingName,
                     T("Widget.CreateShortcut"));
             }
-            else if (Directory.Exists(item.Path))
+            else if (isDirectory)
             {
                 ShortcutHelper.CreateOrUpdateFolderShortcut(
                     linkPath,
@@ -918,20 +1035,28 @@ public sealed partial class FileSurfaceContent
     /// <summary>
     /// Empty Recycle Bin for the bin's namespace shortcut — the desktop
     /// icon's own verb, with the system's confirmation and progress dialogs
-    /// (flags 0). A bin emptied between the menu check and the click no-ops
-    /// instead of popping the dialog for nothing.
+    /// (flags 0) executed on the modal Shell STA pool rather than blocking
+    /// the UI thread. A bin emptied between the menu check and the click
+    /// no-ops instead of popping the dialog for nothing.
     /// </summary>
     private async Task EmptyRecycleBinAsync()
     {
         try
         {
-            if (ShellRecycleBinInterop.TryQueryTotalItemCount(out long totalItems) &&
-                totalItems == 0)
+            WidgetItem? binItem = GetSelectedItems().FirstOrDefault(
+                candidate => NamespaceShortcutHelper.ResolveKind(candidate) ==
+                    NamespaceShortcutKind.RecycleBin);
+            EmptyRecycleBinResult result = await RunWithDialogOwnerAsync(
+                binItem,
+                ownerHwnd => ShellLaunchService.EmptyRecycleBinAsync(
+                    ownerHwnd,
+                    _lifetimeCancellation.Token));
+            if (_isDisposed)
             {
                 return;
             }
 
-            if (!ShellRecycleBinInterop.TryEmptyAllBins(_hostWindowHandle))
+            if (result is EmptyRecycleBinResult.Failed or EmptyRecycleBinResult.Busy)
             {
                 ShowFeedback(new WidgetFeedbackRequest(
                     T("Widget.Error.OperationIncomplete"),
@@ -940,10 +1065,16 @@ public sealed partial class FileSurfaceContent
                 return;
             }
 
-            // The bin just emptied: its state-aware icon (empty vs. full
-            // graphic for the same PIDL) must re-render even though the
-            // shortcut file never changed.
-            await RefreshRecycleBinItemIconsAsync();
+            if (result is EmptyRecycleBinResult.Emptied or EmptyRecycleBinResult.AlreadyEmpty)
+            {
+                // The bin just emptied: its state-aware icon (empty vs. full
+                // graphic for the same PIDL) must re-render even though the
+                // shortcut file never changed.
+                await RefreshRecycleBinItemIconsAsync();
+            }
+        }
+        catch (OperationCanceledException)
+        {
         }
         catch (Exception ex)
         {
@@ -954,8 +1085,6 @@ public sealed partial class FileSurfaceContent
                 WidgetFeedbackSeverity.Warning,
                 "empty-recycle-bin"));
         }
-
-        await Task.CompletedTask;
     }
 
     /// <summary>
@@ -995,6 +1124,7 @@ public sealed partial class FileSurfaceContent
         bool fromStackPopover = _stackPopoverItemsView?.Items
             .OfType<WidgetItem>()
             .Any(candidate => ReferenceEquals(candidate, item)) == true;
+        _systemContextMenuInFlightDepth++;
         if (fromStackPopover)
         {
             // The WinUI flyout closes before the native proxy menu opens. Keep
@@ -1022,7 +1152,10 @@ public sealed partial class FileSurfaceContent
                 // The user picked the host-owned rename entry (a view-host
                 // verb the pure Shell menu cannot offer); run the built-in
                 // rename pipeline, the same one the WinUI flyout uses.
-                await RenameItemAsync(item);
+                using (AcquireMenuCloseRenameHandoff())
+                {
+                    await RenameItemAsync(item);
+                }
             }
             else if (result != ShellContextMenuProxy.MenuResult.Invoked &&
                 result != ShellContextMenuProxy.MenuResult.Cancelled)
@@ -1045,6 +1178,11 @@ public sealed partial class FileSurfaceContent
         }
         finally
         {
+            if (_systemContextMenuInFlightDepth > 0)
+            {
+                _systemContextMenuInFlightDepth--;
+            }
+
             _lastItemContextScreenPoint = null;
             if (fromStackPopover)
             {
@@ -1091,10 +1229,17 @@ public sealed partial class FileSurfaceContent
             return;
         }
 
-        ElevatedFileLaunchResult result =
-            ElevatedFileLauncher.RunAsAdministrator(
-            _hostWindowHandle,
-            item);
+        ElevatedFileLaunchResult result = await RunWithDialogOwnerAsync(
+            item,
+            ownerHwnd => ShellLaunchService.RunAsAdministratorAsync(
+                ownerHwnd,
+                item,
+                _lifetimeCancellation.Token));
+        if (_isDisposed)
+        {
+            return;
+        }
+
         switch (result.Status)
         {
             case ElevatedFileLaunchStatus.Launched:
@@ -1307,7 +1452,9 @@ public sealed partial class FileSurfaceContent
                         out string resolvedPath)
                     ? resolvedPath
                     : mappedFolderPath;
-                Win32Helper.OpenFile(pathToOpen);
+                ShellLaunchService.FireAndForgetOpenPath(
+                    pathToOpen,
+                    _hostWindowHandle);
             }
         };
         flyout.Items.Add(openFolder);
@@ -1451,7 +1598,8 @@ public sealed partial class FileSurfaceContent
     {
         string? folderPath = ViewModel.CurrentFolderPath;
         if (string.IsNullOrWhiteSpace(folderPath) ||
-            TryBlockTransferMutation(folderPath))
+            TryBlockTransferMutation(folderPath) ||
+            TryBlockStoreVirtualizedDestination(folderPath))
         {
             return;
         }
@@ -1475,7 +1623,7 @@ public sealed partial class FileSurfaceContent
             // Shortcut tab is where the user completes it (Explorer's own
             // New→Shortcut uses its in-process wizard for the same step).
             // Modal — the refresh below also picks up a rename made there.
-            _ = Win32Helper.ShowFileProperties(_hostWindowHandle, targetPath);
+            _ = await ShellLaunchService.ShowFilePropertiesAsync(_hostWindowHandle, targetPath);
             await ViewModel.RefreshFolderContentsAsync();
         });
     }
@@ -1485,7 +1633,8 @@ public sealed partial class FileSurfaceContent
     {
         string? folderPath = ViewModel.CurrentFolderPath;
         if (string.IsNullOrWhiteSpace(folderPath) ||
-            TryBlockTransferMutation(folderPath))
+            TryBlockTransferMutation(folderPath) ||
+            TryBlockStoreVirtualizedDestination(folderPath))
         {
             return;
         }
@@ -1508,13 +1657,10 @@ public sealed partial class FileSurfaceContent
             }
 
             await ViewModel.RefreshFolderContentsAsync();
-            if (ViewModel.Items.FirstOrDefault(item =>
-                    string.Equals(
-                        item.Path,
-                        createdPath,
-                        StringComparison.OrdinalIgnoreCase)) is { } newFile)
+            TryJoinCreatedPathIntoOpenManualStackPopover(createdPath);
+            if (FindCreatedItemForInlineRename(createdPath) is { } newFile)
             {
-                await StartItemRenameAsync(newFile);
+                await RenameItemAsync(newFile);
             }
         });
     }
@@ -1556,7 +1702,8 @@ public sealed partial class FileSurfaceContent
             return;
         }
 
-        if (TryBlockTransferMutation(ViewModel.CurrentFolderPath))
+        if (TryBlockTransferMutation(ViewModel.CurrentFolderPath) ||
+            TryBlockStoreVirtualizedDestination(ViewModel.CurrentFolderPath))
         {
             return;
         }
@@ -1569,15 +1716,48 @@ public sealed partial class FileSurfaceContent
                     T("Widget.NewFolderName")));
             Directory.CreateDirectory(folderPath);
             await ViewModel.RefreshFolderContentsAsync();
-            if (ViewModel.Items.FirstOrDefault(item =>
-                    string.Equals(
-                        item.Path,
-                        folderPath,
-                        StringComparison.OrdinalIgnoreCase)) is { } newFolder)
+            TryJoinCreatedPathIntoOpenManualStackPopover(folderPath);
+            if (FindCreatedItemForInlineRename(folderPath) is { } newFolder)
             {
-                await StartItemRenameAsync(newFolder);
+                await RenameItemAsync(newFolder);
             }
         });
+    }
+
+    private void TryJoinCreatedPathIntoOpenManualStackPopover(string createdPath)
+    {
+        if (!_stackPopoverPopupOpen ||
+            _stackPopoverKey is not { Length: > 0 } openStackKey ||
+            ViewModel.FindStackByKey(openStackKey) is not { IsManual: true })
+        {
+            return;
+        }
+
+        WidgetItem? createdItem = ViewModel.Items.FirstOrDefault(item =>
+            item is not WidgetStackItem &&
+            string.Equals(item.Path, createdPath, StringComparison.OrdinalIgnoreCase));
+        if (createdItem is null)
+        {
+            return;
+        }
+
+        ApplyStackProjectionChange(() =>
+            _ = ViewModel.AddItemsToStack(openStackKey, [createdItem]));
+    }
+
+    private WidgetItem? FindCreatedItemForInlineRename(string createdPath)
+    {
+        if (_stackPopoverPopupOpen &&
+            _stackPopoverItemsView is { } popoverView &&
+            popoverView.Items.OfType<WidgetItem>().FirstOrDefault(item =>
+                string.Equals(item.Path, createdPath, StringComparison.OrdinalIgnoreCase)) is { } popoverItem)
+        {
+            return popoverItem;
+        }
+
+        return ViewModel.Items.FirstOrDefault(item =>
+            item is not WidgetStackItem &&
+            string.Equals(item.Path, createdPath, StringComparison.OrdinalIgnoreCase));
     }
 
     private void AddSortItem(
@@ -1588,7 +1768,7 @@ public sealed partial class FileSurfaceContent
         var item = new ToggleMenuFlyoutItem
         {
             Text = T(localizationKey),
-            IsChecked = ViewModel.Config.SortMode == mode
+            IsChecked = ViewModel.EffectiveSortMode == mode
         };
         item.Click += (_, _) =>
         {
@@ -1892,11 +2072,43 @@ public sealed partial class FileSurfaceContent
         toggle.Click += (_, _) => ToggleStackFromInput(stack);
         flyout.Items.Add(toggle);
 
+        bool startStackRenameWhenClosed = false;
+        IDisposable? stackRenameHandoff = null;
         MenuFlyoutItem rename = CreateMenuItem(
             "Widget.Stack.Rename",
             "\uE8AC");
-        rename.Click += async (_, _) =>
-            await RenameStackAsync(stack);
+        rename.Click += (_, _) =>
+        {
+            startStackRenameWhenClosed = true;
+            stackRenameHandoff ??= AcquireMenuCloseRenameHandoff();
+        };
+        flyout.Closed += (_, _) =>
+        {
+            if (!startStackRenameWhenClosed)
+            {
+                stackRenameHandoff?.Dispose();
+                stackRenameHandoff = null;
+                return;
+            }
+
+            startStackRenameWhenClosed = false;
+            IDisposable? heldHandoff = stackRenameHandoff;
+            stackRenameHandoff = null;
+            if (!DispatcherQueue.TryEnqueue(async () =>
+                {
+                    try
+                    {
+                        await RenameStackAsync(stack);
+                    }
+                    finally
+                    {
+                        heldHandoff?.Dispose();
+                    }
+                }))
+            {
+                heldHandoff?.Dispose();
+            }
+        };
         flyout.Items.Add(rename);
         flyout.Items.Add(new MenuFlyoutSeparator());
 

@@ -170,6 +170,200 @@ public sealed class ForkOneClickOrganizeTests
     }
 
     [Fact]
+    public void MappedPreviewProjection_ManualExclusionSurvivesAutoAssignment()
+    {
+        DesktopOrganizationFileSnapshot excluded = Item("a.png", DesktopOrganizationCategoryIds.Images);
+        DesktopOrganizationFileSnapshot selected = Item("b.png", DesktopOrganizationCategoryIds.Images);
+        var plan = new DesktopOrganizationPlan
+        {
+            IncludePersonalDesktop = true,
+            SourceItems = [excluded, selected],
+            Targets =
+            [
+                new DesktopOrganizationTargetPlan
+                {
+                    SourceBucketId = "images",
+                    CategoryId = DesktopOrganizationCategoryIds.Images,
+                    SuggestedDisplayName = "Pictures",
+                    TargetWidgetId = "images",
+                    Items = [excluded, selected]
+                }
+            ]
+        };
+        var session = new DesktopOrganizationWorkbenchSession(
+            (basePlan, _) => basePlan,
+            () => new Dictionary<string, WidgetConfig>(StringComparer.Ordinal));
+        session.SetInitialPlan(plan);
+        session.ExcludeItems([excluded.SourcePath]);
+
+        MappedOrganizePreviewProjection projection = ForkOneClickOrganizePolicy.BuildMappedPreviewProjection(
+            session.EffectivePlan!,
+            session.TargetSelections,
+            session.ExcludedSourcePaths,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            Name);
+
+        Assert.Equal(new[] { selected.SourcePath }, Assert.Single(projection.Groups).Paths);
+        Assert.Equal(new[] { excluded.SourcePath }, projection.KeepOnDesktop);
+
+        // Mirror ApplyGroupsAsync: assign confirmed group paths, persist explicit
+        // keep paths, then let automatic routing inspect what remains unassigned.
+        var mapped = Mapped("mapped-images", "Pictures", DesktopOrganizationCategoryIds.Images);
+        var widgets = new List<WidgetConfig> { mapped };
+        MappedOrganizeMembership.Assign(widgets, mapped.Id, projection.Groups.SelectMany(group => group.Paths));
+        var kept = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        MappedOrganizeKeepList.Keep(kept, projection.KeepOnDesktop);
+        IReadOnlyList<string> autoAssigned = MappedOrganizeKeepList.FilterUnassigned(
+            MappedOrganizeMembership.FindUnassigned(widgets, [excluded.SourcePath, selected.SourcePath]),
+            kept);
+
+        Assert.Empty(autoAssigned);
+    }
+
+    [Fact]
+    public void MappedPreviewProjection_OptedInKeptFolderMapsUnlessUserReturnsItToTray()
+    {
+        DesktopOrganizationFileSnapshot folder = Item("KeptFolder", DesktopOrganizationCategoryIds.Other,
+            DesktopOrganizationExclusionReason.Folder, isDirectory: true);
+        DesktopOrganizationFileSnapshot included = folder with { ExclusionReason = DesktopOrganizationExclusionReason.None };
+        var plan = new DesktopOrganizationPlan
+        {
+            IncludePersonalDesktop = true,
+            SourceItems = [folder],
+            Targets =
+            [
+                new DesktopOrganizationTargetPlan
+                {
+                    SourceBucketId = "other",
+                    CategoryId = DesktopOrganizationCategoryIds.Other,
+                    SuggestedDisplayName = "Other",
+                    Items = [included]
+                }
+            ]
+        };
+
+        MappedOrganizePreviewProjection includedProjection = ForkOneClickOrganizePolicy.BuildMappedPreviewProjection(
+            plan,
+            new Dictionary<string, DesktopOrganizationTargetSelection>(),
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            new HashSet<string>([folder.SourcePath], StringComparer.OrdinalIgnoreCase),
+            Name);
+        Assert.Equal(new[] { folder.SourcePath }, Assert.Single(includedProjection.Groups).Paths);
+        Assert.Empty(includedProjection.KeepOnDesktop);
+
+        var returnedToTray = new DesktopOrganizationPlan
+        {
+            IncludePersonalDesktop = true,
+            SourceItems = [folder],
+            ExcludedItems = [folder],
+            Targets = []
+        };
+        MappedOrganizePreviewProjection returnedProjection = ForkOneClickOrganizePolicy.BuildMappedPreviewProjection(
+            returnedToTray,
+            new Dictionary<string, DesktopOrganizationTargetSelection>(),
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            new HashSet<string>([folder.SourcePath], StringComparer.OrdinalIgnoreCase),
+            Name);
+        Assert.Empty(returnedProjection.Groups);
+        Assert.Equal(new[] { folder.SourcePath }, returnedProjection.KeepOnDesktop);
+    }
+
+    [Fact]
+    public void MappedPreviewProjection_SkipsOutOfScopePathsWithoutPersistingThemAsKept()
+    {
+        DesktopOrganizationFileSnapshot personal = Item("personal.png", DesktopOrganizationCategoryIds.Images);
+        DesktopOrganizationFileSnapshot shared = Item("shared.png", DesktopOrganizationCategoryIds.Images) with
+        {
+            SourceScope = DesktopOrganizationSourceScope.Public
+        };
+        var plan = new DesktopOrganizationPlan
+        {
+            IncludePersonalDesktop = true,
+            IncludePublicDesktop = false,
+            SourceItems = [personal, shared],
+            Targets =
+            [
+                new DesktopOrganizationTargetPlan
+                {
+                    SourceBucketId = "images",
+                    CategoryId = DesktopOrganizationCategoryIds.Images,
+                    SuggestedDisplayName = "Pictures",
+                    Items = [personal, shared]
+                }
+            ]
+        };
+
+        MappedOrganizePreviewProjection projection = ForkOneClickOrganizePolicy.BuildMappedPreviewProjection(
+            plan,
+            new Dictionary<string, DesktopOrganizationTargetSelection>(),
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            Name);
+
+        Assert.Equal(new[] { personal.SourcePath }, Assert.Single(projection.Groups).Paths);
+        Assert.Empty(projection.KeepOnDesktop);
+        Assert.Equal(new[] { shared.SourcePath }, projection.SkipAutoAssignPaths);
+    }
+
+    [Fact]
+    public void MappedPreviewProjection_PreservesCustomBoxIdentityAndEditedNames()
+    {
+        DesktopOrganizationFileSnapshot work = Item("work.txt", DesktopOrganizationCategoryIds.Documents);
+        DesktopOrganizationFileSnapshot personal = Item("personal.txt", DesktopOrganizationCategoryIds.Documents);
+        var plan = new DesktopOrganizationPlan
+        {
+            IncludePersonalDesktop = true,
+            SourceItems = [work, personal],
+            Targets =
+            [
+                new DesktopOrganizationTargetPlan
+                {
+                    SourceBucketId = "custom-work",
+                    CategoryId = string.Empty,
+                    TargetWidgetId = "custom-work",
+                    SuggestedDisplayName = "Work renamed",
+                    Items = [work]
+                },
+                new DesktopOrganizationTargetPlan
+                {
+                    SourceBucketId = "custom-personal",
+                    CategoryId = string.Empty,
+                    TargetWidgetId = "custom-personal",
+                    SuggestedDisplayName = "Personal renamed",
+                    Items = [personal]
+                }
+            ]
+        };
+
+        IReadOnlyList<MappedOrganizeGroup> groups = ForkOneClickOrganizePolicy.BuildMappedPreviewProjection(
+            plan,
+            new Dictionary<string, DesktopOrganizationTargetSelection>(),
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            Name).Groups;
+
+        Assert.Equal(2, groups.Count);
+        Assert.Equal("custom:custom-work", groups[0].CategoryId);
+        Assert.Equal("Work renamed", groups[0].DisplayName);
+        Assert.Equal(new[] { work.SourcePath }, groups[0].Paths);
+        Assert.Equal("custom:custom-personal", groups[1].CategoryId);
+        Assert.Equal("Personal renamed", groups[1].DisplayName);
+        Assert.Equal(new[] { personal.SourcePath }, groups[1].Paths);
+    }
+
+    [Fact]
+    public void FindMappedTarget_CustomBucketsKeepIdentityEvenWithEqualTitles()
+    {
+        WidgetConfig first = Mapped("first", "Work", "custom:first");
+        WidgetConfig second = Mapped("second", "Work", "custom:second");
+        WidgetConfig legacy = Mapped("legacy", "Work", "Custom");
+        Assert.Same(second, ForkOneClickOrganizePolicy.FindMappedTarget([first, second], "custom:second", "Work"));
+        Assert.Null(ForkOneClickOrganizePolicy.FindMappedTarget([first], "custom:second", "Work"));
+        Assert.Null(ForkOneClickOrganizePolicy.FindMappedTarget([first], DesktopOrganizationCategoryIds.Other, "Work"));
+        Assert.Same(legacy, ForkOneClickOrganizePolicy.FindMappedTarget([first, legacy], DesktopOrganizationCategoryIds.Other, "Work"));
+    }
+
+    [Fact]
     public void SelectOptIns_TakesFoldersLargeFilesAndOverflowOnly()
     {
         IReadOnlyList<string> optIns = ForkOneClickOrganizePolicy.SelectOptIns(
@@ -190,7 +384,8 @@ public sealed class ForkOneClickOrganizeTests
     {
         string tray = File.ReadAllText(TestPaths.FromRepository("src/DeskBox/App.Tray.cs"));
         Assert.Contains("OrganizeDesktopOneClick();", tray, StringComparison.Ordinal);
-        Assert.Contains("CreateForkOrganizePreviewTrayItem(contextMenu)", tray, StringComparison.Ordinal);
+        Assert.Contains("TrayCommandOrganizePreview", tray, StringComparison.Ordinal);
+        Assert.Contains("OpenDesktopOrganizationPreview()", tray, StringComparison.Ordinal);
 
         string settingsActions = File.ReadAllText(TestPaths.FromRepository("src/DeskBox/Services/InProcessSettingsAppActions.cs"));
         Assert.Contains("_app.OrganizeDesktopOneClick(", settingsActions, StringComparison.Ordinal);
@@ -206,7 +401,43 @@ public sealed class ForkOneClickOrganizeTests
         string planner = File.ReadAllText(TestPaths.FromRepository("src/DeskBox/Services/DesktopOrganizationPlanner.cs"));
         Assert.Contains("DesktopOrganizationCategoryReuse.FindExistingWidget(", planner, StringComparison.Ordinal);
 
+        string mappedPreview = File.ReadAllText(TestPaths.FromRepository("src/DeskBox/Controls/DesktopOrganizationTaskView.MappedOrganize.cs"));
+        Assert.Contains("BuildMappedPreviewProjection(", mappedPreview, StringComparison.Ordinal);
+        Assert.Contains("DeferredDesktopOrganizationClosePolicy.CompleteIfRequested(", mappedPreview, StringComparison.Ordinal);
+
         Assert.Equal("一键整理桌面", ForkOrganizeModeText.Get(LocalizationService.LanguageChinese, ForkOrganizeModeText.Key.MenuReorganizeDesktop));
         Assert.Equal("整理预览…", ForkOrganizeModeText.Get(LocalizationService.LanguageChinese, ForkOrganizeModeText.Key.MenuOrganizePreview));
+    }
+
+    [Fact]
+    public async Task DeferredMappedClose_WaitsForInFlightOperationAndConsumesRequestOnce()
+    {
+        var releaseOperation = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        bool closePending = false;
+        int closeCount = 0;
+
+        Task execution = CompleteMappedExecutionAsync();
+        closePending = true;
+        Assert.Equal(0, closeCount);
+
+        releaseOperation.SetResult(true);
+        await execution;
+
+        Assert.Equal(1, closeCount);
+        Assert.False(closePending);
+        DeferredDesktopOrganizationClosePolicy.CompleteIfRequested(ref closePending, () => closeCount++);
+        Assert.Equal(1, closeCount);
+
+        async Task CompleteMappedExecutionAsync()
+        {
+            try
+            {
+                await releaseOperation.Task;
+            }
+            finally
+            {
+                DeferredDesktopOrganizationClosePolicy.CompleteIfRequested(ref closePending, () => closeCount++);
+            }
+        }
     }
 }
