@@ -1,6 +1,6 @@
 # 映射整理 (mapped / virtual desktop organize) — fork feature
 
-Fork-only feature (GOXF/DeskBox `custom`). Like 360桌面助手 / WPS 桌面整理:
+Fork-only feature (GOXF/DeskBox). Like 360桌面助手 / WPS 桌面整理:
 desktop items are grouped into widgets **without moving any file**.
 
 ## Model
@@ -57,73 +57,57 @@ Ordinary organization never targets mapped widgets: they are filtered out in
   every hidden desktop item. Startup: installs that already have mapped widgets
   but no mode file adopt 「只映射」.
 
-## Desktop visibility: per item (replaces hiding the whole list view)
+## Desktop visibility: a filtered Shell surface
 
-* Only mapped entries are hidden, by setting `FILE_ATTRIBUTE_HIDDEN`.
-  Unmapped and 「放回桌面」 entries stay visible as normal desktop icons.
-* Ledger `data/mapped-organize.hidden` lists every path DeskBox hid; it is
-  written *before* an attribute is set. Files that were already hidden are
-  never recorded and never touched. Pure rules: `MappedOrganizeHiddenLedger`.
-* Restore (`Reconcile` with nothing desired / member removed): entry leaves its
-  widget, 「放回桌面」, 「退出映射整理」, switching to move mode, DeskBox exit
-  (shutdown step + ProcessExit), next start after a crash (members re-hidden,
-  stale records restored), and the uninstaller
-  (`installer/DeskBox.ForkMappedOrganize.iss`, after the process is stopped).
-* `MappedOrganizeHiddenRegistry` lets the widget folder loader
-  (`FileService`: snapshot filter, `ClassifyExistingEntry`, `ShouldDisplayEntry`)
-  keep listing DeskBox-hidden members; it is seeded lazily from the ledger.
-* The legacy `desktopIconsHiddenByDeskBox` marker (whole list view hidden by
-  older builds) is repaired once at startup.
-* Settings warns when Explorer shows hidden items (HKCU …\Explorer\Advanced
-  `Hidden`=1): mapped entries then still appear as faded icons.
+Mapped entries are excluded only from a DeskBox-owned Windows Shell view.
+Their real file attributes are not changed, so Explorer, file pickers, uploads,
+copies and moves continue to see the original desktop files normally.
 
-### Restore before every exit (fix/mapped-hidden-restore)
+* `MappedDesktopShellView` hosts the real Desktop namespace in an
+  `IExplorerBrowser`. `IFolderFilterSite` / `IFolderFilter` exclude mapped
+  absolute paths only from this view. Public Desktop and virtual Shell items
+  remain part of the namespace; no duplicate files or shortcut copies exist.
+* `MappedDesktopSurfaceController` creates a transparent, desktop-parented
+  host across the native desktop client area. Unmapped and 「放回桌面」 items
+  remain in the filtered view, using Windows' own file interaction surface.
+  Monitor work areas exclude taskbars. Existing icon positions are transferred
+  through `IFolderView`, also when putting an item back at the drop point.
+* Only after the new view is ready and its separate crash guardian acknowledges
+  readiness is Explorer's original icon list hidden with `ShowWindow`.
+  No Explorer registry setting is toggled. A creation/guardian failure leaves
+  the native desktop visible rather than stranding the user without icons.
+* A periodic UI-thread check reattaches after Explorer recreates its windows
+  and resizes for display changes. Only the exact owned host is treated as a
+  desktop drag target; ordinary DeskBox widgets and folder windows are not.
+* Normal exit, removing the final mapped widget, or switching back to moving
+  restores the original native icon list before closing the projection.
+  `DeskBox.Updater --desktop-surface-guardian` retains the owner process handle
+  and validates the exact Shell PID/HWND before restoring icons after a hard
+  kill. The guardian neither installs updates nor relaunches the app.
 
-Goal: whenever DeskBox is not running, no desktop entry stays hidden by it.
-`RestoreIconsForExit(reason, sessionEnd)` is synchronous and idempotent
-(`MappedOrganizeExitGate`); log line `[MappedOrganize] Restored desktop items for <reason>`.
+### Compatibility with older attribute-hiding builds
 
-| Exit path | What runs |
-| --- | --- |
-| Tray exit, 重启, in-app update (`ShutdownForUpdate/RestartAsync`), dev「更新并重启」 | first line of `ShutdownApplicationAsync` (before any bounded teardown step can time out), again in the shutdown step |
-| Windows shutdown / restart / sign-out, installer Restart Manager | `WM_QUERYENDSESSION` / `WM_ENDSESSION` on the tray window → `FlushSettingsForEndSession` → restore; a cancelled session end (`WM_ENDSESSION` FALSE) re-hides (`ForkSessionEndSignal`) |
-| `Environment.Exit` / fatal startup | `ProcessExit` |
-| Crash on a background thread | `AppDomain.UnhandledException` (terminating) — best effort |
-| Hard kill (Task Manager, `Stop-Process -Force`) | cannot run; `fork-dev-update.ps1` restores from the ledger after its own force-kill; next start: `MappedOrganizeStartupRecovery` (startup step `mapped-organize-recovery`, before widget restore) shows every ledger entry, logs it, then the service hides the members again; uninstaller as before |
+The legacy `data/mapped-organize.hidden` ownership ledger is still read.
+Startup recovery and visibility reconciliation clear **only** attributes that
+DeskBox previously recorded as its own. User-hidden files never enter that
+ledger and retain their original attributes. Failed restores stay recorded for
+retry. The old leak guard and uninstaller recovery remain available for these
+legacy entries, but no new mapped entry is marked hidden.
 
-The desktop organizer (`DesktopOrganizationScanner`) reads attributes through
-`MappedOrganizeHiddenRegistry.EffectiveAttributes`, so a ledger entry is a
-normal item, never 「本次无法整理」. Older builds (no ledger support) cannot do
-this — they are why the post-restart desktop showed 0 items.
+Explorer's 「显示隐藏的项目」 setting no longer controls mapped visibility, so
+its previous warning is no longer shown. Tests of the old ledger planner remain
+as compatibility coverage, not as the new runtime hiding mechanism.
 
-### Hidden attribute never leaves the desktop
+### WPS as a product reference, not an implementation claim
 
-When an entry is hidden its NTFS id (volume serial + file index) is captured.
-A ledger entry the desktop watcher reports as deleted is opened by id
-(`ForkFileIdentityNative`, `OpenFileById` + `GetFinalPathNameByHandle`): if it
-now lives outside the desktop (another folder, cut/paste, dragged out of a
-mapped widget, Recycle Bin) its hidden attribute is cleared there and it leaves
-the ledger (`MappedOrganizeLeakPolicy`). Not covered: a *copy* of a hidden
-entry (copies keep attributes) and a move to another volume (copy + delete).
+[WPS' public introduction](https://bbs.wps.cn/topic/214) demonstrates category
+boxes, new-file collection and custom groups. It does not document its internal
+Windows hiding implementation. DeskBox follows the user-visible separation of
+organization and desktop presentation without copying proprietary code or
+claiming that WPS uses these exact APIs.
 
-### Research: hiding icons without file attributes
-
-* 360 桌面助手 / Fences: keep the desktop SysListView32 but position icons
-  under their own fence windows (Fences moves icon positions via
-  LVM_SETITEMPOSITION and draws its own frame; "quick-hide" hides the whole
-  list view). WPS 桌面整理 hides the whole icon layer (SysListView32
-  ShowWindow / Explorer "show desktop icons") and draws every item, mapped or
-  not, in its own windows. None of them touch file attributes.
-* This codebase already has the whole-layer approach: `DesktopIconVisibilityService`
-  (SW_HIDE of the desktop SysListView32, not persisted by Explorer) behind the
-  legacy `desktopIconsHiddenByDeskBox` marker, from the first mapped build.
-  A "hide icon layer + show unmapped items in a DeskBox desktop surface" mode
-  is feasible: needs a full-screen-per-monitor desktop-layer widget that lists
-  unmapped desktop items with free positioning (or a grid), Explorer-restart
-  re-apply (periodic check exists), desktop drop target / context menu / rename
-  / keyboard parity, and blank-area double-click behaviour. Rough effort: 5–8
-  focused dev days for a usable version, more for full Explorer parity
-  (icon positions, multi-monitor layouts, F2/Del/Ctrl+A on the desktop).
+The native hosting/filtering API is documented in
+[Microsoft's IExplorerBrowser reference](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-iexplorerbrowser).
 
 ## 「放回桌面」
 
@@ -278,16 +262,16 @@ topology profiles and wake recovery apply unchanged.
   until 「一键整理」.
 * The tray item keeps the upstream text 「整理桌面…」 (upstream string; its
   ellipsis is now slightly misleading).
-* Public Desktop entries need admin rights to change attributes; when that
-  fails they stay visible on the desktop as well as in the widget.
-* Hidden entries are also hidden in File Explorer's Desktop folder view.
+* User-enabled virtual desktop icons are captured when the projection is
+  created. Changing those Windows preferences takes effect when the view is
+  recreated; live registry preference editing is not yet mirrored.
 * Preview "use existing widget" destination choices are ignored in mapped mode
   (grouping is per category).
 * The auto/manual switch for mapped widgets stays in the mapped widget's
   blank-area menu.
-* Copying a mapped item to another folder, or moving it to another volume,
-  keeps the Hidden attribute on the copy (moves on the same volume are fixed,
-  see 「Hidden attribute never leaves the desktop」).
+* Older builds could leak Hidden attributes when copying mapped files. This
+  version creates no new hidden entries; legacy restoration covers only paths
+  recorded in its ownership ledger, not unknown historical copies.
 * 拖到桌面 = 放回桌面: a drop onto another desktop icon is not treated as
   put-back (one whose label equals a dragged entry's name is); icon
   placement needs 自动排列图标 off (网格对齐 still snaps it). Touch / pen

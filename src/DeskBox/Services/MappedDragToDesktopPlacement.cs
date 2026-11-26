@@ -16,6 +16,11 @@ internal static class MappedDragToDesktopPlacement
 
     internal static void PlaceInBackground(IReadOnlyList<string> paths, MappedDesktopDropPoint drop)
     {
+        if (MappedDesktopSurfaceController.TryPlaceOnSurface(paths, drop))
+        {
+            return;
+        }
+
         if (paths.Count == 0 || drop.ListView == IntPtr.Zero)
         {
             return;

@@ -101,7 +101,8 @@ internal static class MappedDragToDesktopTarget
         uint currentProcess = (uint)Environment.ProcessId;
         Win32Helper.GetWindowThreadProcessId(hit, out uint hitProcess);
         Win32Helper.GetWindowThreadProcessId(root == IntPtr.Zero ? hit : root, out uint rootProcess);
-        bool ownedByDeskBox = hitProcess == currentProcess || rootProcess == currentProcess;
+        bool ownedByDeskBox = (hitProcess == currentProcess || rootProcess == currentProcess) &&
+                              !MappedDesktopSurfaceController.OwnsWindow(hit);
 
         // Same identity rule as the upstream desktop probes: compare with the
         // shell window's process, and keep the class verdict while Explorer is

@@ -52,6 +52,12 @@ internal static class Program
 
     private static int Main(string[] args)
     {
+        if (args.Length > 0 &&
+            string.Equals(args[0], DesktopSurfaceGuardian.Command, StringComparison.Ordinal))
+        {
+            return DesktopSurfaceGuardian.Run(args);
+        }
+
         UpdateOptions? options = null;
         try
         {

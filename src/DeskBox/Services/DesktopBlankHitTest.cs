@@ -66,7 +66,7 @@ internal static partial class DesktopBlankHitTest
         }
 
         return listView != IntPtr.Zero &&
-               IsShellDesktopListView(listView) &&
+               (IsShellDesktopListView(listView) || MappedDesktopSurfaceController.OwnsWindow(listView)) &&
                IsBlankListViewPoint(listView, screenPoint);
     }
 

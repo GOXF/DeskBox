@@ -10,11 +10,12 @@ namespace DeskBox.Platform;
 /// positioning desktop items. Vtable slots are called through unmanaged
 /// function pointers (no RCW, NativeAOT-safe); slot numbers follow
 /// shobjidl_core.h / exdisp.h / servprov.h and count IUnknown as 0-2.
-/// Must run on an STA thread. Every call is best effort.
+/// Must run on an STA thread. Position writes are best effort; snapshots
+/// reject incomplete views so the controller can leave Explorer visible.
 /// </summary>
 internal static unsafe partial class DesktopIconPlacementNativeMethods
 {
-    internal readonly record struct ViewInfo(int SpacingX, int SpacingY, bool AutoArrange);
+    internal readonly record struct ViewInfo(int SpacingX, int SpacingY, bool AutoArrange, int IconSize = 0);
 
     private const uint ClsctxInprocServer = 0x1;
     private const uint ClsctxLocalServer = 0x4;
@@ -25,6 +26,7 @@ internal static unsafe partial class DesktopIconPlacementNativeMethods
     private const uint SvgioAllView = 2;
     private const uint ShgdnForParsing = 0x8000;
     private const uint SvsiPositionItem = 0x80;
+    private const uint SvsiNoTakeFocus = 0x40000000;
     private const int ShcneUpdateItem = 0x2000;
     private const uint ShcnfPathW = 0x0005;
 
@@ -62,6 +64,7 @@ internal static unsafe partial class DesktopIconPlacementNativeMethods
     private static readonly Guid SidTopLevelBrowser = new("4C96BE40-915C-11CF-99D3-00AA004AE837");
     private static readonly Guid IidShellBrowser = new("000214E2-0000-0000-C000-000000000046");
     private static readonly Guid IidFolderView = new("CDE725B0-CCC9-4519-917E-325D72FAB4CE");
+    private static readonly Guid IidFolderView2 = new("1AF3A467-214F-4298-908E-06B03E0B39F9");
     private static readonly Guid IidShellFolder = new("000214E6-0000-0000-C000-000000000046");
 
     [LibraryImport("ole32.dll")]
@@ -93,10 +96,10 @@ internal static unsafe partial class DesktopIconPlacementNativeMethods
     }
 
     /// <summary>Reads the desktop view's icon spacing and auto-arrange state.</summary>
-    internal static bool TryGetViewInfo(out ViewInfo info)
+    internal static bool TryGetViewInfo(out ViewInfo info, IntPtr suppliedView = default)
     {
         info = default;
-        IntPtr view = AcquireDesktopFolderView();
+        IntPtr view = AcquireView(suppliedView);
         if (view == IntPtr.Zero)
         {
             return false;
@@ -107,11 +110,69 @@ internal static unsafe partial class DesktopIconPlacementNativeMethods
             Win32Helper.POINT spacing = default;
             int hr = ((delegate* unmanaged[Stdcall]<IntPtr, Win32Helper.POINT*, int>)Slot(view, FolderViewGetSpacingSlot))(view, &spacing);
             int autoArrange = ((delegate* unmanaged[Stdcall]<IntPtr, int>)Slot(view, FolderViewGetAutoArrangeSlot))(view);
-            info = new ViewInfo(hr >= 0 ? spacing.X : 0, hr >= 0 ? spacing.Y : 0, autoArrange == 0);
+            if (hr < 0 || autoArrange < 0)
+            {
+                return false;
+            }
+            int iconSize = 0;
+            Guid iid = IidFolderView2;
+            if (ComVtable.QueryInterface(view, ref iid, out IntPtr view2) >= 0 && view2 != IntPtr.Zero)
+            {
+                try
+                {
+                    uint mode = 0;
+                    if (((delegate* unmanaged[Stdcall]<IntPtr, uint*, int*, int>)Slot(view2, 36))(view2, &mode, &iconSize) < 0)
+                    {
+                        return false;
+                    }
+                }
+                finally
+                {
+                    Marshal.Release(view2);
+                }
+            }
+            else
+            {
+                return false;
+            }
+
+            info = new ViewInfo(hr >= 0 ? spacing.X : 0, hr >= 0 ? spacing.Y : 0, autoArrange == 0, iconSize);
             return true;
         }
         finally
         {
+            Marshal.Release(view);
+        }
+    }
+
+    internal static bool TryApplyViewInfo(ViewInfo info, IntPtr suppliedView = default)
+    {
+        IntPtr view = AcquireView(suppliedView);
+        if (view == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        IntPtr view2 = IntPtr.Zero;
+        try
+        {
+            Guid iid = IidFolderView2;
+            if (ComVtable.QueryInterface(view, ref iid, out view2) < 0 || view2 == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            return (info.IconSize <= 0 ||
+                    ((delegate* unmanaged[Stdcall]<IntPtr, uint, int, int>)Slot(view2, 35))(view2, 1, info.IconSize) >= 0) &&
+                   ((delegate* unmanaged[Stdcall]<IntPtr, uint, uint, int>)Slot(view2, 24))(view2, 1, info.AutoArrange ? 1u : 0u) >= 0;
+        }
+        finally
+        {
+            if (view2 != IntPtr.Zero)
+            {
+                Marshal.Release(view2);
+            }
+
             Marshal.Release(view);
         }
     }
@@ -121,14 +182,14 @@ internal static unsafe partial class DesktopIconPlacementNativeMethods
     /// at the matching client-coordinate origins. Returns how many items were
     /// found in the view and positioned (0 when the view is not ready yet).
     /// </summary>
-    internal static int TryPositionItems(IReadOnlyList<string> paths, IReadOnlyList<(int X, int Y)> origins)
+    internal static int TryPositionItems(IReadOnlyList<string> paths, IReadOnlyList<(int X, int Y)> origins, IntPtr suppliedView = default)
     {
         if (paths.Count == 0 || paths.Count != origins.Count)
         {
             return 0;
         }
 
-        IntPtr view = AcquireDesktopFolderView();
+        IntPtr view = AcquireView(suppliedView);
         if (view == IntPtr.Zero)
         {
             return 0;
@@ -208,7 +269,7 @@ internal static unsafe partial class DesktopIconPlacementNativeMethods
             fixed (Win32Helper.POINT* pointArray = foundPoints)
             {
                 hr = ((delegate* unmanaged[Stdcall]<IntPtr, uint, IntPtr*, Win32Helper.POINT*, uint, int>)Slot(view, FolderViewSelectAndPositionItemsSlot))(
-                    view, (uint)found, pidlArray, pointArray, SvsiPositionItem);
+                    view, (uint)found, pidlArray, pointArray, SvsiPositionItem | SvsiNoTakeFocus);
             }
 
             return hr >= 0 ? found : 0;
@@ -240,6 +301,83 @@ internal static unsafe partial class DesktopIconPlacementNativeMethods
 
             Marshal.Release(view);
         }
+    }
+
+    /// <summary>Captures view-local icon positions, including virtual desktop entries.</summary>
+    internal static Dictionary<string, (int X, int Y)> CapturePositions(IntPtr suppliedView = default)
+    {
+        var positions = new Dictionary<string, (int X, int Y)>(StringComparer.OrdinalIgnoreCase);
+        IntPtr view = AcquireView(suppliedView);
+        if (view == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("Desktop folder view is not ready for a complete position snapshot.");
+        }
+
+        IntPtr folder = IntPtr.Zero;
+        IntPtr strRet = Marshal.AllocHGlobal(StrRetSize);
+        IntPtr buffer = Marshal.AllocHGlobal(PathBufferChars * sizeof(char));
+        try
+        {
+            Guid iidFolder = IidShellFolder;
+            int count = 0;
+            if (((delegate* unmanaged[Stdcall]<IntPtr, Guid*, IntPtr*, int>)Slot(view, FolderViewGetFolderSlot))(view, &iidFolder, &folder) < 0 ||
+                folder == IntPtr.Zero ||
+                ((delegate* unmanaged[Stdcall]<IntPtr, uint, int*, int>)Slot(view, FolderViewItemCountSlot))(view, SvgioAllView, &count) < 0)
+            {
+                throw new InvalidOperationException("Could not enumerate the desktop position snapshot.");
+            }
+
+            for (int index = 0; index < count; index++)
+            {
+                IntPtr pidl = IntPtr.Zero;
+                if (((delegate* unmanaged[Stdcall]<IntPtr, int, IntPtr*, int>)Slot(view, FolderViewItemSlot))(view, index, &pidl) < 0 || pidl == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException("Desktop enumeration changed while capturing positions.");
+                }
+
+                try
+                {
+                    Win32Helper.POINT point = default;
+                    if (((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, Win32Helper.POINT*, int>)Slot(view, 11))(view, pidl, &point) >= 0 &&
+                        GetParsingName(folder, pidl, strRet, buffer) is { } name)
+                    {
+                        positions[Normalize(name)] = (point.X, point.Y);
+                    }
+                    else
+                    {
+                        throw new InvalidOperationException("A desktop item position or parsing name is not ready.");
+                    }
+                }
+                finally
+                {
+                    CoTaskMemFree(pidl);
+                }
+            }
+
+            return positions;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(strRet);
+            Marshal.FreeHGlobal(buffer);
+            if (folder != IntPtr.Zero)
+            {
+                Marshal.Release(folder);
+            }
+
+            Marshal.Release(view);
+        }
+    }
+
+    private static IntPtr AcquireView(IntPtr suppliedView)
+    {
+        if (suppliedView == IntPtr.Zero)
+        {
+            return AcquireDesktopFolderView();
+        }
+
+        Marshal.AddRef(suppliedView);
+        return suppliedView;
     }
 
     private static string? GetParsingName(IntPtr folder, IntPtr pidl, IntPtr strRet, IntPtr buffer)
@@ -335,6 +473,11 @@ internal static unsafe partial class DesktopIconPlacementNativeMethods
 
     private static string Normalize(string path)
     {
+        if (path.StartsWith("::", StringComparison.Ordinal) || path.StartsWith("shell:", StringComparison.OrdinalIgnoreCase))
+        {
+            return path;
+        }
+
         try
         {
             return Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));

@@ -59,7 +59,7 @@ public sealed partial class MappedOrganizeService
                     case MappedOrganizeLeakPolicy.Outcome.StillOnDesktop:
                         return;
                     case MappedOrganizeLeakPolicy.Outcome.LeftDesktop:
-                        bool shown = TrySetHidden(resolved!, hidden: false);
+                        bool shown = TryRestoreHidden(resolved!);
                         App.Log($"[MappedOrganize] Hidden entry left the desktop: '{key}' -> '{resolved}', attribute cleared={shown}.");
                         break;
                     default:

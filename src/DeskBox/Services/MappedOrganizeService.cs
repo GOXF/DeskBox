@@ -7,10 +7,9 @@ namespace DeskBox.Services;
 /// Runtime owner of 「映射整理」 (virtual desktop organize): creates the
 /// mapped widgets, keeps membership in sync with the Desktop folders, routes
 /// new desktop entries, and hides exactly the mapped entries on the desktop
-/// (hidden attribute, see <see cref="MappedOrganizeHiddenLedger"/>) while
-/// unmapped / 「放回桌面」 entries stay visible. Files are never moved, renamed
-/// or deleted here; the only file-system write is the hidden attribute of
-/// entries DeskBox itself hid, always restored from the ledger.
+/// in a filtered Shell view while unmapped / 「放回桌面」 entries stay visible.
+/// Files are never moved, renamed or hidden here. Legacy hidden attributes
+/// from older builds are restored only from their ownership ledger.
 ///
 /// Threading: every membership mutation runs on the UI dispatcher (the same
 /// thread that owns <see cref="SettingsService.Settings"/>); file-system
@@ -184,10 +183,6 @@ public sealed partial class MappedOrganizeService : IDisposable
                 App.Log($"[MappedOrganize] Restored desktop items for {reason}: ledger {before} -> {HiddenLedgerCount} in {Environment.TickCount64 - started} ms.");
             }
 
-            if (first)
-            {
-                DesktopIconVisibilityService.Apply(hidden: false);
-            }
         }
         catch (Exception ex)
         {
@@ -761,8 +756,7 @@ public sealed partial class MappedOrganizeService : IDisposable
 
     private void RaiseMembershipChanged(IEnumerable<string> widgetIds)
     {
-        // Hide / restore first: the widget reload that follows must already
-        // see its members as DeskBox-hidden (MappedOrganizeHiddenRegistry).
+        // Update the desktop projection before the widgets reload membership.
         ReconcileDesktopVisibility();
         var ids = widgetIds.ToHashSet(StringComparer.Ordinal);
         if (ids.Count == 0)

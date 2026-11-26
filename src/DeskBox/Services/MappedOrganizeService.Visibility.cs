@@ -15,6 +15,7 @@ public sealed partial class MappedOrganizeService
     private DesktopOrganizeMode _mode = DesktopOrganizeMode.MoveToWidgets;
     private readonly MappedOrganizeExitGate _exitGate = new();
     private readonly Dictionary<string, MappedOrganizeFileIdentity> _hiddenIdentities = new(StringComparer.OrdinalIgnoreCase);
+    private MappedDesktopSurfaceController? _desktopSurface;
 
     /// <summary>Entries currently marked 「放回桌面」 (copy; UI thread).</summary>
     public IReadOnlyCollection<string> KeptOnDesktopSnapshot() => _keptOnDesktop.ToArray();
@@ -141,62 +142,25 @@ public sealed partial class MappedOrganizeService
         WriteList(KeptPath, MappedOrganizeHiddenLedger.Serialize(_keptOnDesktop));
 
     /// <summary>
-    /// Hides the members of the live mapped widgets and restores every other
-    /// entry DeskBox hid. The ledger is written before an attribute is set,
-    /// so a crash can only leave recorded entries hidden, which the next start
-    /// (or the uninstaller) restores.
+    /// Restores attributes changed by older builds, then filters mapped entries
+    /// only in our desktop view. File dialogs keep seeing the real files.
     /// </summary>
     private void ReconcileDesktopVisibility()
     {
         lock (_visibilityGate)
         {
-            List<string> desired = _exitGate.IsRestored || _isDisposed
-                ? new List<string>()
-                : LiveMappedWidgets().SelectMany(MappedOrganizeMembership.GetMembers).ToList();
-            MappedOrganizeHiddenLedger.Plan plan = MappedOrganizeHiddenLedger.Reconcile(desired, _hiddenLedger, ProbeAttributes);
-            if (plan.ToHide.Count == 0 && plan.ToUnhide.Count == 0 && plan.Forget.Count == 0)
-            {
-                return;
-            }
-
+            MappedOrganizeHiddenLedger.Plan plan = MappedOrganizeHiddenLedger.Reconcile([], _hiddenLedger, ProbeAttributes);
             bool ledgerChanged = false;
-            foreach (string path in plan.ToHide)
-            {
-                ledgerChanged |= _hiddenLedger.Add(path);
-            }
-
             foreach (string path in plan.Forget)
             {
                 ledgerChanged |= _hiddenLedger.Remove(path);
                 _hiddenIdentities.Remove(path);
             }
 
-            if (ledgerChanged)
-            {
-                PersistHiddenLedger();
-            }
-
-            int hidden = 0;
-            foreach (string path in plan.ToHide)
-            {
-                if (TrySetHidden(path, hidden: true))
-                {
-                    hidden++;
-                    CaptureIdentity(path);
-                }
-                else
-                {
-                    // Not ours to hide (e.g. the Public Desktop without admin
-                    // rights): it stays visible on the desktop too.
-                    _hiddenLedger.Remove(path);
-                    ledgerChanged = true;
-                }
-            }
-
             int restored = 0;
             foreach (string path in plan.ToUnhide)
             {
-                if (TrySetHidden(path, hidden: false))
+                if (TryRestoreHidden(path))
                 {
                     restored++;
                     _hiddenLedger.Remove(path);
@@ -210,11 +174,40 @@ public sealed partial class MappedOrganizeService
                 PersistHiddenLedger();
             }
 
-            if (hidden > 0 || restored > 0)
+            if (restored > 0)
             {
-                App.Log($"[MappedOrganize] Desktop visibility: hid {hidden}, restored {restored}, ledger {_hiddenLedger.Count}.");
+                App.Log($"[MappedOrganize] Restored {restored} legacy hidden entries; ledger {_hiddenLedger.Count}.");
             }
         }
+
+        if ((_exitGate.IsRestored || _isDisposed) && !_dispatcherQueue.HasThreadAccess)
+        {
+            // ProcessExit can run off the UI thread; restore native icons now,
+            // and leave COM teardown to the thread that created the view.
+            _desktopSurface?.RestoreNativeIcons();
+        }
+
+        if (_dispatcherQueue.HasThreadAccess)
+        {
+            UpdateDesktopSurface();
+        }
+        else
+        {
+            _dispatcherQueue.TryEnqueue(UpdateDesktopSurface);
+        }
+    }
+
+    private void UpdateDesktopSurface()
+    {
+        if (_exitGate.IsRestored || _isDisposed || !HasMappedWidgets || _mode != DesktopOrganizeMode.MapOnly)
+        {
+            _desktopSurface?.Dispose();
+            _desktopSurface = null;
+            return;
+        }
+
+        _desktopSurface ??= new MappedDesktopSurfaceController(_dispatcherQueue);
+        _desktopSurface.Update(LiveMappedWidgets().SelectMany(MappedOrganizeMembership.GetMembers).ToArray());
     }
 
     private void RenameVisibilityRecords(string oldPath, string newPath, out bool wasKept)
@@ -258,14 +251,12 @@ public sealed partial class MappedOrganizeService
         }
     }
 
-    private static bool TrySetHidden(string path, bool hidden)
+    private static bool TryRestoreHidden(string path)
     {
         try
         {
             FileAttributes attributes = File.GetAttributes(path);
-            FileAttributes updated = hidden
-                ? attributes | FileAttributes.Hidden
-                : attributes & ~FileAttributes.Hidden;
+            FileAttributes updated = attributes & ~FileAttributes.Hidden;
             if (updated != attributes)
             {
                 File.SetAttributes(path, updated);
@@ -275,7 +266,7 @@ public sealed partial class MappedOrganizeService
         }
         catch (Exception ex)
         {
-            App.Log($"[MappedOrganize] Could not {(hidden ? "hide" : "show")} '{path}': {ex.Message}");
+            App.Log($"[MappedOrganize] Could not restore legacy hidden entry '{path}': {ex.Message}");
             return false;
         }
     }
