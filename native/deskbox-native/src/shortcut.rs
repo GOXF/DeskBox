@@ -8,7 +8,10 @@ use windows::{
             CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
             CoTaskMemFree, CoUninitialize, IPersistFile, STGM_READ,
         },
-        UI::Shell::{Common::ITEMIDLIST, ILFree, IShellLinkW, SHParseDisplayName, ShellLink},
+        UI::Shell::{
+            Common::ITEMIDLIST, GPFIDL_DEFAULT, ILFree, IShellLinkW, SHGetPathFromIDListEx,
+            SHParseDisplayName, ShellLink,
+        },
     },
     core::{GUID, Interface, PCWSTR, PWSTR},
 };
@@ -274,15 +277,9 @@ unsafe fn try_read_long_target_parsing_property(shell_link: &IShellLinkW) -> Opt
     }
 
     let out = if len >= SHELL_LINK_LONG_PATH_THRESHOLD && len < MAX_LONG_TARGET_CHARS {
-        let mut buf = Vec::with_capacity(len + 2);
         // SAFETY: Validated `len` UTF-16 code units before the NUL terminator.
         let chars = unsafe { slice::from_raw_parts(pv.ptr, len) };
-        buf.extend_from_slice(chars);
-        // Append two NULs so `capture_field` observes `source_length < source.len() - 1`
-        // and knows the value was not truncated by a fixed source buffer.
-        buf.push(0);
-        buf.push(0);
-        Some(buf)
+        Some(normalize_long_target_path(chars))
     } else {
         None
     };
@@ -290,6 +287,116 @@ unsafe fn try_read_long_target_parsing_property(shell_link: &IShellLinkW) -> Opt
     // SAFETY: Free the CoTaskMemAlloc-backed LPWSTR returned in PROPVARIANT.
     unsafe { CoTaskMemFree(Some(pv.ptr.cast())) };
     out
+}
+
+unsafe fn try_read_full_long_target(shell_link: &IShellLinkW, raw: &[u16]) -> Option<Vec<u16>> {
+    // SAFETY: The loaded shell link is alive throughout both optional queries.
+    if let Some(path) = unsafe { try_read_long_target_parsing_property(shell_link) } {
+        return Some(path);
+    }
+    if raw.iter().position(|&ch| ch == 0) != Some(raw.len().saturating_sub(1)) {
+        return None;
+    }
+
+    let mut pidl = core::ptr::null_mut();
+    // SAFETY: GetIDList writes an owned PIDL, released by ItemIdListGuard.
+    let hr = unsafe { (Interface::vtable(shell_link).GetIDList)(Interface::as_raw(shell_link), &mut pidl) };
+    let _guard = ItemIdListGuard(pidl);
+    if hr.is_err() || pidl.is_null() {
+        return None;
+    }
+    let mut path = vec![0_u16; 32_768];
+    // SAFETY: The owned target PIDL is valid and the output slice supplies its capacity.
+    if !unsafe { SHGetPathFromIDListEx(pidl, &mut path, GPFIDL_DEFAULT) }.as_bool() {
+        return None;
+    }
+    let len = path.iter().position(|&ch| ch == 0)?;
+    if len < SHELL_LINK_LONG_PATH_THRESHOLD || len >= path.len() - 1 {
+        return None;
+    }
+    Some(normalize_long_target_path(&path[..len]))
+}
+
+fn normalize_long_target_path(path: &[u16]) -> Vec<u16> {
+    const BACKSLASH: u16 = b'\\' as u16;
+    let extended = path.starts_with(&[BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH]);
+    let unc = extended && path.len() >= 8 && utf16_eq_ascii_ignore_case(&path[4..8], b"UNC\\");
+    let drive = extended
+        && path.len() >= 7
+        && matches!(path[4], 0x41..=0x5A | 0x61..=0x7A)
+        && path[5] == b':' as u16
+        && path[6] == BACKSLASH;
+    let components = if unc {
+        &path[8..]
+    } else if drive {
+        &path[7..]
+    } else {
+        path
+    };
+    let components = components.strip_suffix(&[BACKSLASH]).unwrap_or(components);
+    let mut parts = components.split(|&ch| ch == BACKSLASH);
+    let complete_unc = !unc
+        || (parts.next().is_some_and(|part| !part.is_empty())
+            && parts.next().is_some_and(|part| !part.is_empty()));
+    // Prefix removal must not change literal device names, dot/space components or namespace tokens.
+    let safe = (unc || drive)
+        && complete_unc
+        && char::decode_utf16(path.iter().copied()).all(|ch| ch.is_ok())
+        && (components.is_empty() && drive
+            || components
+                .split(|&ch| ch == BACKSLASH)
+                .all(ordinary_path_component));
+    let mut value = Vec::with_capacity(path.len() + 2);
+    if safe && unc {
+        value.extend_from_slice(&[BACKSLASH, BACKSLASH]);
+        value.extend_from_slice(&path[8..]);
+    } else {
+        value.extend_from_slice(if safe { &path[4..] } else { path });
+    }
+    // Two NULs distinguish a complete property value from a full, possibly truncated GetPath buffer.
+    value.extend_from_slice(&[0, 0]);
+    value
+}
+
+fn ordinary_path_component(part: &[u16]) -> bool {
+    if part.is_empty()
+        || matches!(part.last(), Some(0x20 | 0x2E))
+        || part.iter().any(|&ch| {
+            ch < 0x20 || matches!(ch, 0x22 | 0x2A | 0x2F | 0x3A | 0x3C | 0x3E | 0x3F | 0x7C)
+        })
+    {
+        return false;
+    }
+    let stem = part
+        .split(|&ch| ch == b'.' as u16)
+        .next()
+        .unwrap_or_default();
+    if stem.last() == Some(&0x20) {
+        return false;
+    }
+    let reserved = [
+        b"CON".as_slice(),
+        b"PRN",
+        b"AUX",
+        b"NUL",
+        b"CONIN$",
+        b"CONOUT$",
+    ]
+    .iter()
+    .any(|name| utf16_eq_ascii_ignore_case(stem, name));
+    let numbered_device = stem.len() == 4
+        && (utf16_eq_ascii_ignore_case(&stem[..3], b"COM")
+            || utf16_eq_ascii_ignore_case(&stem[..3], b"LPT"))
+        && matches!(stem[3], 0x31..=0x39 | 0xB9 | 0xB2 | 0xB3);
+    !reserved && !numbered_device
+}
+
+fn utf16_eq_ascii_ignore_case(value: &[u16], ascii: &[u8]) -> bool {
+    value.len() == ascii.len()
+        && value
+            .iter()
+            .zip(ascii)
+            .all(|(&ch, &expected)| ch <= 0x7F && (ch as u8).eq_ignore_ascii_case(&expected))
 }
 
 unsafe fn try_get_short_path(path: &[u16]) -> Option<Vec<u16>> {
@@ -301,9 +408,9 @@ unsafe fn try_get_short_path(path: &[u16]) -> Option<Vec<u16>> {
     // SAFETY: Both input and output buffers are NUL-terminated / sized accurately.
     let written = unsafe { GetShortPathNameW(PCWSTR(query_ptr), Some(&mut short_buf)) };
     if written > 0 && (written as usize) < short_buf.len() {
-        let mut out = short_buf[..written as usize].to_vec();
-        out.push(0);
-        return Some(out);
+        let mut out = normalize_long_target_path(&short_buf[..written as usize]);
+        out.pop();
+        return (out.len() <= STORED_FIELD_CAPACITY).then_some(out);
     }
 
     None
@@ -596,6 +703,14 @@ pub(crate) unsafe fn write_shortcut(
         request.flags & DESKBOX_SHORTCUT_WRITE_FLAG_SHELL_NAMESPACE_TARGET != 0;
     let is_long_target =
         !shell_namespace_target && target_path.len().saturating_sub(1) >= SHELL_LINK_LONG_PATH_THRESHOLD;
+    // Shell parsing rejects extended DOS names even when the same ordinary path is valid.
+    let target_path = if is_long_target {
+        let mut normalized = normalize_long_target_path(&target_path[..target_path.len() - 1]);
+        normalized.pop();
+        normalized
+    } else {
+        target_path
+    };
     let target_hresult = if shell_namespace_target {
         let mut item_id_list: *mut ITEMIDLIST = std::ptr::null_mut();
         // SAFETY: The parsing name is NUL-terminated and the output pointer is
@@ -733,7 +848,10 @@ pub(crate) unsafe fn write_shortcut(
             >= SHELL_LINK_LONG_PATH_THRESHOLD
         {
             let short_dir = unsafe { try_get_short_path(&working_directory) };
-            let candidate = short_dir.as_ref().unwrap_or(&working_directory);
+            // Overlong WORKING_DIR StringData makes Shell reload the path tail as arguments.
+            // shortcut: omit an unshortenable long working directory; require an explicit error if callers need it.
+            let empty = [0_u16];
+            let candidate = short_dir.as_deref().unwrap_or(&empty);
             let hr = unsafe {
                 (Interface::vtable(&shell_link).SetWorkingDirectory)(
                     Interface::as_raw(&shell_link),
@@ -1014,10 +1132,9 @@ unsafe fn read_stored_raw(
             SLGP_RAWPATH,
         )
     };
-    // SAFETY: Queries optional PKEY_Link_TargetParsingPath from the loaded shell link;
-    // returns Some(...) only when a stamped >260-char target property exists, preventing
-    // Windows 8.3 short-path PIDLs from masking full long target paths.
-    let long_target_fallback = unsafe { try_read_long_target_parsing_property(shell_link) };
+    // SAFETY: Recover a complete long target from its property or, when GetPath fills
+    // its fixed buffer, the target PIDL. Ordinary stored fields keep their raw form.
+    let long_target_fallback = unsafe { try_read_full_long_target(shell_link, &target) };
     if let Some(long_target) = long_target_fallback.as_deref() {
         // SAFETY: The caller-owned output buffer passed ABI validation.
         unsafe {
@@ -1156,10 +1273,9 @@ unsafe fn read_effective_diagnostic(
             0,
         )
     };
-    // SAFETY: Queries optional PKEY_Link_TargetParsingPath from the loaded shell link;
-    // returns Some(...) only when a stamped >260-char target property exists, preventing
-    // Windows 8.3 short-path PIDLs from masking full long target paths.
-    let long_target_fallback = unsafe { try_read_long_target_parsing_property(shell_link) };
+    // SAFETY: Recover a complete long target from its property or, when GetPath fills
+    // its fixed buffer, the target PIDL. Ordinary stored fields keep their raw form.
+    let long_target_fallback = unsafe { try_read_full_long_target(shell_link, &target) };
     if let Some(long_target) = long_target_fallback.as_deref() {
         // SAFETY: The caller-owned output buffer passed ABI validation.
         unsafe {
@@ -1296,4 +1412,85 @@ const fn is_dotnet_whitespace(value: u16) -> bool {
             | 0x205F
             | 0x3000
     )
+}
+
+#[cfg(test)]
+mod long_target_tests {
+    use super::normalize_long_target_path;
+
+    fn terminated(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain([0, 0]).collect()
+    }
+
+    #[test]
+    fn canonicalizes_only_ordinary_qualified_dos_and_unc_paths() {
+        for (input, expected) in [
+            (r"\\?\C:\folder\目标🚀.exe", r"C:\folder\目标🚀.exe"),
+            (r"\\?\c:\folder\", r"c:\folder\"),
+            (r"\\?\C:\", r"C:\"),
+            (
+                r"\\?\UNC\server\share\target.exe",
+                r"\\server\share\target.exe",
+            ),
+            (r"\\?\unc\Server\Share", r"\\Server\Share"),
+        ] {
+            assert_eq!(
+                normalize_long_target_path(&input.encode_utf16().collect::<Vec<_>>()),
+                terminated(expected),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_namespace_and_literal_only_path_semantics() {
+        for input in [
+            r"C:\folder\target.exe",
+            r"\\server\share\target.exe",
+            r"%TEMP%\target.exe",
+            r"\\?\Volume{abc}\target.exe",
+            r"\\?\GLOBALROOT\Device\file",
+            r"\\.\PhysicalDrive0",
+            r"shell:AppsFolder",
+            r"::{abc}",
+            r"\\?\C:relative",
+            r"\\?\C:/folder/file",
+            r"\\?\UNC\server",
+            r"\\?\UNC\\share\file",
+            r"\\?\UNC\server\\file",
+            r"\\?\UNC\.\share\file",
+            r"\\?\UNC\..\share\file",
+            r"\\?\UNC\?\share\file",
+            r"\\?\C:\folder\..\file",
+            r"\\?\C:\.\file",
+            r"\\?\C:\folder.\file",
+            r"\\?\C:\folder \file",
+            r"\\?\C:\folder/file",
+            r"\\?\C:\folder\\file",
+            r"\\?\C:\con.txt",
+            r"\\?\C:\con .txt",
+            r"\\?\C:\PRN",
+            r"\\?\C:\COM1.log",
+            r"\\?\C:\Lpt9",
+            r"\\?\C:\COM¹",
+            r"\\?\C:\LPT².dat",
+            r"\\?\C:\CONIN$",
+            r"\\?\C:\file:stream",
+        ] {
+            assert_eq!(
+                normalize_long_target_path(&input.encode_utf16().collect::<Vec<_>>()),
+                terminated(input),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_invalid_utf16_without_lossy_replacement() {
+        let mut path: Vec<u16> = r"\\?\C:\folder\".encode_utf16().collect();
+        path.push(0xD800);
+        let mut expected = path.clone();
+        expected.extend_from_slice(&[0, 0]);
+        assert_eq!(normalize_long_target_path(&path), expected);
+    }
 }

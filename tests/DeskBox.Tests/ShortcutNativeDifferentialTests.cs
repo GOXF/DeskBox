@@ -902,8 +902,14 @@ public sealed class ShortcutNativeDifferentialTests : IDisposable
         }
     }
 
-    [Fact]
-    public void LongPathShortcut_CreateAndResolveRoundTripsAcrossManagedAndRustNative()
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void LongPathShortcut_CreateAndResolveRoundTripsAcrossManagedAndRustNative(
+        bool useExtendedTarget,
+        bool useLongWorkingDirectory)
     {
         string segment = new('p', 90);
         string longFolder = Path.Combine(_tempRoot, segment, segment, segment + "_folder");
@@ -935,10 +941,10 @@ public sealed class ShortcutNativeDifferentialTests : IDisposable
         ShortcutNativeWriteCallResult writeResult = Native.WriteShortcut(
             rustFileShortcut,
             new ShortcutInfo(
-                longTargetFile,
+                useExtendedTarget ? StorageMigrationNativeMethods.Extended(longTargetFile) : longTargetFile,
                 "Long file shortcut",
                 "--mode long-path",
-                longFolder,
+                useLongWorkingDirectory ? longFolder : _tempRoot,
                 string.Empty,
                 0));
         Assert.True(writeResult.Success, writeResult.Detail);
@@ -966,6 +972,28 @@ public sealed class ShortcutNativeDifferentialTests : IDisposable
         Assert.NotNull(unifiedResolved);
         Assert.Equal(expectedFileTarget, unifiedResolved!.TargetPath, ignoreCase: true);
         Assert.Equal("--mode long-path", unifiedResolved.Arguments);
+        Assert.Equal("--mode long-path", rustStored.Metadata.Arguments);
+        Assert.Equal("--mode long-path", rustDiagnostic.Metadata.Arguments);
+        Assert.Equal("--mode long-path", rustResolved.Metadata.Arguments);
+        if (useLongWorkingDirectory)
+        {
+            Assert.InRange(rustStored.Metadata.WorkingDirectory.Length, 0, 259);
+            if (rustStored.Metadata.WorkingDirectory.Length > 0)
+            {
+                Assert.Equal(expectedFolderTarget,
+                    ExpandShortTargetIfCompressed(rustStored.Metadata.WorkingDirectory), ignoreCase: true);
+            }
+        }
+        else
+        {
+            Assert.Equal(_tempRoot, rustStored.Metadata.WorkingDirectory, ignoreCase: true);
+            Assert.Equal(_tempRoot, unifiedResolved.WorkingDirectory, ignoreCase: true);
+        }
+        Assert.Equal(0u, rustStored.SourceTruncatedFields);
+        Assert.Equal(0u, rustDiagnostic.SourceTruncatedFields);
+        Assert.Equal(0u, rustResolved.SourceTruncatedFields);
+        Assert.Equal(ShortcutTargetKind.LocalFileSystem, ShortcutTargetProbe.Classify(unifiedResolved.TargetPath));
+        Assert.Equal("MZ"u8.ToArray(), File.ReadAllBytes(StorageMigrationNativeMethods.Extended(unifiedResolved.TargetPath)));
 
         static string ExpandShortTargetIfCompressed(string path) =>
             StorageMigrationNativeMethods.TryExpandShortPathExceedingMaxPath(path, out string expanded)
