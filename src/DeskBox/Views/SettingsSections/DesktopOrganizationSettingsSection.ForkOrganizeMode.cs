@@ -112,7 +112,7 @@ public sealed partial class DesktopOrganizationSettingsSection
 
         if (_forkHiddenItemsInfo is not null)
         {
-            _forkHiddenItemsInfo.IsOpen = mapOnly && ExplorerHiddenItemsSetting.IsShowingHiddenItems();
+            _forkHiddenItemsInfo.IsOpen = false;
         }
     }
 

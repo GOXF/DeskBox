@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [Parameter(Mandatory)]
     [ValidateSet("x64", "ARM64")]
@@ -6,7 +6,15 @@ param(
 
     [string]$OutputDirectory = "",
 
-    [string]$DotNetPath = ""
+    [string]$DotNetPath = "",
+
+    [string]$SignThumbprint = "",
+
+    [string[]]$TimestampUrls = @(
+        "http://time.certum.pl",
+        "http://timestamp.digicert.com",
+        "http://timestamp.sectigo.com"
+    )
 )
 
 $ErrorActionPreference = "Stop"
@@ -123,12 +131,24 @@ if (-not (Test-Path -LiteralPath $directAuditSummaryPath -PathType Leaf)) {
 Copy-Item -LiteralPath $directAuditSummaryPath `
     -Destination (Join-Path $OutputDirectory "direct-aot-audit-summary.json") -Force
 
+$signingEnabled = -not [string]::IsNullOrWhiteSpace($SignThumbprint)
+$resolvedSigningCertificate = $null
+if ($signingEnabled) {
+    $signHelperScript = Join-Path $PSScriptRoot "Sign-DeskBoxFiles.ps1"
+    $resolvedSigningCertificate = & $signHelperScript -Thumbprint $SignThumbprint -ResolveOnly
+    Write-Host "Authenticode signing enabled: $($resolvedSigningCertificate.Subject) ($($resolvedSigningCertificate.Thumbprint))" -ForegroundColor Cyan
+}
+
 $retailPublishScript = Join-Path $PSScriptRoot "publish-aot-retail.ps1"
 $retailPublishArguments = @{
     Platform = $Platform
 }
 if (-not [string]::IsNullOrWhiteSpace($DotNetPath)) {
     $retailPublishArguments.DotNetPath = [System.IO.Path]::GetFullPath($DotNetPath)
+}
+if ($signingEnabled) {
+    $retailPublishArguments.SignThumbprint = $resolvedSigningCertificate.Thumbprint
+    $retailPublishArguments.TimestampUrls = $TimestampUrls
 }
 Write-Host "Publishing the smoke-free Full Native AOT retail payload for $Platform..." `
     -ForegroundColor Cyan
@@ -169,24 +189,46 @@ $directRequiredFiles = @(
     "DeskBox.Updater.exe",
     "DeskBox.ThumbnailProxy.exe",
     "deskbox_native.dll",
-    "EverythingSdk.dll",
+    "deskbox_qjs.dll",
     "Microsoft.UI.Input.dll",
+    "Microsoft.UI.Xaml.Phone.dll",
     "Microsoft.ui.xaml.dll",
     "Microsoft.WindowsAppRuntime.dll",
     "Microsoft.WindowsAppRuntime.Insights.Resource.dll",
-    "ThirdParty/Everything/LICENSE.txt",
     "DeskBox.pri",
-    "DeskBox.InstallManifest.txt"
+    "DeskBox.InstallManifest.txt",
+    "Strings/ar-SA.json",
+    "Strings/bn-BD.json",
+    "Strings/de-DE.json",
+    "Strings/en-US.json",
+    "Strings/es-ES.json",
+    "Strings/fr-FR.json",
+    "Strings/hi-IN.json",
+    "Strings/ja-JP.json",
+    "Strings/ko-KR.json",
+    "Strings/pt-BR.json",
+    "Strings/ru-RU.json",
+    "Strings/zh-CN.json",
+    "Strings/zh-TW.json"
 )
 $missingDirectFiles = @($directRequiredFiles | Where-Object { $directFiles -notcontains $_ })
 $directForbiddenPatterns = @(
     '\.pdb$',
+    '\.winmd$',
     '(^|/)DeskBox\.dll$',
     '(^|/)DeskBox\.deps\.json$',
     '(^|/)DeskBox\.runtimeconfig\.json$',
+    '(^|/)DeskBox\.Settings\.(?:exe|pri|dll)$',
+    '(^|/)DeskBox\.Settings\.deps\.json$',
+    '(^|/)DeskBox\.Settings\.runtimeconfig\.json$',
     '(^|/)(?:coreclr|clrjit|hostfxr|hostpolicy)\.dll$',
+    '(^|/)EverythingSdk\.dll$',
+    '(^|/)H\.NotifyIcon(?:\.WinUI)?\.dll$',
+    '(^|/)deskbox_search_core(?:\.|$)',
+    '(^|/)Microsoft\.Windows\.(?:AI\.|Search\.|Widgets\.|Workloads\.)',
     '(^|/)Assets/Store/',
-    'store-assets-html'
+    'store-assets-html',
+    '(^|/)\.mimosa(/|$)'
 )
 $forbiddenDirectFiles = @(
     @(
@@ -211,14 +253,11 @@ $deskBoxMachine = Get-PeMachine -Path (Join-Path $directPublishDirectory "DeskBo
 $updaterMachine = Get-PeMachine -Path (Join-Path $directPublishDirectory "DeskBox.Updater.exe")
 $thumbnailProxyMachine = Get-PeMachine -Path (
     Join-Path $directPublishDirectory "DeskBox.ThumbnailProxy.exe")
-$everythingSdkMachine = Get-PeMachine -Path (
-    Join-Path $directPublishDirectory "EverythingSdk.dll")
 $windowsAppRuntimeInsightsMachine = Get-PeMachine -Path (
     Join-Path $directPublishDirectory "Microsoft.WindowsAppRuntime.Insights.Resource.dll")
 if ($deskBoxMachine -ne $expectedMachine -or
     $updaterMachine -ne $expectedMachine -or
     $thumbnailProxyMachine -ne $expectedMachine -or
-    $everythingSdkMachine -ne $expectedMachine -or
     $windowsAppRuntimeInsightsMachine -ne $expectedMachine) {
     throw "The Direct AOT executable architecture does not match $Platform."
 }
@@ -247,6 +286,34 @@ $vcImports = @(
 )
 if ($vcImports.Count -gt 0) {
     throw "Static Rust modules unexpectedly import VC runtime DLLs: $($vcImports -join ', ')."
+}
+
+$qjsExports = @(
+    "deskbox_qjs_abi_version",
+    "deskbox_qjs_compile_module",
+    "deskbox_qjs_invoke_bytecode",
+    "deskbox_qjs_free_buffer"
+)
+$qjsContract = Get-DeskBoxNativePeContract `
+    -Path (Join-Path $directPublishDirectory "deskbox_qjs.dll") `
+    -ExpectedPlatform $Platform `
+    -RequiredExports $qjsExports
+$qjsVcImports = @(
+    @($qjsContract.ImportedModules) |
+        Where-Object { $_ -match '^(?:VCRUNTIME|MSVCP|VCCORLIB|CONCRT|ucrtbase|api-ms-win-crt-)' } |
+        Sort-Object -Unique
+)
+if ($qjsVcImports.Count -gt 0) {
+    throw "Static QuickJS module unexpectedly imports dynamic VC++/UCRT runtime DLLs: $($qjsVcImports -join ', ')."
+}
+
+$osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+$canRunDirectSmoke =
+    ($Platform -eq "x64" -and $osArch -eq [System.Runtime.InteropServices.Architecture]::X64) -or
+    ($Platform -eq "ARM64" -and $osArch -eq [System.Runtime.InteropServices.Architecture]::Arm64)
+if ($canRunDirectSmoke) {
+    Write-Host "Running Direct Native AOT --mcp & settings-host smoke against '$directPublishDirectory'..." -ForegroundColor Cyan
+    & (Join-Path $PSScriptRoot "run-aot-agent-clipboard-companion-smoke.ps1") -PublishDir $directPublishDirectory | Out-Host
 }
 
 $installerOutputDirectory = Join-Path $OutputDirectory "direct-installer"
@@ -283,9 +350,19 @@ $innoArguments = @(
     "/DDeskBoxBundledRuntime=1",
     "/DMyAppReleaseDir=$directPublishDirectory",
     "/F$installerOutputBaseName",
-    "/O$installerOutputDirectory",
-    $installerScript
+    "/O$installerOutputDirectory"
 )
+if ($signingEnabled) {
+    $powershellHost = (Get-Process -Id $PID).Path
+    $signHelperPath = Join-Path $PSScriptRoot "Sign-DeskBoxFiles.ps1"
+    # Use Inno Setup's $q quote macro so ISCC's argv parser never splits paths containing spaces (e.g. "C:\Program Files\...").
+    $innoSignCmd = "`$q$powershellHost`$q -NoProfile -ExecutionPolicy Bypass -File `$q$signHelperPath`$q -Thumbprint $($resolvedSigningCertificate.Thumbprint) -FilePath `$f"
+    $innoArguments += @(
+        "/DDeskBoxUseSignTool=1",
+        "/Sdeskboxsign=$innoSignCmd"
+    )
+}
+$innoArguments += $installerScript
 Write-Host "Compiling the Direct Full Native AOT installer with '$innoCompiler'..." -ForegroundColor Cyan
 & $innoCompiler @innoArguments 2>&1 | Tee-Object -FilePath $innoLogPath | Out-Host
 if ($LASTEXITCODE -ne 0) {
@@ -362,6 +439,12 @@ if (@($uploadEntries | Where-Object { $_ -like '*.msix' }).Count -ne 1 -or
 }
 
 $installerSignature = Get-AuthenticodeSignature -LiteralPath $installer.FullName
+if ($signingEnabled) {
+    if ($installerSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+        $null -eq $installerSignature.TimeStamperCertificate) {
+        throw "Authenticode verification failed for signed installer '$($installer.FullName)': status=$($installerSignature.Status)."
+    }
+}
 $summary = [ordered]@{
     schemaVersion = 1
     status = "passed"
@@ -387,6 +470,7 @@ $summary = [ordered]@{
         thumbnailProxyMachine = "0x$($thumbnailProxyMachine.ToString('X4'))"
         windowsAppRuntimeInsightsMachine = "0x$($windowsAppRuntimeInsightsMachine.ToString('X4'))"
         rustNative = $nativeContract
+        qjsNative = $qjsContract
         crtLinkage = "Static"
         vcRuntimeImports = $vcImports
         installer = [ordered]@{
@@ -416,6 +500,7 @@ $summary = [ordered]@{
         msixUploadSha256 = Get-FileSha256 -Path $msixUpload.FullName
         uploadEntries = $uploadEntries
         rustNativePackaged = $true
+        qjsNativePackaged = $true
         updaterPackaged = $false
     }
     evidenceBoundary = [ordered]@{
@@ -424,7 +509,7 @@ $summary = [ordered]@{
         interactiveDesktopExecuted = $false
         installerInstallationExecuted = $false
         msixInstallationExecuted = $false
-        signingExecuted = $false
+        signingExecuted = $signingEnabled
         wackExecuted = $false
         inPlaceUpgradeExecuted = $false
         storeFlightExecuted = $false

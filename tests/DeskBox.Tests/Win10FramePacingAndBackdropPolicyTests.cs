@@ -1,5 +1,6 @@
 using DeskBox.Helpers;
 using DeskBox.Models;
+using DeskBox.Platform;
 using DeskBox.Services;
 
 namespace DeskBox.Tests;
@@ -140,5 +141,37 @@ public sealed class Win10FramePacingAndBackdropPolicyTests
         int expectedState)
     {
         Assert.Equal(expectedState, Win32Helper.ResolveAccentState(enabled, blurEnabled, opacity));
+    }
+
+    [Fact]
+    public void LegacyAccentSimplificationPolicy_RequiresSustainedOverrunsOrResourceSaver()
+    {
+        Assert.False(InteractionBackdropSimplificationPolicy.ShouldSimplify(
+            recentOverrunMask: 0,
+            performanceMode: PerformanceSettingsPolicy.ModeBalanced));
+        Assert.True(InteractionBackdropSimplificationPolicy.ShouldSimplify(
+            recentOverrunMask: 0,
+            performanceMode: PerformanceSettingsPolicy.ModeResourceSaver));
+        Assert.True(InteractionBackdropSimplificationPolicy.ShouldSimplify(
+            recentOverrunMask: (1L << 24) - 1,
+            performanceMode: PerformanceSettingsPolicy.ModeBalanced));
+    }
+
+    [Theory]
+    [InlineData(0x1414u, 0x008Cu, 0u, true)]
+    [InlineData(0x1414u, 0x5353u, 0u, true)]
+    [InlineData(0x8086u, 0x9A49u, 0x2u, true)]
+    [InlineData(0x8086u, 0x9A49u, 0u, false)]
+    [InlineData(0x10DEu, 0x2684u, 0u, false)]
+    [InlineData(0x1002u, 0x744Cu, 0u, false)]
+    public void IsSoftwareOrSyntheticDxgiAdapter_IdentifiesWarpAndHyperVSyntheticWithoutHardwareFalsePositives(
+        uint vendorId,
+        uint deviceId,
+        uint flags,
+        bool expectedSoftware)
+    {
+        Assert.Equal(
+            expectedSoftware,
+            CustomWidgetNativeMetrics.IsSoftwareOrSyntheticDxgiAdapter(vendorId, deviceId, flags));
     }
 }

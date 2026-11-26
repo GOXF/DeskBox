@@ -27,6 +27,10 @@ public sealed partial class TodoWidgetContent
             return;
         }
 
+        DeskBox.Views.WidgetWindowBase.TryActivateOwnerForKeyboardInput(
+            this,
+            "todo-context-menu",
+            expectTextInput: false);
         TodoListView.Focus(FocusState.Programmatic);
         if (!item.IsCopySelected)
         {
@@ -53,26 +57,114 @@ public sealed partial class TodoWidgetContent
         var localization = App.Current.LocalizationService;
 
         var editItem = CreateTodoContextCommand("Todo.Menu.Edit", "\uE70F");
-        editItem.Click += async (_, _) =>
+        bool pendingEditAfterClose = false;
+        bool pendingRenameAfterClose = false;
+        flyout.Closed += (_, _) =>
         {
-            flyout.Hide();
-            ClearCopySelection();
-            ClearTodoListContainerSelection();
-            CloseCustomDueDateOverlay();
-            MarkDetailSelectionExplicit();
-            if (await OpenDetailItemAsync(item.Id) is null || ViewModel is null)
+            if (!pendingEditAfterClose && !pendingRenameAfterClose)
             {
                 return;
             }
 
-            ViewModel.BeginEdit(item.Id);
-            DispatcherQueue.TryEnqueue(() =>
+            bool runEdit = pendingEditAfterClose;
+            bool runRename = pendingRenameAfterClose;
+            pendingEditAfterClose = false;
+            pendingRenameAfterClose = false;
+            if (runRename)
             {
-                DetailTitleTextBox.Focus(FocusState.Programmatic);
-                DetailTitleTextBox.Select(DetailTitleTextBox.Text?.Length ?? 0, 0);
+                Interlocked.Increment(ref _pendingMenuInlineEditDepth);
+            }
+
+            bool enqueued = DispatcherQueue.TryEnqueue(async () =>
+            {
+                try
+                {
+                    if (_isDisposed || ViewModel is null)
+                    {
+                        return;
+                    }
+
+                    if (runRename)
+                    {
+                        OpenTodoInlineEdit(item);
+                        return;
+                    }
+
+                    if (runEdit)
+                    {
+                        ClearCopySelection();
+                        ClearTodoListContainerSelection();
+                        CloseCustomDueDateOverlay();
+                        MarkDetailSelectionExplicit();
+                        if (await OpenDetailItemAsync(item.Id) is null || ViewModel is null)
+                        {
+                            return;
+                        }
+
+                        ViewModel.BeginEdit(item.Id);
+                        _ = EnsureDetailPageRealized();
+                        DispatcherQueue.TryEnqueue(() =>
+                        {
+                            if (DetailTitleTextBox is not null)
+                            {
+                                DeskBox.Views.WidgetWindowBase.TryActivateOwnerForKeyboardInput(this, "todo-detail-title");
+                                DetailTitleTextBox.Focus(FocusState.Programmatic);
+                                DetailTitleTextBox.Select(DetailTitleTextBox.Text?.Length ?? 0, 0);
+                            }
+                        });
+                    }
+                }
+                finally
+                {
+                    if (runRename)
+                    {
+                        Interlocked.Decrement(ref _pendingMenuInlineEditDepth);
+                    }
+                }
             });
+            if (!enqueued && runRename)
+            {
+                Interlocked.Decrement(ref _pendingMenuInlineEditDepth);
+            }
+        };
+        editItem.Click += (_, _) =>
+        {
+            pendingEditAfterClose = true;
+            flyout.Hide();
         };
         flyout.Items.Add(editItem);
+
+        var renameItem = CreateTodoContextCommand("Todo.Menu.Rename", "\uE8AC");
+        renameItem.Click += (_, _) =>
+        {
+            pendingRenameAfterClose = true;
+            flyout.Hide();
+        };
+        flyout.Items.Add(renameItem);
+
+        var completeItem = CreateTodoContextCommand(
+            item.IsCompleted ? "Todo.Menu.MarkActive" : "Todo.Menu.MarkCompleted",
+            "\uE73E");
+        completeItem.Click += async (_, _) =>
+        {
+            flyout.Hide();
+            bool updated = await SetCompletedWithFeedbackAsync(item, !item.IsCompleted);
+            if (updated)
+            {
+                SynchronizeTodoCompletionCheckBox(item);
+            }
+        };
+        flyout.Items.Add(completeItem);
+
+        var importantItem = CreateTodoContextCommand(
+            item.IsImportant ? "Todo.Menu.UnmarkImportant" : "Todo.Menu.MarkImportant",
+            item.IsImportant ? "\uE734" : "\uE735");
+        importantItem.Click += async (_, _) =>
+        {
+            flyout.Hide();
+            await SetImportantWithFeedbackAsync(item, !item.IsImportant);
+        };
+        flyout.Items.Add(importantItem);
 
         var copyItem = new MenuFlyoutItem
         {
@@ -94,6 +186,14 @@ public sealed partial class TodoWidgetContent
             }
         };
         flyout.Items.Add(copyItem);
+
+        var convertItem = CreateTodoContextCommand("Todo.Menu.ConvertToQuickCapture", "\uE70B");
+        convertItem.Click += async (_, _) =>
+        {
+            flyout.Hide();
+            await ConvertTodoItemsToQuickCaptureWithFeedbackAsync([item]);
+        };
+        flyout.Items.Add(convertItem);
 
         var deleteItem = CreateTodoContextCommand("Common.Delete", "\uE74D");
         deleteItem.Click += async (_, _) =>
@@ -127,7 +227,10 @@ public sealed partial class TodoWidgetContent
                 Text = localization.T("Todo.Due.Custom"),
                 Icon = new FontIcon { Glyph = "\uE8A5" }
             };
-            customDueDateItem.Click += async (_, _) => await PickCustomDueDateAsync(item);
+            AttachDeferredFlyoutOverlayAction(
+                flyout,
+                customDueDateItem,
+                () => PickCustomDueDateAsync(item));
             menu.Items.Add(customDueDateItem);
             if (item.DueDate is not null)
             {
@@ -158,7 +261,7 @@ public sealed partial class TodoWidgetContent
             }
         });
         flyout.Items.Add(CreateTodoContextSubmenu(
-            "Todo.Menu.Recurrence", "\uE823", recurrenceMenu, flyout, item.DueDate is not null));
+            "Todo.Menu.Recurrence", "\uE823", recurrenceMenu, flyout));
 
         if (item.DueDate is not null &&
             !item.IsCompleted &&
@@ -202,6 +305,49 @@ public sealed partial class TodoWidgetContent
         var localization = App.Current.LocalizationService;
         string[] selectedIds = selectedItems.Select(item => item.Id).ToArray();
 
+        bool anyActive = selectedItems.Any(item => !item.IsCompleted);
+        var batchCompleteItem = CreateTodoContextCommand(
+            anyActive ? "Todo.Menu.MarkCompleted" : "Todo.Menu.MarkActive",
+            "\uE73E");
+        batchCompleteItem.Click += async (_, _) =>
+        {
+            flyout.Hide();
+            if (ViewModel is not null)
+            {
+                int changed = await ViewModel.SetCompletedBatchAsync(selectedIds, anyActive);
+                if (changed > 0 && !anyActive)
+                {
+                    ShowTodoStatus("Todo.Status.MarkedActive");
+                }
+
+                foreach (TodoItemViewModel selected in selectedItems)
+                {
+                    SynchronizeTodoCompletionCheckBox(selected);
+                }
+            }
+        };
+        flyout.Items.Add(batchCompleteItem);
+
+        bool anyUnimportant = selectedItems.Any(item => !item.IsImportant);
+        var batchImportantItem = CreateTodoContextCommand(
+            anyUnimportant ? "Todo.Menu.MarkImportant" : "Todo.Menu.UnmarkImportant",
+            anyUnimportant ? "\uE735" : "\uE734");
+        batchImportantItem.Click += async (_, _) =>
+        {
+            flyout.Hide();
+            if (ViewModel is not null)
+            {
+                int changed = await ViewModel.SetImportantAsync(selectedIds, anyUnimportant);
+                if (changed > 0)
+                {
+                    ShowTodoStatus(anyUnimportant
+                        ? "Todo.Status.MarkedImportant"
+                        : "Todo.Status.UnmarkedImportant");
+                }
+            }
+        };
+        flyout.Items.Add(batchImportantItem);
+
         var copyItem = new MenuFlyoutItem
         {
             Text = localization.Format("Todo.Menu.CopySelected", selectedItems.Count),
@@ -213,6 +359,26 @@ public sealed partial class TodoWidgetContent
             CopySelectedTodoItems(selectedItems);
         };
         flyout.Items.Add(copyItem);
+
+        var convertSelectedItem = CreateTodoContextCommand("Todo.Menu.ConvertToQuickCapture", "\uE70B");
+        convertSelectedItem.Click += async (_, _) =>
+        {
+            flyout.Hide();
+            await ConvertTodoItemsToQuickCaptureWithFeedbackAsync(selectedItems);
+        };
+        flyout.Items.Add(convertSelectedItem);
+
+        var exportSelectedItem = new MenuFlyoutItem
+        {
+            Text = localization.Format("Todo.Export.SelectedMenuItem", selectedItems.Count),
+            Icon = new FontIcon { Glyph = "\uEDE1" }
+        };
+        exportSelectedItem.Click += async (_, _) =>
+        {
+            flyout.Hide();
+            await ExportSelectedItemsAsync(selectedItems, anchor);
+        };
+        flyout.Items.Add(exportSelectedItem);
 
         var deleteItem = CreateTodoContextCommand("Common.Delete", "\uE74D");
         deleteItem.Click += async (_, _) =>
@@ -248,13 +414,17 @@ public sealed partial class TodoWidgetContent
             Text = localization.T("Todo.Due.Custom"),
             Icon = new FontIcon { Glyph = "\uE8A5" }
         };
-        customDueDateItem.Click += async (_, _) =>
-        {
-            flyout.Hide();
-            await PickBatchCustomDueDateAsync(
-                selectedIds,
-                selectedItems.FirstOrDefault(item => item.DueDate is not null)?.DueDate);
-        };
+        AttachDeferredFlyoutOverlayAction(
+            flyout,
+            customDueDateItem,
+            () =>
+            {
+                TodoItemViewModel? initialItem = selectedItems.FirstOrDefault(item => item.DueDate is not null);
+                return PickBatchCustomDueDateAsync(
+                    selectedIds,
+                    initialItem?.DueDate,
+                    initialItem?.HasDueTime == true);
+            });
         dueDateMenu.Items.Add(customDueDateItem);
         if (hasDueDate)
         {
@@ -290,7 +460,7 @@ public sealed partial class TodoWidgetContent
                 selectedItems, selectedIds, recurrenceMode, flyout));
         }
         flyout.Items.Add(CreateTodoContextSubmenu(
-            "Todo.Menu.Recurrence", "\uE823", recurrenceMenu, flyout, hasDueDate));
+            "Todo.Menu.Recurrence", "\uE823", recurrenceMenu, flyout));
 
         flyout.Items.Add(new MenuFlyoutSeparator());
         flyout.Items.Add(deleteItem);
@@ -376,9 +546,8 @@ public sealed partial class TodoWidgetContent
         MenuFlyout owner)
     {
         string normalizedMode = TodoRecurrenceMode.Normalize(recurrenceMode);
-        var dueItems = selectedItems.Where(item => item.DueDate is not null).ToList();
-        bool isSelected = dueItems.Count > 0 &&
-                          dueItems.All(item => string.Equals(item.RecurrenceMode, normalizedMode, StringComparison.Ordinal));
+        bool isSelected = selectedItems.Count > 0 &&
+                          selectedItems.All(item => string.Equals(item.RecurrenceMode, normalizedMode, StringComparison.Ordinal));
         var menuItem = new MenuFlyoutItem
         {
             Text = App.Current.LocalizationService.T(TodoRecurrenceService.GetLocalizationKey(normalizedMode)),
@@ -623,5 +792,38 @@ public sealed partial class TodoWidgetContent
             1440 => localization.T("Todo.Reminder.OneDayBefore"),
             int minutes => localization.Format("Todo.Reminder.MinutesBefore", minutes)
         };
+    }
+
+    private async Task ConvertTodoItemsToQuickCaptureWithFeedbackAsync(
+        IReadOnlyList<TodoItemViewModel> items)
+    {
+        if (_isDisposed || items.Count == 0)
+        {
+            return;
+        }
+
+        TodoItem[] snapshots = items
+            .Where(vm => !vm.Item.IsDeleted && !string.IsNullOrWhiteSpace(vm.Text))
+            .Select(vm => TodoWidgetStore.CloneItem(vm.Item))
+            .ToArray();
+        if (snapshots.Length == 0 || App.Current.WidgetManager is not { } widgetManager)
+        {
+            return;
+        }
+
+        try
+        {
+            int createdCount = await widgetManager.ConvertTodoItemsToQuickCaptureAsync(snapshots);
+            if (createdCount > 0)
+            {
+                ShowUndoToast(
+                    App.Current.LocalizationService.Format("Todo.ConvertedToQuickCaptureCount", createdCount),
+                    clearUndoOnHide: false);
+            }
+        }
+        catch (Exception ex)
+        {
+            App.Log($"[Todo] Failed to convert {snapshots.Length} item(s) to QuickCapture: {ex}");
+        }
     }
 }

@@ -33,6 +33,19 @@ public partial class WidgetViewModel
         _settingsService.SaveDebounced();
     }
 
+    internal string EnsureManagedFolderForDrop()
+    {
+        EnsureFolderBackedConfig();
+        MappedFolderPath = Config.MappedFolderPath;
+        if (string.IsNullOrWhiteSpace(CurrentFolderPath))
+        {
+            _mappedFolderTraversalPath = ResolveMappedFolderTraversalPath();
+            SetCurrentFolderPath(_mappedFolderTraversalPath);
+        }
+
+        return CurrentFolderPath ?? Config.MappedFolderPath ?? string.Empty;
+    }
+
     private string CreateAvailableManagedFolderName(string displayName, string widgetId)
     {
         string baseFolderName = FileService.SanitizeFileSystemName(displayName);
@@ -162,14 +175,26 @@ public partial class WidgetViewModel
         }
 
         long afterEnumerateMs = loadStopwatch.ElapsedMilliseconds;
+        _activeAddedAtDirectories = folderPath.Equals(userDesktop, StringComparison.OrdinalIgnoreCase)
+            ? [NormalizeAddedAtDirectoryKey(userDesktop), NormalizeAddedAtDirectoryKey(publicDesktop)]
+            : [NormalizeAddedAtDirectoryKey(folderPath)];
         ApplyPersistedAddedTimes(items);
         cancellationToken.ThrowIfCancellationRequested();
         beforeItemsReplaced?.Invoke();
         long afterAddedMs = loadStopwatch.ElapsedMilliseconds;
-        SyncFolderItems(items);
-        long afterSyncMs = loadStopwatch.ElapsedMilliseconds;
-        SortItems();
-        long afterSortMs = loadStopwatch.ElapsedMilliseconds;
+        long afterSyncMs;
+        long afterSortMs;
+        using (DeferStackDisplayRebuild())
+        {
+            SyncFolderItems(items);
+            afterSyncMs = loadStopwatch.ElapsedMilliseconds;
+            SortItems();
+            afterSortMs = loadStopwatch.ElapsedMilliseconds;
+        }
+        if (_dispatcherQueue is null || _dispatcherQueue.HasThreadAccess)
+        {
+            EnsureProjectionAndRenderWindowSynchronizedForHydration();
+        }
         if (clearIconCacheBeforeHydration)
         {
             ClearCurrentItemIconCache();
@@ -206,7 +231,7 @@ public partial class WidgetViewModel
             .Select(item => item.Path)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        if (Config.SortMode == WidgetSortMode.Manual)
+        if (EffectiveSortMode == WidgetSortMode.Manual)
         {
             List<string> liveOrderPaths = Items.Select(item => item.Path).ToList();
             List<WidgetItem> snapshotItems = refreshedItems
@@ -227,13 +252,24 @@ public partial class WidgetViewModel
             IReadOnlyList<WidgetItem> reconciled = WidgetManualOrderPolicy.Reconcile(
                 snapshotItems,
                 liveOrderPaths,
-                Config.Items,
+                GetPersistedManualOrderItemsForCurrentFolder(),
                 item => item.Path);
 
             ApplyReconciledManualOrder(reconciled);
             NormalizeSortOrder();
             PersistManualOrderSnapshotIfChanged();
             return;
+        }
+
+        IReadOnlyList<WidgetItem> orderedItems = refreshedItems;
+        if (Items.Count == 0 && refreshedItems.Count > 1)
+        {
+            // Pre-sorting the initial folder snapshot lets SyncFolderItems
+            // append in final order instead of inserting unsorted items and
+            // turning the trailing SortItems() into an O(N^2) Move storm.
+            var preSorted = refreshedItems.ToList();
+            preSorted.Sort(CompareItems);
+            orderedItems = preSorted;
         }
 
         for (int index = Items.Count - 1; index >= 0; index--)
@@ -244,9 +280,9 @@ public partial class WidgetViewModel
             }
         }
 
-        for (int targetIndex = 0; targetIndex < refreshedItems.Count; targetIndex++)
+        for (int targetIndex = 0; targetIndex < orderedItems.Count; targetIndex++)
         {
-            var refreshedItem = refreshedItems[targetIndex];
+            var refreshedItem = orderedItems[targetIndex];
             if (!existingByPath.TryGetValue(refreshedItem.Path, out var existingItem))
             {
                 Items.Insert(targetIndex, refreshedItem);
@@ -299,9 +335,20 @@ public partial class WidgetViewModel
 
     private void StartItemHydration()
     {
-        if (_isDisposed)
+        if (_isDisposed || _dispatcherQueue is null)
         {
             return;
+        }
+
+        if (_dispatcherQueue.HasThreadAccess)
+        {
+            EnsureProjectionAndRenderWindowSynchronizedForHydration();
+        }
+
+        _pendingHealAfterActiveHydration = false;
+        if (!_isIconHydrationDormant)
+        {
+            _activeHydrationSkippedIconsWhileDormant = false;
         }
 
         int generation = Interlocked.Increment(ref _itemHydrationGeneration);
@@ -408,12 +455,27 @@ public partial class WidgetViewModel
         }
         finally
         {
-            Interlocked.Decrement(ref _itemHydrationActiveCount);
+            int remainingActive = Interlocked.Decrement(ref _itemHydrationActiveCount);
             Interlocked.CompareExchange(
                 ref _itemHydrationCancellation,
                 null,
                 cancellation);
             cancellation.Dispose();
+            if (remainingActive == 0 &&
+                _pendingHealAfterActiveHydration &&
+                !_isDisposed &&
+                !_isIconHydrationDormant)
+            {
+                _pendingHealAfterActiveHydration = false;
+                if (_dispatcherQueue is null || _dispatcherQueue.HasThreadAccess)
+                {
+                    HealReleasedItemIconsIfIdle();
+                }
+                else
+                {
+                    _dispatcherQueue.TryEnqueue(HealReleasedItemIconsIfIdle);
+                }
+            }
         }
     }
 
@@ -461,6 +523,35 @@ public partial class WidgetViewModel
         return released;
     }
 
+    internal int ReleaseAllItemIcons(bool resetRenderWindow = false)
+    {
+        if (_isDisposed)
+        {
+            return 0;
+        }
+
+        _isIconHydrationDormant = true;
+        Interlocked.Increment(ref _itemHydrationGeneration);
+        CancelItemHydration(
+            Interlocked.Exchange(ref _itemHydrationCancellation, null));
+        if (resetRenderWindow)
+        {
+            ResetRenderWindow();
+        }
+
+        int released = 0;
+        foreach (WidgetItem item in Items)
+        {
+            if (item.Icon is not null)
+            {
+                item.Icon = null;
+                released++;
+            }
+        }
+
+        return released;
+    }
+
     /// <summary>
     /// Pure keep-set shared with behavior tests: the items whose icons a
     /// realized UI element currently displays. Stack projection renders
@@ -499,18 +590,35 @@ public partial class WidgetViewModel
     /// </summary>
     internal void HealReleasedItemIconsIfIdle()
     {
-        if (_isDisposed || IsItemHydrationActive)
+        if (_isDisposed)
         {
             return;
         }
 
-        foreach (WidgetItem item in HydrationUniverseItems)
+        ResumeIconHydrationFromDormancy();
+        if (_dispatcherQueue is null || _dispatcherQueue.HasThreadAccess)
+        {
+            EnsureProjectionAndRenderWindowSynchronizedForHydration();
+        }
+
+        if (IsItemHydrationActive && !_activeHydrationSkippedIconsWhileDormant)
+        {
+            _pendingHealAfterActiveHydration = true;
+            return;
+        }
+
+        foreach (WidgetItem item in ResolveIconHydrationItems(HydrationUniverseItems))
         {
             if (item.Icon is null)
             {
                 StartItemHydration();
                 return;
             }
+        }
+
+        if (HasMissingDisplayedItemMetadata())
+        {
+            StartItemHydration();
         }
     }
 
@@ -533,7 +641,7 @@ public partial class WidgetViewModel
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (generation != Volatile.Read(ref _itemHydrationGeneration) ||
-                !Items.Any(item => item.Icon is null))
+                !HasMissingTargetIcons())
             {
                 return;
             }
@@ -554,7 +662,13 @@ public partial class WidgetViewModel
         bool clearCacheBeforeLoad,
         CancellationToken cancellationToken)
     {
-        var items = HydrationUniverseItems
+        if (_isIconHydrationDormant)
+        {
+            _activeHydrationSkippedIconsWhileDormant = true;
+            return;
+        }
+
+        var items = ResolveIconHydrationItems(HydrationUniverseItems)
             .Where(item => item.Icon is null)
             .OrderByDescending(item => item.IsShortcut)
             .ThenBy(item => item.SortOrder)
@@ -656,7 +770,7 @@ public partial class WidgetViewModel
                     path,
                     _hideShortcutArrowOverlay,
                     _showImageFilesAsIcons,
-                    resetTransientFailures: false);
+                    resetTransientFailures: true);
             }
 
             var icon = await _fileService.GetIconAsync(
@@ -683,7 +797,7 @@ public partial class WidgetViewModel
         int generation,
         CancellationToken cancellationToken)
     {
-        var folders = HydrationUniverseItems
+        var folders = ResolveFolderCountHydrationItems(HydrationUniverseItems)
             .Where(item => item.IsFolder && !item.IsFolderItemCountLoaded)
             .ToList();
         int processed = 0;
@@ -743,7 +857,7 @@ public partial class WidgetViewModel
         // Loaded flags keep this proportional: without them every
         // generation re-read the shell link of every shortcut in the
         // universe — the stack-projection scroll amplifier.
-        var shortcuts = HydrationUniverseItems
+        var shortcuts = ResolveShortcutHydrationItems(HydrationUniverseItems)
             .Where(item => item.IsShortcut && !item.IsShortcutTargetLoaded)
             .OrderBy(item => item.SortOrder)
             .ToList();
@@ -771,14 +885,7 @@ public partial class WidgetViewModel
                 .ToArray();
             var results = await Task.WhenAll(batch);
 
-            foreach (var result in results)
-            {
-                SetShortcutTarget(
-                    result.Item,
-                    result.TargetPath,
-                    result.ExpectedPath,
-                    generation);
-            }
+            SetShortcutTarget(results, generation);
 
             await Task.Yield();
             cancellationToken.ThrowIfCancellationRequested();
@@ -789,7 +896,7 @@ public partial class WidgetViewModel
         int generation,
         CancellationToken cancellationToken)
     {
-        var items = HydrationUniverseItems
+        var items = ResolveShellKindHydrationItems(HydrationUniverseItems)
             .Where(item => !item.IsShellKindLoaded)
             .OrderBy(item => item.SortOrder)
             .ToList();
@@ -817,14 +924,7 @@ public partial class WidgetViewModel
                 .ToArray();
             var results = await Task.WhenAll(batch);
 
-            foreach (var result in results)
-            {
-                SetShellKind(
-                    result.Item,
-                    result.Kind,
-                    result.ExpectedPath,
-                    generation);
-            }
+            ApplyShellKindsBatch(results, generation);
 
             await Task.Yield();
             cancellationToken.ThrowIfCancellationRequested();
@@ -854,7 +954,7 @@ public partial class WidgetViewModel
             }
         }
 
-        if (_dispatcherQueue.HasThreadAccess)
+        if (_dispatcherQueue is null || _dispatcherQueue.HasThreadAccess)
         {
             Apply();
             return;
@@ -865,7 +965,7 @@ public partial class WidgetViewModel
 
     private void SetFolderItemCount(WidgetItem item, int count, string expectedPath, int generation)
     {
-        if (_dispatcherQueue.HasThreadAccess)
+        if (_dispatcherQueue is null || _dispatcherQueue.HasThreadAccess)
         {
             if (CanApplyHydrationResult(item, expectedPath, generation))
             {
@@ -887,15 +987,23 @@ public partial class WidgetViewModel
     }
 
     private void SetShortcutTarget(
-        WidgetItem item,
-        string targetPath,
-        string expectedPath,
+        (WidgetItem Item, string ExpectedPath, string TargetPath)[] results,
         int generation)
     {
+        if (results.Length == 0)
+        {
+            return;
+        }
+
         void Apply()
         {
-            if (CanApplyHydrationResult(item, expectedPath, generation))
+            foreach (var (item, expectedPath, targetPath) in results)
             {
+                if (!CanApplyHydrationResult(item, expectedPath, generation))
+                {
+                    continue;
+                }
+
                 item.TargetPath = targetPath;
                 if (!string.IsNullOrEmpty(targetPath))
                 {
@@ -913,10 +1021,15 @@ public partial class WidgetViewModel
                 // stored-metadata read is cache-hot at this point, so only
                 // PIDL-only links pay the vtable pass, once per item.
                 NamespaceShortcutHelper.ResolveKind(item);
+                if (item.NamespaceShortcutKind == NamespaceShortcutKind.RecycleBin)
+                {
+                    RecycleBinEmptyStateCache.Shared.EnsureWarm(
+                        _dispatcherQueue ?? Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread());
+                }
             }
         }
 
-        if (_dispatcherQueue.HasThreadAccess)
+        if (_dispatcherQueue is null || _dispatcherQueue.HasThreadAccess)
         {
             Apply();
         }
@@ -948,7 +1061,7 @@ public partial class WidgetViewModel
             item.IsFolderItemCountLoaded = false;
         }
 
-        if (_dispatcherQueue.HasThreadAccess)
+        if (_dispatcherQueue is null || _dispatcherQueue.HasThreadAccess)
         {
             Apply();
         }
@@ -958,25 +1071,41 @@ public partial class WidgetViewModel
         }
     }
 
-    private void SetShellKind(WidgetItem item, string kind, string expectedPath, int generation)
+    private void ApplyShellKindsBatch(
+        (WidgetItem Item, string ExpectedPath, string Kind)[] results,
+        int generation)
     {
+        if (results.Length == 0)
+        {
+            return;
+        }
+
         void Apply()
         {
-            if (!CanApplyHydrationResult(item, expectedPath, generation))
+            bool anyCategoryMayChange = false;
+            foreach (var (item, expectedPath, kind) in results)
             {
-                return;
+                if (!CanApplyHydrationResult(item, expectedPath, generation))
+                {
+                    continue;
+                }
+
+                bool categoryMayChange = !string.Equals(
+                    item.ShellKind,
+                    kind,
+                    StringComparison.OrdinalIgnoreCase);
+                item.ShellKind = kind;
+                item.IsShellKindLoaded = true;
+                anyCategoryMayChange |= categoryMayChange;
             }
 
-            bool categoryMayChange = !string.Equals(item.ShellKind, kind, StringComparison.OrdinalIgnoreCase);
-            item.ShellKind = kind;
-            item.IsShellKindLoaded = true;
-            if (categoryMayChange && FileStackGroupBy == SettingsService.FileStackGroupByKind)
+            if (anyCategoryMayChange && FileStackGroupBy == SettingsService.FileStackGroupByKind)
             {
                 QueueStackDisplayRebuild();
             }
         }
 
-        if (_dispatcherQueue.HasThreadAccess)
+        if (_dispatcherQueue is null || _dispatcherQueue.HasThreadAccess)
         {
             Apply();
         }

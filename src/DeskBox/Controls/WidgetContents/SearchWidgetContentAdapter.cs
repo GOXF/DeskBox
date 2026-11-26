@@ -1,119 +1,261 @@
 using DeskBox.Contracts;
 using DeskBox.Models;
 using DeskBox.Services;
+using DeskBox.ViewModels;
 using Microsoft.UI.Xaml;
 
 namespace DeskBox.Controls.WidgetContents;
 
 /// <summary>
-/// Adapts SearchWidgetContent to the IWidgetContent contract.
+/// Residency adapter for the first-party desktop Search entry widget.
+/// Owns <see cref="SearchWidgetViewModel"/> while letting the XAML leaf view
+/// hibernate cleanly when collapsed to a compact capsule.
 /// </summary>
 public sealed class SearchWidgetContentAdapter :
     WidgetContentAdapterBase,
-    IWidgetResponsiveLayoutContent
+    IWidgetFeedbackSource,
+    IWidgetGroupContentCacheable,
+    IWidgetPerformanceAwareContent
 {
-    private EventHandler? _searchRequested;
+    private readonly SettingsService _settingsService;
+    private readonly SearchWidgetHostCallbacks _hostCallbacks;
+    private readonly CancellationTokenSource _lifetimeCts = new();
+    private IDisposable? _preferencesSubscription;
+    private IDisposable? _everythingSubscription;
+    private bool _isWindowVisible = true;
+    private bool _isCompactCollapsed;
 
     public SearchWidgetContentAdapter(
         WidgetConfig config,
         LocalizationService localizationService,
         SettingsService? settingsService = null,
-        Func<FrameworkElement>? viewFactory = null)
+        SearchWidgetHostCallbacks? hostCallbacks = null,
+        Func<SearchWidgetViewModel, FrameworkElement>? viewFactory = null)
+        : this(
+            config,
+            settingsService ?? new SettingsService(),
+            localizationService,
+            hostCallbacks ?? new SearchWidgetHostCallbacks(),
+            viewFactory)
+    {
+    }
+
+    private SearchWidgetContentAdapter(
+        WidgetConfig config,
+        SettingsService settingsService,
+        LocalizationService localizationService,
+        SearchWidgetHostCallbacks hostCallbacks,
+        Func<SearchWidgetViewModel, FrameworkElement>? viewFactory)
+        : this(
+            config,
+            CreateViewModel(config, localizationService, settingsService, hostCallbacks),
+            settingsService,
+            localizationService,
+            hostCallbacks,
+            viewFactory)
+    {
+    }
+
+    private SearchWidgetContentAdapter(
+        WidgetConfig config,
+        SearchWidgetViewModel viewModel,
+        SettingsService settingsService,
+        LocalizationService localizationService,
+        SearchWidgetHostCallbacks hostCallbacks,
+        Func<SearchWidgetViewModel, FrameworkElement>? viewFactory)
         : base(
             config,
-            viewFactory ?? (() => new SearchWidgetContent(localizationService, settingsService)))
+            () => (viewFactory ?? (vm => new SearchWidgetContent(vm, localizationService)))(viewModel))
     {
         if (config.WidgetKind != WidgetKind.Search)
         {
             throw new ArgumentException("Search content requires a Search widget config.", nameof(config));
         }
+
+        _settingsService = settingsService;
+        _hostCallbacks = hostCallbacks;
+        ViewModel = viewModel;
+        ViewModel.FeedbackRequested += ViewModel_FeedbackRequested;
+        _preferencesSubscription = hostCallbacks.SubscribePreferencesChanged?.Invoke(ViewModel.RequestRefresh);
+        _everythingSubscription = hostCallbacks.SubscribeEverythingConnectionChanged?.Invoke(ViewModel.RequestRefresh);
     }
+
+    public SearchWidgetViewModel ViewModel { get; }
+
+    public bool IsReadyForReuse => !IsDisposed;
+
+    public event EventHandler<WidgetFeedbackRequestedEventArgs>? FeedbackRequested;
 
     protected override void OnViewMaterialized(FrameworkElement view)
     {
         if (view is SearchWidgetContent content)
         {
-            content.SearchRequested += Content_SearchRequested;
+            content.FeedbackRequested += Content_FeedbackRequested;
+            content.OnCompactStateChanged(_isCompactCollapsed);
+            content.OnWindowVisibilityChanged(_isWindowVisible);
+            content.SyncFromResidentViewModel();
         }
     }
 
-    /// <summary>
-    /// Raised when the user clicks the widget to open the search popup.
-    /// The adapter holds the handler list itself: subscribing a cold
-    /// adapter must not materialize the view tree (roadmap section 4.5,
-    /// Search row — the accessors used to read View).
-    /// </summary>
-    public event EventHandler? SearchRequested
+    protected override void OnHibernatingView(FrameworkElement view)
     {
-        add => _searchRequested += value;
-        remove => _searchRequested -= value;
+        if (view is SearchWidgetContent content)
+        {
+            content.FeedbackRequested -= Content_FeedbackRequested;
+            content.DisposeLeafOnly();
+        }
     }
 
-    private void Content_SearchRequested(object? sender, EventArgs e)
+    public override Task InitializeAsync()
     {
-        _searchRequested?.Invoke(this, e);
+        EnsureEverythingSubscription();
+        ViewModel.RefreshState();
+        TriggerBackgroundEverythingProbe();
+        return Task.CompletedTask;
     }
 
     public override Task RefreshAsync()
     {
-        if (MaterializedView is SearchWidgetContent content)
-        {
-            content.UpdateContent();
-        }
-
+        EnsureEverythingSubscription();
+        ViewModel.RefreshState();
+        TriggerBackgroundEverythingProbe();
         return Task.CompletedTask;
     }
 
     public override void ApplyAppearance()
     {
+        ViewModel.RefreshState();
         if (MaterializedView is SearchWidgetContent content)
         {
-            content.ApplyAppearance();
+            content.ApplyAppearanceVisuals();
         }
     }
 
-    public void BeginResponsiveLayoutTransition(
-        double targetContentWidth,
-        double targetContentHeight,
-        bool isCollapsing)
+    public override void OnCompactStateChanged(bool collapsed)
     {
+        _isCompactCollapsed = collapsed;
         if (MaterializedView is SearchWidgetContent content)
         {
-            content.BeginResponsiveLayoutTransition(
-                targetContentWidth,
-                targetContentHeight,
-                isCollapsing);
+            content.OnCompactStateChanged(collapsed);
         }
     }
 
-    public void CompleteResponsiveLayoutTransition(
-        double finalContentWidth,
-        double finalContentHeight)
+    public override void OnWindowVisibilityChanged(bool visible)
     {
+        _isWindowVisible = visible;
         if (MaterializedView is SearchWidgetContent content)
         {
-            content.CompleteResponsiveLayoutTransition(
-                finalContentWidth,
-                finalContentHeight);
+            content.OnWindowVisibilityChanged(visible);
         }
     }
 
-    public void CancelResponsiveLayoutTransition()
+    public void ApplyPerformanceSettings()
     {
-        if (MaterializedView is SearchWidgetContent content)
+        _ = _settingsService;
+    }
+
+    private void EnsureEverythingSubscription()
+    {
+        _everythingSubscription ??=
+            _hostCallbacks.SubscribeEverythingConnectionChanged?.Invoke(ViewModel.RequestRefresh);
+    }
+
+    private void TriggerBackgroundEverythingProbe()
+    {
+        if (_hostCallbacks.ProbeEverythingConnectionAsync is not { } probe ||
+            !_settingsService.Settings.Search.SearchEverythingEnabled)
         {
-            content.CancelResponsiveLayoutTransition();
+            return;
         }
+
+        _ = RunEverythingProbeSafeAsync(probe);
+    }
+
+    private async Task RunEverythingProbeSafeAsync(Func<CancellationToken, Task> probe)
+    {
+        try
+        {
+            await probe(_lifetimeCts.Token).ConfigureAwait(false);
+            if (IsDisposed)
+            {
+                return;
+            }
+
+            if (_hostCallbacks.UiDispatch is { } dispatch)
+            {
+                dispatch(() =>
+                {
+                    if (!IsDisposed)
+                    {
+                        EnsureEverythingSubscription();
+                        ViewModel.RefreshState();
+                    }
+                });
+            }
+            else if (!IsDisposed)
+            {
+                EnsureEverythingSubscription();
+                ViewModel.RefreshState();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            App.Log($"[SearchWidget] Everything probe failed: {ex.Message}");
+        }
+    }
+
+    private void ViewModel_FeedbackRequested(object? sender, WidgetFeedbackRequestedEventArgs e)
+    {
+        FeedbackRequested?.Invoke(this, e);
+    }
+
+    private void Content_FeedbackRequested(object? sender, WidgetFeedbackRequestedEventArgs e)
+    {
+        FeedbackRequested?.Invoke(this, e);
     }
 
     protected override void Dispose(bool disposing)
     {
+        _lifetimeCts.Cancel();
+        _lifetimeCts.Dispose();
+
+        _preferencesSubscription?.Dispose();
+        _preferencesSubscription = null;
+        _everythingSubscription?.Dispose();
+        _everythingSubscription = null;
+
         if (MaterializedView is SearchWidgetContent content)
         {
-            content.SearchRequested -= Content_SearchRequested;
+            content.FeedbackRequested -= Content_FeedbackRequested;
+            content.DisposeLeafOnly();
         }
 
-        (MaterializedView as IDisposable)?.Dispose();
-        _searchRequested = null;
+        ViewModel.FeedbackRequested -= ViewModel_FeedbackRequested;
+        ViewModel.Dispose();
+    }
+
+    private static SearchWidgetViewModel CreateViewModel(
+        WidgetConfig config,
+        LocalizationService localizationService,
+        SettingsService settingsService,
+        SearchWidgetHostCallbacks callbacks)
+    {
+        return new SearchWidgetViewModel(
+            config,
+            localizationService,
+            settingsService,
+            callbacks.HistoryService,
+            isEverythingConnected: callbacks.IsEverythingConnected,
+            openSearchPopup: callbacks.OpenSearchPopup,
+            openSearchPopupWithQuery: callbacks.OpenSearchPopupWithQuery,
+            executeSearchAction: callbacks.ExecuteSearchAction,
+            openRecommendation: callbacks.OpenRecommendation,
+            openSettings: callbacks.OpenSettings,
+            copyText: callbacks.CopyText,
+            setPrivacyMaskPreference: callbacks.SetPrivacyMaskPreference,
+            uiDispatch: callbacks.UiDispatch);
     }
 }

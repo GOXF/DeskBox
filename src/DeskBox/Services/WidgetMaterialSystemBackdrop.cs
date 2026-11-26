@@ -1,3 +1,7 @@
+using System.Runtime.InteropServices;
+using DeskBox.Platform;
+using static DeskBox.Platform.MonitorAndBackdropInterop;
+using Microsoft.UI;
 using Microsoft.UI.Composition;
 using Microsoft.UI.Composition.SystemBackdrops;
 using Microsoft.UI.Xaml;
@@ -19,6 +23,453 @@ internal readonly record struct WidgetMaterialBackdropAppearance(
     double MaterialIntensity);
 
 /// <summary>
+/// AOT-safe native solid/transparent tint <see cref="SystemBackdrop"/> backed by a
+/// <see cref="Windows.UI.Composition.CompositionColorBrush"/> on the window target.
+/// </summary>
+internal sealed partial class SolidTintSystemBackdrop : SystemBackdrop, IDisposable
+{
+    private const int DqTypeThreadCurrent = 2;
+    private const int DqtatComSta = 2;
+
+    [ThreadStatic]
+    private static IntPtr t_dispatcherQueueController;
+
+    [ThreadStatic]
+    private static Windows.UI.Composition.Compositor? t_compositor;
+
+    private Windows.UI.Color _tintColor;
+    private ICompositionSupportsSystemBackdrop? _target;
+    private Windows.UI.Composition.CompositionColorBrush? _brush;
+    private IntPtr _hwnd;
+    private bool _isDisposed;
+
+    internal SolidTintSystemBackdrop(Windows.UI.Color tintColor)
+    {
+        _tintColor = tintColor;
+    }
+
+    internal Windows.UI.Color TintColor
+    {
+        get => _tintColor;
+        set
+        {
+            _tintColor = value;
+            if (_brush is not null && !_isDisposed)
+            {
+                try
+                {
+                    _brush.Color = value;
+                }
+                catch
+                {
+                }
+            }
+        }
+    }
+
+    internal static Windows.UI.Composition.Compositor? TryEnsureThreadCompositor()
+    {
+        try
+        {
+            EnsureWindowsSystemDispatcherQueue();
+            return t_compositor ??= new Windows.UI.Composition.Compositor();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    protected override void OnTargetConnected(
+        ICompositionSupportsSystemBackdrop connectedTarget,
+        XamlRoot xamlRoot)
+    {
+        base.OnTargetConnected(connectedTarget, xamlRoot);
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        DetachBrushAndWindowState(connectedTarget);
+        _target = connectedTarget;
+
+        Windows.UI.Composition.Compositor? compositor = TryEnsureThreadCompositor();
+        if (compositor is null)
+        {
+            return;
+        }
+        _brush = compositor.CreateColorBrush(_tintColor);
+        connectedTarget.SystemBackdrop = _brush;
+
+        try
+        {
+            if (xamlRoot?.ContentIslandEnvironment is { } islandEnvironment)
+            {
+                _hwnd = Win32Interop.GetWindowFromWindowId(islandEnvironment.AppWindowId);
+                if (_hwnd != IntPtr.Zero)
+                {
+                    Win32Helper.EnableTransparentWindowHost(_hwnd);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            App.LogVerbose($"[SolidTintBackdrop] Window frame alpha setup failed: {ex.Message}");
+        }
+    }
+
+    protected override void OnTargetDisconnected(
+        ICompositionSupportsSystemBackdrop disconnectedTarget)
+    {
+        try
+        {
+            base.OnTargetDisconnected(disconnectedTarget);
+        }
+        finally
+        {
+            DetachBrushAndWindowState(disconnectedTarget);
+            if (ReferenceEquals(_target, disconnectedTarget))
+            {
+                _target = null;
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        _isDisposed = true;
+        DetachBrushAndWindowState(_target);
+        _target = null;
+    }
+
+    private void DetachBrushAndWindowState(ICompositionSupportsSystemBackdrop? target)
+    {
+        if (target is not null)
+        {
+            try
+            {
+                if (_brush is null || ReferenceEquals(target.SystemBackdrop, _brush))
+                {
+                    target.SystemBackdrop = null;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        if (_brush is not null)
+        {
+            try
+            {
+                _brush.Dispose();
+            }
+            catch
+            {
+            }
+            finally
+            {
+                _brush = null;
+            }
+        }
+
+        if (_hwnd != IntPtr.Zero)
+        {
+            Win32Helper.DisableTransparentWindowHost(_hwnd);
+            _hwnd = IntPtr.Zero;
+        }
+    }
+
+    private static void EnsureWindowsSystemDispatcherQueue()
+    {
+        if (Windows.System.DispatcherQueue.GetForCurrentThread() is not null ||
+            t_dispatcherQueueController != IntPtr.Zero)
+        {
+            return;
+        }
+
+        var options = new DispatcherQueueOptions
+        {
+            dwSize = Marshal.SizeOf<DispatcherQueueOptions>(),
+            threadType = DqTypeThreadCurrent,
+            apartmentType = DqtatComSta
+        };
+        _ = CreateDispatcherQueueController(options, out t_dispatcherQueueController);
+    }
+}
+
+/// <summary>
+/// Bridges a <see cref="Microsoft.UI.Xaml.Controls.SystemBackdropElement"/>'s
+/// <see cref="ICompositionSupportsSystemBackdrop"/> target to external shared
+/// or window-owned backdrop controllers via a smooth 256-level anti-aliased
+/// <see cref="MaskedBackdropTargetProxy"/>, and disposes the thread-affine native
+/// target link on the UI thread when XAML disconnects the element.
+/// </summary>
+internal sealed partial class ElementBackdropTargetBridge : SystemBackdrop, IDisposable
+{
+    private readonly Action? _onTargetChanged;
+    private readonly Action<ICompositionSupportsSystemBackdrop>? _onTargetDisconnecting;
+    private ICompositionSupportsSystemBackdrop? _rawTarget;
+    private MaskedBackdropTargetProxy? _maskedProxy;
+    private XamlRoot? _xamlRoot;
+    private SystemBackdropConfiguration? _configuration;
+    private double _cornerRadiusDip;
+    private double _rasterizationScale = 1.0;
+    private bool _isDisposed;
+
+    internal ElementBackdropTargetBridge(
+        Action? onTargetChanged = null,
+        Action<ICompositionSupportsSystemBackdrop>? onTargetDisconnecting = null)
+    {
+        _onTargetChanged = onTargetChanged;
+        _onTargetDisconnecting = onTargetDisconnecting;
+    }
+
+    internal ICompositionSupportsSystemBackdrop? Target => _isDisposed ? null : _maskedProxy;
+
+    internal SystemBackdropConfiguration? Configuration => _isDisposed ? null : _configuration;
+
+    internal void SetCornerRadius(double cornerRadiusDip)
+    {
+        _cornerRadiusDip = Math.Max(0.0, cornerRadiusDip);
+        _maskedProxy?.UpdateParameters(_cornerRadiusDip, _rasterizationScale);
+    }
+
+    internal void Suspend()
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        _maskedProxy?.ReleaseSuspendedResources();
+    }
+
+    protected override void OnTargetConnected(
+        ICompositionSupportsSystemBackdrop connectedTarget,
+        XamlRoot xamlRoot)
+    {
+        base.OnTargetConnected(connectedTarget, xamlRoot);
+        if (_isDisposed)
+        {
+            TryDisposeElementTargetLink(connectedTarget, "[ElementBackdropBridge]");
+            return;
+        }
+
+        DetachXamlRoot();
+        DisposeMaskedProxySafely(ref _maskedProxy, "[ElementBackdropBridge]");
+
+        _rawTarget = connectedTarget;
+        AttachXamlRoot(xamlRoot);
+        _maskedProxy = new MaskedBackdropTargetProxy(
+            connectedTarget,
+            _cornerRadiusDip,
+            _rasterizationScale);
+        _configuration = GetDefaultSystemBackdropConfiguration(connectedTarget, xamlRoot);
+        _onTargetChanged?.Invoke();
+    }
+
+    protected override void OnDefaultSystemBackdropConfigurationChanged(
+        ICompositionSupportsSystemBackdrop target,
+        XamlRoot xamlRoot)
+    {
+        base.OnDefaultSystemBackdropConfigurationChanged(target, xamlRoot);
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        if (xamlRoot is { RasterizationScale: > 0 } validRoot)
+        {
+            _rasterizationScale = validRoot.RasterizationScale;
+            _maskedProxy?.UpdateParameters(_cornerRadiusDip, _rasterizationScale);
+        }
+
+        // Window focus transitions flip IsInputActive on the default
+        // configuration without replacing the composition target proxy;
+        // shared controllers keep their own always-active configuration, so
+        // only target connect/disconnect should notify _onTargetChanged.
+        _configuration = GetDefaultSystemBackdropConfiguration(target, xamlRoot);
+    }
+
+    protected override void OnTargetDisconnected(
+        ICompositionSupportsSystemBackdrop disconnectedTarget)
+    {
+        try
+        {
+            base.OnTargetDisconnected(disconnectedTarget);
+        }
+        finally
+        {
+            bool wasCurrent = ReferenceEquals(_rawTarget, disconnectedTarget);
+            if (wasCurrent)
+            {
+                DetachXamlRoot();
+                _rawTarget = null;
+                _configuration = null;
+                NotifyAndDisposeMaskedProxySafely(
+                    ref _maskedProxy,
+                    _onTargetDisconnecting,
+                    "[ElementBackdropBridge]");
+            }
+
+            // Always close the thread-affine SystemBackdropElement native link on
+            // the UI thread even if proxy cleanup above faulted; leaving it to the
+            // GC finalizer thread crashes WinUI natively during background collection.
+            TryDisposeElementTargetLink(disconnectedTarget, "[ElementBackdropBridge]");
+
+            if (wasCurrent && !_isDisposed)
+            {
+                try
+                {
+                    _onTargetChanged?.Invoke();
+                }
+                catch (Exception ex)
+                {
+                    App.Log($"[ElementBackdropBridge] Target changed callback failed: {ex}");
+                }
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        _isDisposed = true;
+        DetachXamlRoot();
+        _rawTarget = null;
+        _configuration = null;
+        NotifyAndDisposeMaskedProxySafely(
+            ref _maskedProxy,
+            _onTargetDisconnecting,
+            "[ElementBackdropBridge]");
+    }
+
+    internal static void NotifyAndDisposeMaskedProxySafely<TProxy>(
+        ref TProxy? proxyField,
+        Action<TProxy>? onDisconnecting,
+        string logTag)
+        where TProxy : class, IDisposable
+    {
+        TProxy? activeProxy = proxyField;
+        if (activeProxy is null)
+        {
+            return;
+        }
+
+        proxyField = null;
+        if (onDisconnecting is not null)
+        {
+            try
+            {
+                onDisconnecting(activeProxy);
+            }
+            catch (Exception ex)
+            {
+                App.Log($"{logTag} Target disconnecting callback failed: {ex}");
+            }
+        }
+
+        DisposeProxyInstanceSafely(activeProxy, logTag);
+    }
+
+    internal static void DisposeMaskedProxySafely<TProxy>(
+        ref TProxy? proxyField,
+        string logTag)
+        where TProxy : class, IDisposable
+    {
+        TProxy? activeProxy = proxyField;
+        if (activeProxy is null)
+        {
+            return;
+        }
+
+        proxyField = null;
+        DisposeProxyInstanceSafely(activeProxy, logTag);
+    }
+
+    private static void DisposeProxyInstanceSafely(IDisposable proxy, string logTag)
+    {
+        try
+        {
+            proxy.Dispose();
+        }
+        catch (Exception ex)
+        {
+            App.Log($"{logTag} Masked proxy dispose failed: {ex}");
+        }
+    }
+
+    internal static bool TryDisposeElementTargetLink(object? target, string logTag)
+    {
+        if (target is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (target is IDisposable managedDisposable)
+            {
+                managedDisposable.Dispose();
+                return true;
+            }
+
+            target.As<IDisposable>().Dispose();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            App.Log($"{logTag} Element target close failed: {ex}");
+            return false;
+        }
+    }
+
+    private void AttachXamlRoot(XamlRoot? xamlRoot)
+    {
+        _xamlRoot = xamlRoot;
+        if (xamlRoot is not null)
+        {
+            if (xamlRoot.RasterizationScale > 0)
+            {
+                _rasterizationScale = xamlRoot.RasterizationScale;
+            }
+
+            xamlRoot.Changed += XamlRoot_Changed;
+        }
+    }
+
+    private void DetachXamlRoot()
+    {
+        if (_xamlRoot is not null)
+        {
+            _xamlRoot.Changed -= XamlRoot_Changed;
+            _xamlRoot = null;
+        }
+    }
+
+    private void XamlRoot_Changed(XamlRoot sender, XamlRootChangedEventArgs args)
+    {
+        if (_isDisposed || sender.RasterizationScale <= 0)
+        {
+            return;
+        }
+
+        _rasterizationScale = sender.RasterizationScale;
+        _maskedProxy?.UpdateParameters(_cornerRadiusDip, _rasterizationScale);
+    }
+}
+
+/// <summary>
 /// A configurable system backdrop for transient widget surfaces. The built-in
 /// MicaBackdrop and DesktopAcrylicBackdrop types do not expose their material
 /// strength, so this controller-backed implementation uses the same visual
@@ -27,10 +478,14 @@ internal readonly record struct WidgetMaterialBackdropAppearance(
 internal sealed partial class WidgetMaterialSystemBackdrop : SystemBackdrop, IDisposable
 {
     private WidgetMaterialBackdropAppearance _appearance;
-    private ICompositionSupportsSystemBackdrop? _target;
+    private ICompositionSupportsSystemBackdrop? _rawTarget;
+    private MaskedBackdropTargetProxy? _maskedProxy;
+    private XamlRoot? _xamlRoot;
     private SystemBackdropConfiguration? _configuration;
     private MicaController? _micaController;
     private DesktopAcrylicController? _acrylicController;
+    private double _cornerRadiusDip;
+    private double _rasterizationScale = 1.0;
     private bool _isSuspended;
     private bool _isDisposed;
     private readonly bool _closeElementTargetOnDisconnect;
@@ -49,17 +504,47 @@ internal sealed partial class WidgetMaterialSystemBackdrop : SystemBackdrop, IDi
             : SettingsService.IsAcrylicMaterial(materialType) &&
               WindowsCompatibilityService.SupportsDesktopAcrylic;
 
+    internal bool HasActiveController =>
+        _micaController is not null ||
+        _acrylicController is { IsClosed: false };
+
+    internal static bool ShouldReleaseStateOnTargetDisconnected(
+        object? currentRawTarget,
+        object? disconnectedTarget) =>
+        currentRawTarget is not null &&
+        ReferenceEquals(currentRawTarget, disconnectedTarget);
+
+    internal static bool ShouldSkipAppearanceUpdate(
+        WidgetMaterialBackdropAppearance currentAppearance,
+        WidgetMaterialBackdropAppearance requestedAppearance,
+        bool isDisposed,
+        bool isSuspended,
+        bool hasActiveController) =>
+        isDisposed ||
+        (currentAppearance == requestedAppearance && !isSuspended && hasActiveController);
+
+    internal void SetCornerRadius(double cornerRadiusDip)
+    {
+        _cornerRadiusDip = Math.Max(0.0, cornerRadiusDip);
+        _maskedProxy?.UpdateParameters(_cornerRadiusDip, _rasterizationScale);
+    }
+
     internal void UpdateAppearance(
         WidgetMaterialBackdropAppearance appearance)
     {
-        if (_isDisposed || (_appearance == appearance && !_isSuspended))
+        if (ShouldSkipAppearanceUpdate(
+                _appearance,
+                appearance,
+                _isDisposed,
+                _isSuspended,
+                HasActiveController))
         {
             return;
         }
 
         _appearance = appearance;
         _isSuspended = false;
-        if (_target is not null && _configuration is not null)
+        if (_maskedProxy is not null && _configuration is not null)
         {
             ApplyController();
         }
@@ -70,8 +555,30 @@ internal sealed partial class WidgetMaterialSystemBackdrop : SystemBackdrop, IDi
         XamlRoot xamlRoot)
     {
         base.OnTargetConnected(connectedTarget, xamlRoot);
+        if (_isDisposed)
+        {
+            if (_closeElementTargetOnDisconnect)
+            {
+                ElementBackdropTargetBridge.TryDisposeElementTargetLink(
+                    connectedTarget,
+                    "[WidgetMaterialBackdrop]");
+            }
+
+            return;
+        }
+
         DisposeControllers();
-        _target = connectedTarget;
+        DetachXamlRoot();
+        ElementBackdropTargetBridge.DisposeMaskedProxySafely(
+            ref _maskedProxy,
+            "[WidgetMaterialBackdrop]");
+
+        _rawTarget = connectedTarget;
+        AttachXamlRoot(xamlRoot);
+        _maskedProxy = new MaskedBackdropTargetProxy(
+            connectedTarget,
+            _cornerRadiusDip,
+            _rasterizationScale);
         _configuration = GetDefaultSystemBackdropConfiguration(
             connectedTarget,
             xamlRoot);
@@ -83,6 +590,12 @@ internal sealed partial class WidgetMaterialSystemBackdrop : SystemBackdrop, IDi
         XamlRoot xamlRoot)
     {
         base.OnDefaultSystemBackdropConfigurationChanged(target, xamlRoot);
+        if (xamlRoot is { RasterizationScale: > 0 } validRoot)
+        {
+            _rasterizationScale = validRoot.RasterizationScale;
+            _maskedProxy?.UpdateParameters(_cornerRadiusDip, _rasterizationScale);
+        }
+
         _configuration = GetDefaultSystemBackdropConfiguration(
             target,
             xamlRoot);
@@ -98,21 +611,27 @@ internal sealed partial class WidgetMaterialSystemBackdrop : SystemBackdrop, IDi
         }
         finally
         {
-            DisposeControllers();
+            if (ShouldReleaseStateOnTargetDisconnected(_rawTarget, disconnectedTarget))
+            {
+                DisposeControllers();
+                DetachXamlRoot();
+                _rawTarget = null;
+                _configuration = null;
+                ElementBackdropTargetBridge.DisposeMaskedProxySafely(
+                    ref _maskedProxy,
+                    "[WidgetMaterialBackdrop]");
+            }
+
             // SystemBackdropElement drops its native backdrop link after this
             // callback. Close it on its owning UI thread before C#/WinRT releases
             // the remaining projection references from the finalizer thread.
             // Window targets are owned by their windows and must not be closed here.
             if (_closeElementTargetOnDisconnect)
             {
-                try { disconnectedTarget.As<IDisposable>().Dispose(); }
-                catch (Exception ex)
-                {
-                    App.Log($"[WidgetMaterialBackdrop] Element target close failed: {ex}");
-                }
+                ElementBackdropTargetBridge.TryDisposeElementTargetLink(
+                    disconnectedTarget,
+                    "[WidgetMaterialBackdrop]");
             }
-            _target = null;
-            _configuration = null;
         }
     }
 
@@ -123,6 +642,7 @@ internal sealed partial class WidgetMaterialSystemBackdrop : SystemBackdrop, IDi
     {
         _isSuspended = true;
         DisposeControllers();
+        _maskedProxy?.ReleaseSuspendedResources();
     }
 
     public void Dispose()
@@ -130,6 +650,45 @@ internal sealed partial class WidgetMaterialSystemBackdrop : SystemBackdrop, IDi
         if (_isDisposed) return;
         _isDisposed = true;
         Suspend();
+        DetachXamlRoot();
+        _rawTarget = null;
+        ElementBackdropTargetBridge.DisposeMaskedProxySafely(
+            ref _maskedProxy,
+            "[WidgetMaterialBackdrop]");
+    }
+
+    private void AttachXamlRoot(XamlRoot? xamlRoot)
+    {
+        _xamlRoot = xamlRoot;
+        if (xamlRoot is not null)
+        {
+            if (xamlRoot.RasterizationScale > 0)
+            {
+                _rasterizationScale = xamlRoot.RasterizationScale;
+            }
+
+            xamlRoot.Changed += XamlRoot_Changed;
+        }
+    }
+
+    private void DetachXamlRoot()
+    {
+        if (_xamlRoot is not null)
+        {
+            _xamlRoot.Changed -= XamlRoot_Changed;
+            _xamlRoot = null;
+        }
+    }
+
+    private void XamlRoot_Changed(XamlRoot sender, XamlRootChangedEventArgs args)
+    {
+        if (_isDisposed || sender.RasterizationScale <= 0)
+        {
+            return;
+        }
+
+        _rasterizationScale = sender.RasterizationScale;
+        _maskedProxy?.UpdateParameters(_cornerRadiusDip, _rasterizationScale);
     }
 
     private void ApplyController()
@@ -162,7 +721,7 @@ internal sealed partial class WidgetMaterialSystemBackdrop : SystemBackdrop, IDi
 
     private void ApplyMicaController()
     {
-        if (_target is null ||
+        if (_maskedProxy is null ||
             _configuration is null ||
             !WindowsCompatibilityService.SupportsMica)
         {
@@ -177,7 +736,7 @@ internal sealed partial class WidgetMaterialSystemBackdrop : SystemBackdrop, IDi
         {
             _micaController = new MicaController();
             _micaController.SetSystemBackdropConfiguration(_configuration);
-            if (!_micaController.AddSystemBackdropTarget(_target))
+            if (!_micaController.AddSystemBackdropTarget(_maskedProxy))
             {
                 throw new InvalidOperationException(
                     "Mica backdrop target registration failed.");
@@ -205,7 +764,7 @@ internal sealed partial class WidgetMaterialSystemBackdrop : SystemBackdrop, IDi
 
     private void ApplyAcrylicController()
     {
-        if (_target is null ||
+        if (_maskedProxy is null ||
             _configuration is null ||
             !WindowsCompatibilityService.SupportsDesktopAcrylic)
         {
@@ -220,7 +779,7 @@ internal sealed partial class WidgetMaterialSystemBackdrop : SystemBackdrop, IDi
         {
             _acrylicController = new DesktopAcrylicController();
             _acrylicController.SetSystemBackdropConfiguration(_configuration);
-            if (!_acrylicController.AddSystemBackdropTarget(_target))
+            if (!_acrylicController.AddSystemBackdropTarget(_maskedProxy))
             {
                 throw new InvalidOperationException(
                     "Acrylic backdrop target registration failed.");

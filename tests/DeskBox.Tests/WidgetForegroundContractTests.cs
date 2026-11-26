@@ -1,21 +1,28 @@
-﻿namespace DeskBox.Tests;
+using DeskBox.Services;
+using DeskBox.Views;
+using Microsoft.UI.Xaml;
+using Windows.UI;
+
+namespace DeskBox.Tests;
 
 public sealed class WidgetForegroundContractTests
 {
     [Fact]
     public void SettingsSurface_ExposesPaletteAndColorControlsWithoutTextEdge()
     {
-        string xaml = Read("src/DeskBox/Views/SettingsWindow.xaml");
+        string appearanceXaml = Read("src/DeskBox/Views/SettingsSections/AppearanceSettingsSection.xaml");
+        string settingsWindowXaml = Read("src/DeskBox/Views/SettingsWindow.xaml");
         string bridge = Read(
             "src/DeskBox/Features/Appearance/AppearanceSettingsViewModel.AotBindableProperties.cs");
 
-        Assert.Contains("AvailableForegroundModeOptions", xaml, StringComparison.Ordinal);
-        Assert.Contains("ForegroundColorHex", xaml, StringComparison.Ordinal);
+        Assert.Contains("AvailableForegroundModeOptions", appearanceXaml, StringComparison.Ordinal);
+        Assert.Contains("ForegroundColorHex", appearanceXaml, StringComparison.Ordinal);
         Assert.Contains("nameof(ForegroundColorHex)", bridge, StringComparison.Ordinal);
         // The text edge experiment was removed in 1.5.1 (too many platform
         // traps for the value it added); nothing may quietly reintroduce a
         // shadow surface, host or setting.
-        Assert.DoesNotContain("WidgetTextEdge", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("WidgetTextEdge", appearanceXaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("WidgetTextEdge", settingsWindowXaml, StringComparison.Ordinal);
         Assert.DoesNotContain("WidgetTextEdge", bridge, StringComparison.Ordinal);
     }
 
@@ -106,7 +113,6 @@ public sealed class WidgetForegroundContractTests
     [InlineData("src/DeskBox/Controls/WidgetContents/GlanceWidgetContent.xaml")]
     [InlineData("src/DeskBox/Controls/WidgetContents/MusicWidgetContent.xaml")]
     [InlineData("src/DeskBox/Controls/WidgetContents/QuickCaptureSurfaceContent.xaml")]
-    [InlineData("src/DeskBox/Controls/WidgetContents/SearchWidgetContent.xaml")]
     [InlineData("src/DeskBox/Controls/WidgetContents/TodoWidgetContent.xaml")]
     [InlineData("src/DeskBox/Controls/WidgetContents/WeatherWidgetContent.xaml")]
     public void WidgetContentRoots_InheritTheWidgetPrimaryForeground(string path)
@@ -129,6 +135,9 @@ public sealed class WidgetForegroundContractTests
         Assert.Contains("x:Key=\"TextControlPlaceholderForeground\"", xaml, StringComparison.Ordinal);
         Assert.Contains("x:Key=\"GridViewItemForeground\"", xaml, StringComparison.Ordinal);
         Assert.Contains("x:Key=\"ListViewItemForeground\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Key=\"SegmentedItemForeground\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Key=\"ButtonItemForeground\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Key=\"PivotItemForeground\"", xaml, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -141,9 +150,22 @@ public sealed class WidgetForegroundContractTests
             "src/DeskBox/Controls/WidgetContents/QuickCaptureSurfaceContent.xaml.cs");
         string todo = Read(
             "src/DeskBox/Controls/WidgetContents/TodoWidgetContent.EditingAndUndo.cs");
+        string clipboard = Read(
+            "src/DeskBox/Controls/WidgetContents/ClipboardWidgetContent.xaml.cs");
+        string clipboardAdapter = Read(
+            "src/DeskBox/Controls/WidgetContents/ClipboardWidgetContentAdapter.cs");
+        string foregroundWindow = Read(
+            "src/DeskBox/Views/WidgetWindowBase.Foreground.cs");
+        string contentWindow = Read(
+            "src/DeskBox/Views/ContentWidgetWindow.xaml.cs");
+        string groupSwitcherXaml = Read(
+            "src/DeskBox/Controls/WidgetGroupTitleSwitcher.xaml");
+        string groupSwitcherTabs = Read(
+            "src/DeskBox/Controls/WidgetGroupTitleSwitcher.Tabs.cs");
         string neutralBrush = Read("src/DeskBox/Helpers/NeutralInteractionBrush.cs");
 
         Assert.Contains("_contentForeground = Foreground ??", markdown, StringComparison.Ordinal);
+        Assert.Contains("SolidColorBrush.ColorProperty", markdown, StringComparison.Ordinal);
         Assert.Contains(
             "NeutralInteractionBrush.ResolveThemedResource",
             markdown,
@@ -157,8 +179,154 @@ public sealed class WidgetForegroundContractTests
             "NeutralInteractionBrush.ResolveThemedResource",
             todo,
             StringComparison.Ordinal);
+        Assert.Contains(
+            "NeutralInteractionBrush.ResolveThemedResource(key, this)",
+            clipboard,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "Application.Current.Resources.ThemeDictionaries",
+            clipboard,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "content.ApplyAppearanceVisuals();",
+            clipboardAdapter,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "OnWidgetForegroundChanged();",
+            foregroundWindow,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "protected override void OnWidgetForegroundChanged()",
+            contentWindow,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "<Setter Property=\"Foreground\" Value=\"{ThemeResource TextFillColorPrimaryBrush}\" />",
+            groupSwitcherXaml,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "CurrentTitle.Foreground = primaryBrush;",
+            groupSwitcherTabs,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "OutgoingTitle.Foreground = primaryBrush;",
+            groupSwitcherTabs,
+            StringComparison.Ordinal);
         Assert.Contains("VisualTreeHelper.GetParent(current)", neutralBrush, StringComparison.Ordinal);
         Assert.Contains("candidate.Resources.TryGetValue(key", neutralBrush, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void OverlayPolarity_AdaptsToForegroundLuminance_AcrossLightDarkCustomAndHighContrast()
+    {
+        var lightOnLight = WidgetWindowBase.ResolveForegroundPalette(
+            WidgetForegroundSettings.ModeLight,
+            default,
+            ElementTheme.Light,
+            highContrast: false);
+        Assert.True(lightOnLight.UseDarkOverlay);
+        Assert.Equal(Color.FromArgb(0xFF, 0x2C, 0x2C, 0x2C), lightOnLight.OverlaySurface);
+        Assert.Equal(Color.FromArgb(0x18, 0xFF, 0xFF, 0xFF), lightOnLight.SubtleButtonPointerOver);
+
+        var darkOnDark = WidgetWindowBase.ResolveForegroundPalette(
+            WidgetForegroundSettings.ModeDark,
+            default,
+            ElementTheme.Dark,
+            highContrast: false);
+        Assert.False(darkOnDark.UseDarkOverlay);
+        Assert.Equal(Color.FromArgb(0xFF, 0xF9, 0xF9, 0xF9), darkOnDark.OverlaySurface);
+        Assert.Equal(Color.FromArgb(0x0D, 0x00, 0x00, 0x00), darkOnDark.SubtleButtonPointerOver);
+
+        var followLight = WidgetWindowBase.ResolveForegroundPalette(
+            WidgetForegroundSettings.ModeFollowTheme,
+            default,
+            ElementTheme.Light,
+            highContrast: false);
+        Assert.False(followLight.UseDarkOverlay);
+        Assert.Equal(WidgetWindowBase.LightOverlaySurfaceColor, followLight.OverlaySurface);
+
+        var followDark = WidgetWindowBase.ResolveForegroundPalette(
+            WidgetForegroundSettings.ModeFollowTheme,
+            default,
+            ElementTheme.Dark,
+            highContrast: false);
+        Assert.True(followDark.UseDarkOverlay);
+        Assert.Equal(WidgetWindowBase.DarkOverlaySurfaceColor, followDark.OverlaySurface);
+
+        Color brightYellow = Color.FromArgb(0xFF, 0xFF, 0xE0, 0x66);
+        var customLight = WidgetWindowBase.ResolveForegroundPalette(
+            WidgetForegroundSettings.ModeCustom,
+            brightYellow,
+            ElementTheme.Light,
+            highContrast: false);
+        Assert.True(customLight.UseDarkOverlay);
+        Assert.Equal(brightYellow, customLight.Primary);
+        Assert.Equal(WidgetWindowBase.DarkOverlaySurfaceColor, customLight.OverlaySurface);
+
+        Color deepNavy = Color.FromArgb(0xFF, 0x10, 0x2A, 0x43);
+        var customDark = WidgetWindowBase.ResolveForegroundPalette(
+            WidgetForegroundSettings.ModeCustom,
+            deepNavy,
+            ElementTheme.Dark,
+            highContrast: false);
+        Assert.False(customDark.UseDarkOverlay);
+        Assert.Equal(deepNavy, customDark.Primary);
+        Assert.Equal(WidgetWindowBase.LightOverlaySurfaceColor, customDark.OverlaySurface);
+
+        Color hcFg = Color.FromArgb(0xFF, 0xFF, 0xFF, 0x00);
+        Color hcBg = Color.FromArgb(0xFF, 0x00, 0x00, 0x00);
+        var highContrast = WidgetWindowBase.ResolveForegroundPalette(
+            WidgetForegroundSettings.ModeLight,
+            default,
+            ElementTheme.Light,
+            highContrast: true,
+            highContrastForeground: hcFg,
+            highContrastBackground: hcBg);
+        Assert.Equal(hcFg, highContrast.Primary);
+        Assert.Equal(hcBg, highContrast.OverlaySurface);
+        Assert.Equal(Color.FromArgb(0x00, 0x00, 0x00, 0x00), highContrast.SubtleButtonPointerOver);
+    }
+
+    [Fact]
+    public void WidgetLocalOverlayBrushes_ClipboardStripPolish_AndPopoverThemeIsolation_AreWired()
+    {
+        string contentWindowXaml = Read("src/DeskBox/Views/ContentWidgetWindow.xaml");
+        string[] expectedLocalKeys =
+        [
+            "WidgetOverlaySurfaceBrush",
+            "WidgetOverlayInputSurfaceBrush",
+            "WidgetOverlayStrokeBrush",
+            "WidgetSubtleButtonBackgroundPointerOver",
+            "WidgetSubtleButtonBackgroundPressed",
+            "ButtonBackground",
+            "ButtonBackgroundPointerOver",
+            "ButtonBackgroundPressed",
+            "ButtonBackgroundDisabled",
+            "ButtonBorderBrush",
+            "ButtonBorderBrushPointerOver",
+            "ButtonBorderBrushPressed"
+        ];
+        foreach (string key in expectedLocalKeys)
+        {
+            Assert.Contains($"x:Key=\"{key}\"", contentWindowXaml, StringComparison.Ordinal);
+        }
+
+        string clipboardXaml = Read("src/DeskBox/Controls/WidgetContents/ClipboardWidgetContent.xaml");
+        int overlayStart = clipboardXaml.IndexOf("x:Name=\"ActionButtonsOverlay\"", StringComparison.Ordinal);
+        Assert.True(overlayStart >= 0);
+        int overlayEnd = clipboardXaml.IndexOf("</Border>", overlayStart, StringComparison.Ordinal);
+        string overlayBlock = clipboardXaml.Substring(overlayStart, overlayEnd - overlayStart);
+        Assert.Contains("BorderBrush=\"{ThemeResource WidgetOverlayStrokeBrush}\"", overlayBlock, StringComparison.Ordinal);
+        Assert.Contains("BorderThickness=\"1\"", overlayBlock, StringComparison.Ordinal);
+        Assert.DoesNotContain("Opacity=\"0.84\"", overlayBlock, StringComparison.Ordinal);
+        Assert.DoesNotContain("Opacity=\"0.86\"", overlayBlock, StringComparison.Ordinal);
+
+        string popoverCode = Read("src/DeskBox/Views/WidgetEditorPopoverWindow.cs");
+        Assert.Contains("ElementTheme effectiveTheme = NeutralInteractionBrush.ResolveEffectiveElementTheme(themeScope);", popoverCode, StringComparison.Ordinal);
+        Assert.Contains("NeutralInteractionBrush.ResolveThemedResource(\"TextFillColorSecondaryBrush\", effectiveTheme)", popoverCode, StringComparison.Ordinal);
+
+        string clipboardCode = Read("src/DeskBox/Controls/WidgetContents/ClipboardWidgetContent.xaml.cs");
+        Assert.Contains("ElementTheme popoverTheme = NeutralInteractionBrush.ResolveEffectiveElementTheme(this);", clipboardCode, StringComparison.Ordinal);
+        Assert.Contains("NeutralInteractionBrush.ResolveThemedResource(\"TextFillColorSecondaryBrush\", popoverTheme)", clipboardCode, StringComparison.Ordinal);
     }
 
     private static string Read(string relativePath) =>

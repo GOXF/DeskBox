@@ -78,6 +78,39 @@ public sealed class DeskBoxDiagnosticsBundleServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task ExportAsync_IncludesSanitizedUpdaterLogWhenPresent()
+    {
+        Directory.CreateDirectory(_temporaryRoot);
+        string logPath = Path.Combine(_temporaryRoot, "DeskBox.log");
+        string updaterLogPath = Path.Combine(_temporaryRoot, "DeskBox.Updater.log");
+        string userName = Environment.UserName;
+        string privatePath = $@"C:\Users\{userName}\AppData\Local\DeskBox\updates\1.6.0\DeskBox_Setup_1.6.0_x64.exe";
+        await File.WriteAllTextAsync(logPath, "[Startup] ready=True\n");
+        await File.WriteAllTextAsync(
+            updaterLogPath,
+            $"2026-11-24 10:00:00.000 +08:00 Starting installer: {privatePath}\n" +
+            "2026-11-24 10:00:01.000 +08:00 Installer exited with code 1 (elevationRequired=True, logWritten=False, validateAdminCodeSignatures=True).\n");
+        var service = new DeskBoxDiagnosticsBundleService();
+
+        string archivePath = await service.ExportAsync(
+            _temporaryRoot,
+            CreateSnapshot(),
+            logPath);
+
+        Assert.True(File.Exists(archivePath));
+        using ZipArchive archive = ZipFile.OpenRead(archivePath);
+        Assert.Contains(
+            archive.Entries,
+            entry => string.Equals(entry.FullName, "DeskBox.Updater-sanitized.log", StringComparison.Ordinal));
+
+        string updaterLog = await ReadEntryAsync(archive, "DeskBox.Updater-sanitized.log");
+        Assert.DoesNotContain(userName, updaterLog, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("DeskBox_Setup_1.6.0_x64.exe", updaterLog, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("<PATH>", updaterLog, StringComparison.Ordinal);
+        Assert.Contains("validateAdminCodeSignatures=True", updaterLog, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void SanitizeDiagnosticsValue_KeepsImageNameButRedactsDirectories()
     {
         string value = $@"C:\Users\{Environment.UserName}\AppData\Local\DeskBox\DeskBox.exe";
@@ -171,6 +204,88 @@ public sealed class DeskBoxDiagnosticsBundleServiceTests : IDisposable
 
         Assert.Contains("HRESULT=0x80004005", sanitized, StringComparison.Ordinal);
         Assert.Contains("execute=0x80004005.", sanitized, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SanitizeLog_PreservesIntegerCountsWhileRedactingNumericSecrets()
+    {
+        string source =
+            "[DragProtocol] stage=PackagePrepared paths=1 pathCount=4 file=2 failedItems=0 " +
+            "token=123456 password=999999 pathSample='C:\\Users\\simon\\Desktop\\a.txt'";
+
+        string sanitized = DeskBoxDiagnosticsBundleService.SanitizeLog(source);
+
+        Assert.Contains("paths=1", sanitized, StringComparison.Ordinal);
+        Assert.Contains("pathCount=4", sanitized, StringComparison.Ordinal);
+        Assert.Contains("file=2", sanitized, StringComparison.Ordinal);
+        Assert.Contains("failedItems=0", sanitized, StringComparison.Ordinal);
+        Assert.Contains("token=<REDACTED>", sanitized, StringComparison.Ordinal);
+        Assert.Contains("password=<REDACTED>", sanitized, StringComparison.Ordinal);
+        Assert.Contains("pathSample=<REDACTED>", sanitized, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SanitizeStudioArchiveJson_PreservesValidJsonAndJsRegexLiterals_WhileRedactingPathsAndSecrets()
+    {
+        const string rawJson = """
+            {
+              "schemaVersion": 1,
+              "entries": [
+                {
+                  "entryId": "1a764b590895",
+                  "createdAtUtc": "2026-11-23T03:00:00Z",
+                  "eventKind": "studio-commit",
+                  "userPrompt": "Read C:\\Users\\alice\\Desktop\\secret.txt and call https://api.example.com/v1?api_key=abc123",
+                  "summaryOrError": "Loaded /Users/alice/.config/token.json and \\\\corp-fs\\private\\plan.md",
+                  "diagnostics": [
+                    "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+                  ],
+                  "manifestJson": "{\n  \"id\": \"deskbox.todo-agenda\",\n  \"apiKey\": \"sk-1234567890abcdef123456\",\n  \"icon\": \"C:\\\\Users\\\\alice\\\\icon.png\",\n  \"when\": \"${$computed.hasParsedTokens == 'true'}\"\n}",
+                  "logicJs": "function parse(iso) {\n  const m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(iso);\n  const tokenOffset = m ? m.index + 1 : 0;\n  const secret = \"my-super-secret-value\";\n  const localFile = \"D:\\\\private\\\\notes.txt\";\n  return String(iso).replace(/\\s+/g, ' ') + tokenOffset;\n}"
+                }
+              ]
+            }
+            """;
+
+        string sanitized = DeskBoxDiagnosticsBundleService.SanitizeStudioArchiveJson(rawJson);
+
+        using System.Text.Json.JsonDocument parsed = System.Text.Json.JsonDocument.Parse(sanitized);
+        System.Text.Json.JsonElement entry = parsed.RootElement.GetProperty("entries")[0];
+        string logicJs = entry.GetProperty("logicJs").GetString()!;
+        string manifestJson = entry.GetProperty("manifestJson").GetString()!;
+        string prompt = entry.GetProperty("userPrompt").GetString()!;
+        string summary = entry.GetProperty("summaryOrError").GetString()!;
+        string diag = entry.GetProperty("diagnostics")[0].GetString()!;
+
+        Assert.Contains(@"/^(\d{4})-(\d{2})-(\d{2})$/", logicJs, StringComparison.Ordinal);
+        Assert.Contains(@"/\s+/g", logicJs, StringComparison.Ordinal);
+        Assert.Contains("const tokenOffset = m ? m.index + 1 : 0;", logicJs, StringComparison.Ordinal);
+        Assert.Contains("secret = \"<REDACTED>\"", logicJs, StringComparison.Ordinal);
+        Assert.DoesNotContain("my-super-secret-value", logicJs, StringComparison.Ordinal);
+        Assert.DoesNotContain("D:\\private\\notes.txt", logicJs, StringComparison.Ordinal);
+
+        using System.Text.Json.JsonDocument parsedManifest = System.Text.Json.JsonDocument.Parse(manifestJson);
+        Assert.Equal("<REDACTED>", parsedManifest.RootElement.GetProperty("apiKey").GetString());
+        Assert.Equal("<PATH>", parsedManifest.RootElement.GetProperty("icon").GetString());
+        Assert.Equal("${$computed.hasParsedTokens == 'true'}", parsedManifest.RootElement.GetProperty("when").GetString());
+
+        Assert.Contains("<PATH>", prompt, StringComparison.Ordinal);
+        Assert.Contains("https://api.example.com/v1?<QUERY_REDACTED>", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("abc123", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("corp-fs", summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("/Users/alice", summary, StringComparison.Ordinal);
+        Assert.Equal("<SECRET>", diag);
+    }
+
+    [Fact]
+    public void SanitizeStudioArchiveJson_FailsClosedToValidEmptyArchiveOnCorruptJson()
+    {
+        string sanitized = DeskBoxDiagnosticsBundleService.SanitizeStudioArchiveJson(
+            "{\"schemaVersion\":1,\"entries\":[{\"secret\":\"sk-1234567890abcdef123456\"");
+
+        using System.Text.Json.JsonDocument parsed = System.Text.Json.JsonDocument.Parse(sanitized);
+        Assert.Equal(0, parsed.RootElement.GetProperty("entries").GetArrayLength());
+        Assert.DoesNotContain("sk-1234567890abcdef123456", sanitized, StringComparison.Ordinal);
     }
 
     private static DeskBoxDiagnosticSnapshot CreateSnapshot()

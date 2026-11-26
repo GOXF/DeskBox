@@ -52,6 +52,42 @@ public sealed class MappedOrganizeReorganizeTests
     }
 
     [Fact]
+    public void KeptOptInHistory_PreservesSessionExclusionAcrossRefreshAndResetsForFreshPreview()
+    {
+        DesktopOrganizationFileSnapshot folder = new(
+            D("KeptFolder"), "KeptFolder", string.Empty, 0, DateTime.UnixEpoch,
+            DesktopOrganizationCategoryIds.Other, null, DesktopOrganizationExclusionReason.Folder, IsDirectory: true);
+        var history = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        IReadOnlyCollection<string> kept = [folder.SourcePath];
+        var session = new DesktopOrganizationWorkbenchSession(
+            (_, optionalPaths) => BuildPlan(optionalPaths.Contains(folder.SourcePath), folder),
+            () => new Dictionary<string, WidgetConfig>(StringComparer.Ordinal));
+        session.SetInitialPlan(BuildPlan(false, folder));
+
+        IReadOnlyList<string> initialOptIns = MappedOrganizeReorganizePolicy.SelectKeptOptIns(
+            [(folder.SourcePath, folder.CanOptIn)], kept, history);
+        Assert.Equal(new[] { folder.SourcePath }, initialOptIns);
+        session.IncludeItems(initialOptIns);
+        Assert.Contains(session.EffectivePlan!.Targets.SelectMany(target => target.Items), item => item.SourcePath == folder.SourcePath);
+
+        session.ExcludeItems([folder.SourcePath]);
+        Assert.Empty(session.OptionalIncludedPaths);
+
+        // A preserving refresh shares the same preview-lifetime history and
+        // therefore cannot undo the user's later return-to-tray choice.
+        IReadOnlyList<string> refreshOptIns = MappedOrganizeReorganizePolicy.SelectKeptOptIns(
+            [(folder.SourcePath, folder.CanOptIn)], kept, history);
+        session.IncludeItems(refreshOptIns);
+        Assert.Empty(refreshOptIns);
+        Assert.Empty(session.OptionalIncludedPaths);
+        Assert.DoesNotContain(session.EffectivePlan!.Targets.SelectMany(target => target.Items), item => item.SourcePath == folder.SourcePath);
+
+        history.Clear(); // ResetPreviewState clears this only for a fresh preview.
+        Assert.Single(MappedOrganizeReorganizePolicy.SelectKeptOptIns(
+            [(folder.SourcePath, folder.CanOptIn)], kept, history));
+    }
+
+    [Fact]
     public void SelectKeptOptIns_HandlesEmptyInput()
     {
         var applied = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -102,7 +138,10 @@ public sealed class MappedOrganizeReorganizeTests
     public void Wiring_MenusAndPreviewHook()
     {
         string preview = File.ReadAllText(TestPaths.FromRepository("src/DeskBox/Controls/DesktopOrganizationTaskView.xaml.cs"));
-        Assert.Contains("IncludeKeptOnDesktopItems(scanned, freshPreview: previous is null);", preview, StringComparison.Ordinal);
+        Assert.Contains("IncludeKeptOnDesktopItems(scanned);", preview, StringComparison.Ordinal);
+        Assert.Contains("_keptOnDesktopOptInsApplied.Clear()", preview, StringComparison.Ordinal);
+        string mappedPreview = File.ReadAllText(TestPaths.FromRepository("src/DeskBox/Controls/DesktopOrganizationTaskView.MappedOrganize.cs"));
+        Assert.Contains("_keptOnDesktopOptInsApplied", mappedPreview, StringComparison.Ordinal);
 
         string titleMenu = File.ReadAllText(TestPaths.FromRepository("src/DeskBox/Views/ContentWidgetWindow.Commands.cs"));
         Assert.Contains("AppendMappedOrganizeMoreMenuItems(flyout);", titleMenu, StringComparison.Ordinal);
@@ -113,5 +152,28 @@ public sealed class MappedOrganizeReorganizeTests
 
         Assert.Equal("一键整理桌面", ForkOrganizeModeText.Get(LocalizationService.LanguageChinese, ForkOrganizeModeText.Key.MenuReorganizeDesktop));
         Assert.Equal("Organize desktop", ForkOrganizeModeText.Get("en-US", ForkOrganizeModeText.Key.MenuReorganizeDesktop));
+    }
+
+    private static DesktopOrganizationPlan BuildPlan(bool included, DesktopOrganizationFileSnapshot item)
+    {
+        DesktopOrganizationFileSnapshot effective = included
+            ? item with { ExclusionReason = DesktopOrganizationExclusionReason.None }
+            : item;
+        return new DesktopOrganizationPlan
+        {
+            SourceItems = [item],
+            Targets = included
+                ? [new DesktopOrganizationTargetPlan
+                {
+                    SourceBucketId = "other",
+                    CategoryId = DesktopOrganizationCategoryIds.Other,
+                    TargetWidgetId = "other",
+                    SuggestedDisplayName = "Other",
+                    CreatesWidget = true,
+                    Items = [effective]
+                }]
+                : [],
+            ExcludedItems = included ? [] : [effective]
+        };
     }
 }

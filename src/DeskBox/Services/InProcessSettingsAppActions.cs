@@ -28,15 +28,20 @@ public sealed class InProcessSettingsAppActions : ISettingsAppActions
         // facade event, not the App event.
         _app.DisplayTopologyChanged += OnDisplayTopologyChanged;
         _app.ScreenHomeChanged += OnScreenHomeChanged;
+        StartupService.StateChanged += OnAutoStartStateChanged;
     }
 
     public event Action? DisplayTopologyChanged;
 
     public event Action? ScreenHomeChanged;
 
+    public event Action? AutoStartStateChanged;
+
     private void OnDisplayTopologyChanged() => DisplayTopologyChanged?.Invoke();
 
     private void OnScreenHomeChanged() => ScreenHomeChanged?.Invoke();
+
+    private void OnAutoStartStateChanged() => AutoStartStateChanged?.Invoke();
 
     public Task ShutdownForRestartAsync() => _app.ShutdownForRestartAsync();
 
@@ -46,7 +51,34 @@ public sealed class InProcessSettingsAppActions : ISettingsAppActions
         AppRelaunchService.ScheduleAfterCurrentProcessExit();
 
     public bool TryRelaunchAsExplorerUser(string arguments) =>
-        DragDropPermissionService.TryRelaunchAsExplorerUser(arguments);
+        DragDropPermissionService.TryRelaunchAsExplorerUser(
+            NormalizeAwaitParentExitArguments(arguments, Environment.ProcessId));
+
+    internal static string NormalizeAwaitParentExitArguments(string? arguments, int currentProcessId)
+    {
+        if (string.IsNullOrWhiteSpace(arguments))
+        {
+            return string.Empty;
+        }
+
+        const string flag = "--await-parent-exit ";
+        string trimmed = arguments.Trim();
+        if (!trimmed.StartsWith(flag, StringComparison.Ordinal))
+        {
+            return trimmed;
+        }
+
+        string rest = trimmed[flag.Length..].TrimStart();
+        int spaceIndex = rest.IndexOf(' ');
+        string pidToken = spaceIndex >= 0 ? rest[..spaceIndex] : rest;
+        if (!int.TryParse(pidToken, out _))
+        {
+            return trimmed;
+        }
+
+        string suffix = spaceIndex >= 0 ? rest[spaceIndex..] : string.Empty;
+        return $"{flag}{currentProcessId}{suffix}";
+    }
 
     public void ShowOnboarding(bool resumeProgress = false) =>
         _app.ShowOnboarding(resumeProgress);
@@ -66,17 +98,26 @@ public sealed class InProcessSettingsAppActions : ISettingsAppActions
             manifestLoader,
             (IntPtr)ownerWindowHandle);
 
+    public Task<AppUpdateManifest?> FetchReleaseNotesManifestAsync(
+        string version,
+        CancellationToken cancellationToken) =>
+        _app.LoadReleaseNotesManifestForVersionAsync(version, cancellationToken);
+
     public void UpdateTrayIcon() => _app.UpdateTrayIcon();
 
-    public void SetSnapEnabled(bool value) => _app.ResizeGuideOverlay.IsSnapEnabled = value;
+    public void SetSnapEnabled(bool value) =>
+        DeskBox.Platform.UiDispatch.RunOrDefer(() => _app.ResizeGuideOverlay.IsSnapEnabled = value);
 
-    public void SetSnapSpacingDips(double value) => _app.ResizeGuideOverlay.SnapSpacingDips = value;
+    public void SetSnapSpacingDips(double value) =>
+        DeskBox.Platform.UiDispatch.RunOrDefer(() => _app.ResizeGuideOverlay.SnapSpacingDips = value);
 
     public void BringSettingsWindowToRaisedBand(nint windowHandle, string reason) =>
-        _app.WidgetManager?.BringAuxiliaryWindowToFront((IntPtr)windowHandle, reason);
+        DeskBox.Platform.UiDispatch.RunOrDefer(
+            () => _app.WidgetManager?.BringAuxiliaryWindowToFront((IntPtr)windowHandle, reason));
 
     public void ReleaseRaisedBandGuest(nint windowHandle, string reason) =>
-        _app.WidgetManager?.ReleaseRaisedBandGuest((IntPtr)windowHandle, reason);
+        DeskBox.Platform.UiDispatch.RunOrDefer(
+            () => _app.WidgetManager?.ReleaseRaisedBandGuest((IntPtr)windowHandle, reason));
 
     public void ScheduleLightMemoryCleanup() => App.ScheduleLightMemoryCleanup();
 
@@ -97,7 +138,7 @@ public sealed class InProcessSettingsAppActions : ISettingsAppActions
 
     public async Task<string> ExportDiagnosticBundleAsync(string destinationDirectory)
     {
-        DeskBoxDiagnosticSnapshot snapshot = _app.CreateDiagnosticSnapshot();
+        DeskBoxDiagnosticSnapshot snapshot = await _app.CreateDiagnosticSnapshotSafeAsync(TimeSpan.FromSeconds(2));
         return await _app.DiagnosticsBundleService.ExportAsync(
             destinationDirectory,
             snapshot,
@@ -125,13 +166,43 @@ public sealed class InProcessSettingsAppActions : ISettingsAppActions
         }
     }
 
-    public AppRuntimeHealthSnapshot? GetRuntimeHealthSnapshot() =>
-        _app.DiagnosticsService?.GetRuntimeHealthSnapshot(
-            _app.EverythingSearchService,
-            _app.WidgetManager?.GetFolderWatcherHealthSnapshots());
+    public AppRuntimeHealthSnapshot? GetRuntimeHealthSnapshot()
+    {
+        if (DeskBox.Platform.UiDispatch.HasAccess)
+        {
+            return _app.DiagnosticsService?.GetRuntimeHealthSnapshot(
+                _app.EverythingSearchService,
+                _app.WidgetManager?.GetFolderWatcherHealthSnapshots());
+        }
+
+        try
+        {
+            IReadOnlyList<FolderWatcherHealthSnapshot>? watcherSnapshots = DeskBox.Platform.UiDispatch
+                .RunAsync(() => Task.FromResult<IReadOnlyList<FolderWatcherHealthSnapshot>?>(
+                    _app.WidgetManager?.GetFolderWatcherHealthSnapshots()))
+                .WaitAsync(TimeSpan.FromSeconds(2))
+                .GetAwaiter()
+                .GetResult();
+            return _app.DiagnosticsService?.GetRuntimeHealthSnapshot(
+                _app.EverythingSearchService,
+                watcherSnapshots);
+        }
+        catch (Exception ex) when (ex is TimeoutException or OperationCanceledException or InvalidOperationException)
+        {
+            return _app.DiagnosticsService?.GetRuntimeHealthSnapshot(
+                _app.EverythingSearchService,
+                null);
+        }
+    }
 
     public Task ForceExternalStateRecoveryAsync() =>
-        _app.ForceExternalStateRecoveryAsync();
+        DeskBox.Platform.UiDispatch.RunAsync(_app.ForceExternalStateRecoveryAsync);
+
+    public Task<StartupOperationResult> GetAutoStartStatusAsync() =>
+        _app.GetAutoStartStatusAsync();
+
+    public Task<StartupOperationResult> SetAutoStartEnabledAsync(bool enabled) =>
+        _app.SetAutoStartEnabledAsync(enabled);
 
     public DragDropPermissionDiagnostic DiagnoseDragDropPermissions() =>
         DragDropPermissionService.Diagnose(_localizationService);

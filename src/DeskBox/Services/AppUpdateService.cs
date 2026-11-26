@@ -12,15 +12,20 @@ namespace DeskBox.Services;
 
 public sealed partial class AppUpdateService : IAppUpdateService
 {
-    // GOXF fork: update sources live in ForkUpdateConfig (fork releases only).
+    // GOXF fork: its release channel is separate from upstream's stable feed.
     public const string DefaultManifestUrl = ForkUpdateConfig.ManifestUrl;
     public const string DefaultGitHubLatestReleaseApiUrl = ForkUpdateConfig.ForkLatestReleaseApiUrl;
     public const string DefaultManualDownloadUrl = ForkUpdateConfig.ForkReleasesPageUrl;
+    private const string BlockedVersionsFileName = "blocked-versions.txt";
 
+    private static HashSet<string> s_sharedBlockedVersions = new(StringComparer.OrdinalIgnoreCase);
     private readonly HttpClient _httpClient;
     private readonly string _manifestUrl;
     private readonly string _githubLatestReleaseApiUrl;
     private readonly string _updateRootPath;
+    private readonly string _blockedVersionsPath;
+    private readonly object _blockedVersionsGate = new();
+    private HashSet<string>? _cachedBlockedVersions;
 
     // Display-only manifest fetches are static calls (no service instance on
     // surfaces like the release-notes window), so they share one client
@@ -29,7 +34,12 @@ public sealed partial class AppUpdateService : IAppUpdateService
 
     private static HttpClient CreateContentHttpClient()
     {
-        var client = new HttpClient
+        var client = new HttpClient(new SocketsHttpHandler
+        {
+            PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+            PooledConnectionIdleTimeout = TimeSpan.FromMinutes(1),
+            AutomaticDecompression = System.Net.DecompressionMethods.All
+        })
         {
             Timeout = TimeSpan.FromSeconds(10)
         };
@@ -43,10 +53,33 @@ public sealed partial class AppUpdateService : IAppUpdateService
         string? updateRootPath = null,
         string? githubLatestReleaseApiUrl = null)
     {
-        _httpClient = httpClient ?? new HttpClient();
-        _httpClient.Timeout = TimeSpan.FromSeconds(20);
-        _httpClient.DefaultRequestHeaders.UserAgent.Clear();
-        _httpClient.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("DeskBox", GetCurrentAppVersion()));
+        if (httpClient is null)
+        {
+            _httpClient = new HttpClient(new SocketsHttpHandler
+            {
+                PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(1),
+                AutomaticDecompression = System.Net.DecompressionMethods.All
+            })
+            {
+                Timeout = TimeSpan.FromSeconds(20)
+            };
+            _httpClient.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("DeskBox", GetCurrentAppVersion()));
+        }
+        else
+        {
+            _httpClient = httpClient;
+            if (_httpClient.DefaultRequestHeaders.UserAgent.Count == 0)
+            {
+                try
+                {
+                    _httpClient.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("DeskBox", GetCurrentAppVersion()));
+                }
+                catch (InvalidOperationException)
+                {
+                }
+            }
+        }
 
         _manifestUrl = string.IsNullOrWhiteSpace(manifestUrl)
             ? DefaultManifestUrl
@@ -57,6 +90,7 @@ public sealed partial class AppUpdateService : IAppUpdateService
         _updateRootPath = string.IsNullOrWhiteSpace(updateRootPath)
             ? DeskBoxDataPathService.Current.UpdatesDirectory
             : updateRootPath;
+        _blockedVersionsPath = Path.Combine(_updateRootPath, BlockedVersionsFileName);
     }
 
     public AppUpdateCheckResult? LastCheckResult { get; private set; }
@@ -67,6 +101,7 @@ public sealed partial class AppUpdateService : IAppUpdateService
 
     private string? _lastDownloadedInstallerPath;
     private string? _lastDownloadedVersion;
+    private string? _lastDownloadedSha256;
     private int _downloadInProgress;
     private volatile bool _installerHelperArmed;
 
@@ -77,6 +112,7 @@ public sealed partial class AppUpdateService : IAppUpdateService
     {
         _lastDownloadedInstallerPath = null;
         _lastDownloadedVersion = null;
+        _lastDownloadedSha256 = null;
     }
 
     // Retiring a downloaded installer must also reclaim its files: each
@@ -124,17 +160,26 @@ public sealed partial class AppUpdateService : IAppUpdateService
     // running version's directory (still a retry source until the first
     // check retires it), the updater helper, the offline release-notes
     // cache, and the current version's installer log.
-    public void PruneStaleInstallerDirectories()
+    public void PruneStaleInstallerDirectories() =>
+        PruneStaleInstallerDirectories(GetCurrentAppVersion());
+
+    internal void PruneStaleInstallerDirectories(string currentVersion)
     {
         try
         {
-            string currentSegment = SanitizePathSegment(GetCurrentAppVersion());
+            if (string.IsNullOrWhiteSpace(_updateRootPath) ||
+                !Directory.Exists(_updateRootPath))
+            {
+                return;
+            }
+
+            string currentSegment = SanitizePathSegment(currentVersion);
             foreach (string directory in Directory.EnumerateDirectories(_updateRootPath))
             {
                 string name = Path.GetFileName(directory);
-                if (string.Equals(name, currentSegment, StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(name, "helper", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(name, "release-notes", StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(name, "helper", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(name, "release-notes", StringComparison.OrdinalIgnoreCase) ||
+                    (IsRemoteVersionNewer(currentVersion, name) && !IsKnownBlockedVersion(name)))
                 {
                     continue;
                 }
@@ -155,10 +200,13 @@ public sealed partial class AppUpdateService : IAppUpdateService
                          _updateRootPath,
                          "installer-*.log"))
             {
+                string fileName = Path.GetFileName(logFile);
                 if (string.Equals(
-                        Path.GetFileName(logFile),
+                        fileName,
                         currentLogName,
-                        StringComparison.OrdinalIgnoreCase))
+                        StringComparison.OrdinalIgnoreCase) ||
+                    (TryExtractInstallerLogVersion(fileName, out string logVersion) &&
+                     IsRemoteVersionNewer(currentVersion, logVersion)))
                 {
                     continue;
                 }
@@ -166,7 +214,7 @@ public sealed partial class AppUpdateService : IAppUpdateService
                 try
                 {
                     File.Delete(logFile);
-                    App.Log($"[Update] Pruned stale installer log '{Path.GetFileName(logFile)}'");
+                    App.Log($"[Update] Pruned stale installer log '{fileName}'");
                 }
                 catch (Exception ex)
                 {
@@ -178,6 +226,22 @@ public sealed partial class AppUpdateService : IAppUpdateService
         {
             App.Log($"[Update] Failed to sweep the updates root: {ex.Message}");
         }
+    }
+
+    private static bool TryExtractInstallerLogVersion(string fileName, out string version)
+    {
+        const string Prefix = "installer-";
+        const string Suffix = ".log";
+        if (fileName.StartsWith(Prefix, StringComparison.OrdinalIgnoreCase) &&
+            fileName.EndsWith(Suffix, StringComparison.OrdinalIgnoreCase) &&
+            fileName.Length > Prefix.Length + Suffix.Length)
+        {
+            version = fileName[Prefix.Length..^Suffix.Length];
+            return true;
+        }
+
+        version = string.Empty;
+        return false;
     }
 
     public string ManifestUrl => _manifestUrl;
@@ -225,6 +289,17 @@ public sealed partial class AppUpdateService : IAppUpdateService
                 stream,
                 AppUpdateJsonContext.Default.UpdateManifest,
                 cancellationToken);
+            if (manifest is { SchemaVersion: 1 })
+            {
+                RecordBlockedVersions(manifest.BlockedVersions);
+                if (manifest.PushPaused ||
+                    manifest.IsVersionBlocked(manifest.Version) ||
+                    IsKnownBlockedVersion(manifest.Version))
+                {
+                    return new AppUpdateCheckResult(AppUpdateCheckStatus.UpToDate, currentVersion, manifest);
+                }
+            }
+
             if (manifest is null ||
                 !TrySelectInstallerForArchitecture(
                     manifest,
@@ -239,13 +314,19 @@ public sealed partial class AppUpdateService : IAppUpdateService
                     "The update manifest is missing installer metadata for this processor architecture.");
             }
 
-            return IsRemoteVersionNewer(currentVersion, manifest.Version)
+            bool shouldOfferUpdate =
+                !manifest.PushPaused &&
+                !manifest.IsVersionBlocked(manifest.Version) &&
+                !IsKnownBlockedVersion(manifest.Version) &&
+                IsRemoteVersionNewer(currentVersion, manifest.Version);
+
+            return shouldOfferUpdate
                 ? new AppUpdateCheckResult(AppUpdateCheckStatus.UpdateAvailable, currentVersion, manifest)
                 : new AppUpdateCheckResult(AppUpdateCheckStatus.UpToDate, currentVersion, manifest);
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException or IOException)
         {
-            return new AppUpdateCheckResult(AppUpdateCheckStatus.Failed, currentVersion, errorMessage: ex.Message);
+            return new AppUpdateCheckResult(AppUpdateCheckStatus.Failed, currentVersion, errorMessage: FormatUpdateCheckErrorMessage(ex));
         }
     }
 
@@ -271,14 +352,53 @@ public sealed partial class AppUpdateService : IAppUpdateService
                     "The GitHub release metadata is missing required fields.");
             }
 
+            if (IsKnownBlockedVersion(manifest.Version))
+            {
+                return new AppUpdateCheckResult(
+                    AppUpdateCheckStatus.Failed,
+                    currentVersion,
+                    errorMessage: $"Release {manifest.Version} is blocked by server policy.");
+            }
+
             return IsRemoteVersionNewer(currentVersion, manifest.Version)
                 ? new AppUpdateCheckResult(AppUpdateCheckStatus.UpdateAvailable, currentVersion, manifest)
                 : new AppUpdateCheckResult(AppUpdateCheckStatus.UpToDate, currentVersion, manifest);
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException or IOException)
         {
-            return new AppUpdateCheckResult(AppUpdateCheckStatus.Failed, currentVersion, errorMessage: ex.Message);
+            return new AppUpdateCheckResult(AppUpdateCheckStatus.Failed, currentVersion, errorMessage: FormatUpdateCheckErrorMessage(ex));
         }
+    }
+
+    internal static string FormatUpdateCheckErrorMessage(Exception ex)
+    {
+        if (ex is TaskCanceledException)
+        {
+            return $"TIMEOUT: {ex.Message}";
+        }
+
+        if (ex is HttpRequestException httpEx)
+        {
+            if (httpEx.StatusCode is { } statusCode)
+            {
+                return $"HTTP_{(int)statusCode}: {httpEx.Message}";
+            }
+
+            if (httpEx.HttpRequestError is HttpRequestError.NameResolutionError
+                    or HttpRequestError.ConnectionError
+                    or HttpRequestError.ProxyTunnelError ||
+                httpEx.InnerException is System.Net.Sockets.SocketException)
+            {
+                return $"NETWORK_UNAVAILABLE: {httpEx.Message}";
+            }
+        }
+
+        if (ex.GetBaseException() is System.Net.Sockets.SocketException)
+        {
+            return $"NETWORK_UNAVAILABLE: {ex.Message}";
+        }
+
+        return ex.Message;
     }
 
     public async Task<AppUpdateDownloadResult> DownloadUpdateAsync(
@@ -302,8 +422,13 @@ public sealed partial class AppUpdateService : IAppUpdateService
             // Deep review R13 (R12 debt ③): the core reports every 128KB
             // chunk; the throttler collapses that to percent steps / 100ms
             // beats so the IPC push lane and the About page stop flooding.
+            // Use a synchronous IProgress<T> wrapper so every throttled progress
+            // tick completes inline before DownloadUpdateCoreAsync returns and
+            // before _downloadInProgress / DownloadCompleted fire (System.Progress<T>
+            // posts to the thread pool when constructed off-UI, which allowed the
+            // final 100% tick to land after DownloadCompleted).
             var throttle = new AppUpdateDownloadProgressThrottle();
-            var reportingProgress = new Progress<AppUpdateDownloadProgress>(p =>
+            var reportingProgress = new SynchronousProgress<AppUpdateDownloadProgress>(p =>
             {
                 if (!throttle.ShouldPush(p, Environment.TickCount64))
                 {
@@ -324,6 +449,9 @@ public sealed partial class AppUpdateService : IAppUpdateService
         {
             _lastDownloadedInstallerPath = result.FilePath;
             _lastDownloadedVersion = manifest.Version;
+            _lastDownloadedSha256 = string.IsNullOrWhiteSpace(manifest.Sha256)
+                ? null
+                : NormalizeSha256(manifest.Sha256);
         }
 
         DownloadCompleted?.Invoke(result);
@@ -366,10 +494,16 @@ public sealed partial class AppUpdateService : IAppUpdateService
         string fileName = GetInstallerFileName(downloadUri, manifest.Version);
         string targetPath = Path.Combine(targetDirectory, fileName);
         string tempPath = targetPath + ".tmp";
+        string expectedSha256 = NormalizeSha256(manifest.Sha256);
 
         try
         {
             Directory.CreateDirectory(targetDirectory);
+            if (await TryReuseVerifiedInstallerAsync(targetPath, expectedSha256, progress, cancellationToken))
+            {
+                return AppUpdateDownloadResult.Completed(targetPath);
+            }
+
             if (File.Exists(tempPath))
             {
                 File.Delete(tempPath);
@@ -391,7 +525,7 @@ public sealed partial class AppUpdateService : IAppUpdateService
                 {
                     (bytesReceived, totalBytes, string actualSha256) = await ForkDownloadToFileAsync(
                         candidate, tempPath, manifest.Size, progress, cancellationToken);
-                    if (string.Equals(actualSha256, NormalizeSha256(manifest.Sha256), StringComparison.OrdinalIgnoreCase))
+                    if (string.Equals(actualSha256, expectedSha256, StringComparison.OrdinalIgnoreCase))
                     {
                         hashMatched = true;
                         break;
@@ -402,7 +536,7 @@ public sealed partial class AppUpdateService : IAppUpdateService
                 }
                 catch (Exception ex) when (
                     !cancellationToken.IsCancellationRequested &&
-                    ex is HttpRequestException or TaskCanceledException or TimeoutException)
+                    ex is HttpRequestException or OperationCanceledException or TimeoutException)
                 {
                     App.Log($"[Update] Download from {candidate.Host} failed: {ex.GetType().Name}: {ex.Message}");
                     lastError = ex;
@@ -418,7 +552,6 @@ public sealed partial class AppUpdateService : IAppUpdateService
                     ? AppUpdateDownloadResult.Failed(AppUpdateDownloadFailureKind.HashMismatch)
                     : AppUpdateDownloadResult.Failed(AppUpdateDownloadFailureKind.Network, lastError.Message);
             }
-
             File.Move(tempPath, targetPath, overwrite: true);
             progress?.Report(new AppUpdateDownloadProgress(bytesReceived, totalBytes ?? bytesReceived));
             return AppUpdateDownloadResult.Completed(targetPath);
@@ -428,7 +561,7 @@ public sealed partial class AppUpdateService : IAppUpdateService
             TryDelete(tempPath);
             return AppUpdateDownloadResult.Failed(AppUpdateDownloadFailureKind.Cancelled);
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or TimeoutException)
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or TimeoutException)
         {
             TryDelete(tempPath);
             return AppUpdateDownloadResult.Failed(AppUpdateDownloadFailureKind.Network, ex.Message);
@@ -440,6 +573,47 @@ public sealed partial class AppUpdateService : IAppUpdateService
         }
     }
 
+    private static async Task<bool> TryReuseVerifiedInstallerAsync(
+        string targetPath,
+        string expectedSha256,
+        IProgress<AppUpdateDownloadProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        if (!File.Exists(targetPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            await using var existingStream = new FileStream(
+                targetPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: 1024 * 128,
+                useAsync: true);
+            long length = existingStream.Length;
+            byte[] hashBytes = await SHA256.HashDataAsync(existingStream, cancellationToken);
+            string actualSha256 = Convert.ToHexString(hashBytes);
+            if (string.Equals(actualSha256, expectedSha256, StringComparison.OrdinalIgnoreCase))
+            {
+                progress?.Report(new AppUpdateDownloadProgress(length, length));
+                return true;
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            // Fall through and re-download if the existing file cannot be read.
+        }
+
+        return false;
+    }
+
     public AppUpdateInstallResult StartInstallerHelper(
         string installerPath,
         bool silent = true,
@@ -447,6 +621,7 @@ public sealed partial class AppUpdateService : IAppUpdateService
     {
         if (string.IsNullOrWhiteSpace(installerPath) || !File.Exists(installerPath))
         {
+            App.Log("[Update] StartInstallerHelper failed: downloaded installer does not exist.");
             return AppUpdateInstallResult.Failed("The downloaded installer no longer exists.");
         }
 
@@ -462,19 +637,15 @@ public sealed partial class AppUpdateService : IAppUpdateService
         if (!resolvedInstaller.StartsWith(
                 managedRoot + Path.DirectorySeparatorChar,
                 StringComparison.OrdinalIgnoreCase) ||
-            !string.Equals(Path.GetExtension(resolvedInstaller), ".exe", StringComparison.OrdinalIgnoreCase))
+            !string.Equals(Path.GetExtension(resolvedInstaller), ".exe", StringComparison.OrdinalIgnoreCase) ||
+            HasReparsePointInHierarchy(resolvedInstaller, managedRoot))
         {
-            App.Log($"[Update] Rejected installer outside the managed update root: {installerPath}");
+            App.Log($"[Update] Rejected installer outside or reparse-redirected within the managed update root: {installerPath}");
             return AppUpdateInstallResult.Failed(
                 "The installer path is not inside DeskBox's managed update directory.");
         }
 
-        // From here to process exit this app hands the installer over to the
-        // detached updater: a periodic check landing in that window must not
-        // retire (delete) the directory the armed installer lives in.
-        _installerHelperArmed = true;
-
-        string? appPath = Environment.ProcessPath;
+        string? appPath = AppExecutablePath.ResolveMainExecutablePath();
         if (string.IsNullOrWhiteSpace(appPath) || !File.Exists(appPath))
         {
             appPath = Path.Combine(AppContext.BaseDirectory, "DeskBox.exe");
@@ -482,6 +653,7 @@ public sealed partial class AppUpdateService : IAppUpdateService
 
         if (!TryGetInstallDirectory(appPath, out string installDirectory))
         {
+            App.Log("[Update] StartInstallerHelper failed: could not resolve current installation directory.");
             return AppUpdateInstallResult.Failed(
                 "DeskBox could not determine the current installation directory. Please use the manual installer instead.");
         }
@@ -491,6 +663,7 @@ public sealed partial class AppUpdateService : IAppUpdateService
             string helperPath = PrepareDetachedUpdaterHelper(AppContext.BaseDirectory, _updateRootPath);
             if (!File.Exists(helperPath))
             {
+                App.Log("[Update] StartInstallerHelper failed: DeskBox.Updater.exe was not found in the application directory.");
                 return AppUpdateInstallResult.Failed("DeskBox.Updater.exe was not found in the application directory.");
             }
 
@@ -499,12 +672,19 @@ public sealed partial class AppUpdateService : IAppUpdateService
                 FileName = helperPath,
                 UseShellExecute = false,
                 CreateNoWindow = true,
-                WorkingDirectory = AppContext.BaseDirectory
+                WorkingDirectory = Path.GetDirectoryName(helperPath) ?? _updateRootPath
             };
             startInfo.ArgumentList.Add("--pid");
             startInfo.ArgumentList.Add(Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
             startInfo.ArgumentList.Add("--installer");
-            startInfo.ArgumentList.Add(installerPath);
+            startInfo.ArgumentList.Add(resolvedInstaller);
+            if (!string.IsNullOrWhiteSpace(_lastDownloadedSha256) &&
+                !string.IsNullOrWhiteSpace(_lastDownloadedInstallerPath) &&
+                string.Equals(resolvedInstaller, Path.GetFullPath(_lastDownloadedInstallerPath), StringComparison.OrdinalIgnoreCase))
+            {
+                startInfo.ArgumentList.Add("--sha256");
+                startInfo.ArgumentList.Add(_lastDownloadedSha256);
+            }
             startInfo.ArgumentList.Add("--app");
             startInfo.ArgumentList.Add(appPath);
             startInfo.ArgumentList.Add("--install-dir");
@@ -526,13 +706,51 @@ public sealed partial class AppUpdateService : IAppUpdateService
                 }
             }
 
-            Process.Start(startInfo);
+            // Latch right before launch and clear if Process.Start fails so a
+            // failed helper start does not permanently suppress cleanup.
+            _installerHelperArmed = true;
+            if (Process.Start(startInfo) is null)
+            {
+                _installerHelperArmed = false;
+                return AppUpdateInstallResult.Failed("DeskBox.Updater.exe did not start.");
+            }
+
             return AppUpdateInstallResult.Started();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or System.ComponentModel.Win32Exception)
         {
+            _installerHelperArmed = false;
+            int? nativeError = ex is System.ComponentModel.Win32Exception win32 ? win32.NativeErrorCode : null;
+            App.Log(
+                $"[Update] StartInstallerHelper failed: exception={ex.GetType().Name} " +
+                $"nativeError={(nativeError?.ToString(CultureInfo.InvariantCulture) ?? "none")} " +
+                $"message={ex.Message}");
+            if (nativeError is int errorCode && IsPolicyOrSignatureBlockWin32Error(errorCode))
+            {
+                return AppUpdateInstallResult.PolicyBlocked(ex.Message);
+            }
+
             return AppUpdateInstallResult.Failed(ex.Message);
         }
+    }
+
+    internal static bool IsPolicyOrSignatureBlockWin32Error(int nativeErrorCode)
+    {
+        int code = (nativeErrorCode & unchecked((int)0xFFFF0000)) == unchecked((int)0x80070000)
+            ? nativeErrorCode & 0xFFFF
+            : nativeErrorCode;
+
+        return code switch
+        {
+            577 => true, // ERROR_INVALID_IMAGE_HASH
+            786 => true, // ERROR_ACCESS_DISABLED_NO_SAFER_UI_BY_POLICY
+            1260 => true, // ERROR_ACCESS_DISABLED_BY_POLICY
+            4551 => true, // ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION (Smart App Control / WDAC)
+            >= 4556 and <= 4559 => true, // ERROR_SYSTEM_INTEGRITY_REPUTATION_*
+            >= 4580 and <= 4582 => true, // ERROR_SYSTEM_INTEGRITY_REPUTATION_UNFRIENDLY_FILE / UNATTAINABLE / EXPLICIT_DENY
+            8235 => true, // ERROR_DS_REFERRAL (UAC ValidateAdminCodeSignatures)
+            _ => false
+        };
     }
 
     /// <summary>
@@ -608,6 +826,11 @@ public sealed partial class AppUpdateService : IAppUpdateService
         }
 
         string helperRoot = Path.Combine(updateRootPath, "helper");
+        if ((Directory.Exists(updateRootPath) && (File.GetAttributes(updateRootPath) & FileAttributes.ReparsePoint) != 0) ||
+            (Directory.Exists(helperRoot) && (File.GetAttributes(helperRoot) & FileAttributes.ReparsePoint) != 0))
+        {
+            throw new IOException("Refusing to stage detached updater helper inside a reparse-point directory.");
+        }
 
         // Clean up stale helper directories from previous updates.
         try
@@ -634,7 +857,7 @@ public sealed partial class AppUpdateService : IAppUpdateService
 
         string helperDirectory = Path.Combine(
             helperRoot,
-            $"{DateTimeOffset.UtcNow:yyyyMMddHHmmss}-{Environment.ProcessId.ToString(CultureInfo.InvariantCulture)}");
+            FormattableString.Invariant($"{DateTimeOffset.UtcNow:yyyyMMddHHmmss}-{Environment.ProcessId}"));
         Directory.CreateDirectory(helperDirectory);
 
         foreach (var sourcePath in Directory.EnumerateFiles(appDirectory, "DeskBox.Updater.*", SearchOption.TopDirectoryOnly))
@@ -644,6 +867,41 @@ public sealed partial class AppUpdateService : IAppUpdateService
         }
 
         return Path.Combine(helperDirectory, "DeskBox.Updater.exe");
+    }
+
+    private static bool HasReparsePointInHierarchy(string fullTargetPath, string fullStopRootPath)
+    {
+        try
+        {
+            if (File.Exists(fullTargetPath) &&
+                (File.GetAttributes(fullTargetPath) & FileAttributes.ReparsePoint) != 0)
+            {
+                return true;
+            }
+
+            string? current = Path.GetDirectoryName(fullTargetPath);
+            while (!string.IsNullOrWhiteSpace(current))
+            {
+                if (Directory.Exists(current) &&
+                    (File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                {
+                    return true;
+                }
+
+                if (string.Equals(current, fullStopRootPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    break;
+                }
+
+                current = Path.GetDirectoryName(current);
+            }
+
+            return false;
+        }
+        catch
+        {
+            return true;
+        }
     }
 
     public static string GetCurrentAppVersion()
@@ -742,6 +1000,12 @@ public sealed partial class AppUpdateService : IAppUpdateService
             stream,
             AppUpdateJsonContext.Default.UpdateManifest,
             cancellationToken);
+        if (manifest is { SchemaVersion: 1 } &&
+            string.Equals(manifestUrl, DefaultManifestUrl, StringComparison.OrdinalIgnoreCase))
+        {
+            UpdateSharedBlockedVersions(manifest.BlockedVersions);
+        }
+
         return IsContentManifestUsable(manifest) ? manifest : null;
     }
 
@@ -754,6 +1018,92 @@ public sealed partial class AppUpdateService : IAppUpdateService
     }
 
     /// <summary>
+    /// Normalizes a server manifest before handing it to release-notes display
+    /// surfaces so an emergency push pause (sentinel version <c>1.0.0</c> with
+    /// <c>pushPaused: true</c>) or a rolled-back feed never pollutes the
+    /// release-notes header, version rail, or disk cache under <c>1.0.0</c>.
+    /// </summary>
+    public static AppUpdateManifest NormalizeManifestForReleaseNotes(
+        AppUpdateManifest? manifest,
+        string currentVersion)
+    {
+        string safeCurrent = string.IsNullOrWhiteSpace(currentVersion)
+            ? GetCurrentAppVersion()
+            : currentVersion.Trim();
+
+        if (manifest is null)
+        {
+            return CreateReleaseNotesOnlyManifest(safeCurrent);
+        }
+
+        List<string> blocked = manifest.BlockedVersions is { Count: > 0 }
+            ? [.. manifest.BlockedVersions]
+            : [];
+
+        bool isSentinelPause =
+            manifest.PushPaused ||
+            string.Equals(AppUpdateManifest.NormalizeVersionToken(manifest.Version), "1.0.0", StringComparison.OrdinalIgnoreCase);
+
+        if (isSentinelPause)
+        {
+            string candidatePublic = manifest.PublicVersion?.Trim() ?? string.Empty;
+            if (!string.IsNullOrWhiteSpace(candidatePublic) &&
+                !string.Equals(AppUpdateManifest.NormalizeVersionToken(candidatePublic), "1.0.0", StringComparison.OrdinalIgnoreCase) &&
+                !manifest.IsVersionBlocked(candidatePublic) &&
+                (!IsRemoteVersionNewer(candidatePublic, safeCurrent) || manifest.IsVersionBlocked(safeCurrent)))
+            {
+                return new AppUpdateManifest
+                {
+                    SchemaVersion = manifest.SchemaVersion,
+                    Channel = manifest.Channel,
+                    Version = AppUpdateManifest.NormalizeVersionToken(candidatePublic),
+                    ReleaseDate = manifest.ReleaseDate,
+                    ReleaseNotesUrl = manifest.ReleaseNotesUrl,
+                    Summary = new Dictionary<string, string>(manifest.Summary, StringComparer.OrdinalIgnoreCase),
+                    ReleaseNotes = new Dictionary<string, string>(manifest.ReleaseNotes, StringComparer.OrdinalIgnoreCase),
+                    BlockedVersions = blocked,
+                };
+            }
+
+            AppUpdateManifest fallback = CreateReleaseNotesOnlyManifest(safeCurrent);
+            fallback.BlockedVersions = blocked;
+            return fallback;
+        }
+
+        if (manifest.IsVersionBlocked(manifest.Version) ||
+            (IsRemoteVersionNewer(manifest.Version, safeCurrent) && !manifest.IsVersionBlocked(safeCurrent)))
+        {
+            AppUpdateManifest fallback = CreateReleaseNotesOnlyManifest(safeCurrent);
+            fallback.BlockedVersions = blocked;
+            return fallback;
+        }
+
+        return manifest;
+    }
+
+    public static bool IsVersionBlockedForReleaseNotes(string? version, AppUpdateManifest? activeManifest = null)
+    {
+        if (string.IsNullOrWhiteSpace(version))
+        {
+            return true;
+        }
+
+        string normalized = AppUpdateManifest.NormalizeVersionToken(version);
+        if (string.Equals(normalized, "1.0.0", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (activeManifest is not null && activeManifest.IsVersionBlocked(normalized))
+        {
+            return true;
+        }
+
+        HashSet<string> sharedBlocked = Volatile.Read(ref s_sharedBlockedVersions);
+        return sharedBlocked.Contains(normalized);
+    }
+
+    /// <summary>
     /// Builds a display-only manifest that resolves notes for an exact
     /// version through the project's GitHub release tag; the release-notes
     /// loader converts github.com tag pages to the API endpoint and caches
@@ -761,14 +1111,20 @@ public sealed partial class AppUpdateService : IAppUpdateService
     /// reachable or when the published manifest already moved on to a newer
     /// version than the one that needs showing.
     /// </summary>
-    public static AppUpdateManifest CreateReleaseNotesOnlyManifest(string version)
+    public static AppUpdateManifest CreateReleaseNotesOnlyManifest(string version) =>
+        CreateReleaseNotesOnlyManifest(version,
+            AppDistributionService.Current.IsMicrosoftStore || AppDistributionService.Current.IsPackaged);
+
+    internal static AppUpdateManifest CreateReleaseNotesOnlyManifest(string version, bool isStore)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(version);
         return new AppUpdateManifest
         {
-            Channel = "direct",
+            Channel = isStore ? "store" : "direct",
             Version = version.Trim(),
-            ReleaseNotesUrl = ForkUpdateConfig.GetReleaseTagUrl(version),
+            ReleaseNotesUrl = isStore
+                ? string.Empty
+                : ForkUpdateConfig.GetReleaseTagUrl(version),
         };
     }
 
@@ -896,7 +1252,11 @@ public sealed partial class AppUpdateService : IAppUpdateService
         // must keep it — that is exactly the downloaded-but-not-yet-
         // installed state the 24h loop would otherwise strand.
         if (result.IsUpdateAvailable && result.Manifest is { } offered &&
-            !string.Equals(offered.Version, _lastDownloadedVersion, StringComparison.Ordinal))
+            (_lastDownloadedVersion is null ||
+             !string.Equals(
+                 AppUpdateManifest.NormalizeVersionToken(offered.Version),
+                 AppUpdateManifest.NormalizeVersionToken(_lastDownloadedVersion),
+                 StringComparison.OrdinalIgnoreCase)))
         {
             if (!_installerHelperArmed)
             {
@@ -905,7 +1265,9 @@ public sealed partial class AppUpdateService : IAppUpdateService
 
             ClearLastDownloadedInstaller();
         }
-        else if (result.Status == AppUpdateCheckStatus.UpToDate && _lastDownloadedInstallerPath is not null)
+        else if ((result.Status == AppUpdateCheckStatus.UpToDate ||
+                  (_lastDownloadedVersion is not null && IsKnownBlockedVersion(_lastDownloadedVersion))) &&
+                 _lastDownloadedInstallerPath is not null)
         {
             if (!_installerHelperArmed)
             {
@@ -917,6 +1279,106 @@ public sealed partial class AppUpdateService : IAppUpdateService
 
         CheckCompleted?.Invoke(result);
         return result;
+    }
+
+    private void RecordBlockedVersions(IReadOnlyCollection<string>? blockedVersions)
+    {
+        var next = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (blockedVersions is not null)
+        {
+            foreach (string raw in blockedVersions)
+            {
+                if (!string.IsNullOrWhiteSpace(raw))
+                {
+                    next.Add(AppUpdateManifest.NormalizeVersionToken(raw));
+                }
+            }
+        }
+
+        lock (_blockedVersionsGate)
+        {
+            _cachedBlockedVersions = next;
+            try
+            {
+                if (next.Count == 0)
+                {
+                    DeskBox.Platform.CustomWidgetStorageFileOps.DeleteFileIfExists(_blockedVersionsPath);
+                }
+                else
+                {
+                    Directory.CreateDirectory(_updateRootPath);
+                    DeskBox.Platform.CustomWidgetStorageFileOps.ReplaceTextFileAtomically(
+                        _blockedVersionsPath,
+                        string.Join(Environment.NewLine, next.OrderBy(v => v, StringComparer.OrdinalIgnoreCase)));
+                }
+            }
+            catch (Exception ex)
+            {
+                App.Log($"[Update] Failed to persist blocked versions: {ex.Message}");
+            }
+        }
+
+        if (string.Equals(
+                Path.GetFullPath(_updateRootPath),
+                Path.GetFullPath(DeskBoxDataPathService.Current.UpdatesDirectory),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            UpdateSharedBlockedVersions(next);
+        }
+    }
+
+    internal bool IsKnownBlockedVersion(string? version)
+    {
+        if (string.IsNullOrWhiteSpace(version))
+        {
+            return false;
+        }
+
+        string normalized = AppUpdateManifest.NormalizeVersionToken(version);
+        lock (_blockedVersionsGate)
+        {
+            if (_cachedBlockedVersions is null)
+            {
+                var loaded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    if (File.Exists(_blockedVersionsPath))
+                    {
+                        foreach (string line in File.ReadAllLines(_blockedVersionsPath))
+                        {
+                            if (!string.IsNullOrWhiteSpace(line))
+                            {
+                                loaded.Add(AppUpdateManifest.NormalizeVersionToken(line));
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                }
+
+                _cachedBlockedVersions = loaded;
+            }
+
+            return _cachedBlockedVersions.Contains(normalized);
+        }
+    }
+
+    private static void UpdateSharedBlockedVersions(IEnumerable<string>? blockedVersions)
+    {
+        var next = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (blockedVersions is not null)
+        {
+            foreach (string raw in blockedVersions)
+            {
+                if (!string.IsNullOrWhiteSpace(raw))
+                {
+                    next.Add(AppUpdateManifest.NormalizeVersionToken(raw));
+                }
+            }
+        }
+
+        Volatile.Write(ref s_sharedBlockedVersions, next);
     }
 
     internal static string GetInstallerFileName(Uri downloadUri, string version)
@@ -1053,6 +1515,11 @@ public sealed partial class AppUpdateService : IAppUpdateService
         catch
         {
         }
+    }
+
+    private sealed class SynchronousProgress<T>(Action<T> handler) : IProgress<T>
+    {
+        public void Report(T value) => handler(value);
     }
 
     private sealed class GitHubReleaseResponse

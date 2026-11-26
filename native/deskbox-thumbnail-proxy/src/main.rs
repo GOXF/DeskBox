@@ -4,16 +4,19 @@ fn main() {
 }
 
 #[cfg(windows)]
+mod media_session;
+
+#[cfg(windows)]
 mod windows_proxy {
     use std::{
         cell::RefCell,
         ffi::{OsStr, OsString, c_void},
-        io::{self, BufRead, Write},
+        io::{self, BufRead, Read, Write},
         mem::size_of,
         os::windows::ffi::{OsStrExt, OsStringExt},
         path::{Path, PathBuf},
         sync::{
-            Mutex, OnceLock,
+            Arc, Mutex, OnceLock,
             atomic::{AtomicBool, AtomicI8, AtomicIsize, AtomicU32, AtomicUsize, Ordering},
             mpsc,
         },
@@ -22,23 +25,25 @@ mod windows_proxy {
 
     use windows::{
         Win32::{
-            Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM},
+            Foundation::{COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM},
             Graphics::Gdi::{
-                AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BLENDFUNCTION, BI_RGB, BITMAP,
-                BITMAPINFO, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC,
-                GetDIBits, GetObjectW, HBITMAP, HGDIOBJ, ReleaseDC, SelectObject,
+                AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAP, BITMAPINFO, BLENDFUNCTION,
+                CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits,
+                GetObjectW, HBITMAP, HGDIOBJ, ReleaseDC, SelectObject,
             },
             Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES,
             System::{
-                Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
+                Com::{
+                    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance,
+                    CoInitializeEx, CoTaskMemFree, CoUninitialize,
+                },
                 LibraryLoader::{
-                    GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32,
-                    LoadLibraryExW,
+                    GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
                 },
                 Threading::GetCurrentThreadId,
             },
             UI::{
-                Controls::{ILD_TRANSPARENT, IImageList, SetWindowTheme},
+                Controls::{IImageList, ILD_TRANSPARENT, SetWindowTheme},
                 HiDpi::{
                     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
                 },
@@ -46,28 +51,35 @@ mod windows_proxy {
                 Shell::{
                     CMF_EXPLORE, CMF_ITEMMENU, CMF_NORMAL, CMIC_MASK_CONTROL_DOWN,
                     CMIC_MASK_PTINVOKE, CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFOEX,
-                    Common::ITEMIDLIST, GCS_VERBW, IContextMenu, IContextMenu2,
-                    IContextMenu3, IShellFolder,
-                    IShellItemImageFactory, SHBindToParent, SHCreateItemFromParsingName,
-                    SHFILEINFOW, SHGFI_ADDOVERLAYS, SHGFI_ICON, SHGFI_LARGEICON,
-                    SHGFI_OVERLAYINDEX, SHGFI_SYSICONINDEX, SHGetFileInfoW, SHGetImageList,
-                    SHParseDisplayName, SHIL_EXTRALARGE, SHIL_JUMBO, SIIGBF_BIGGERSIZEOK,
-                    SIIGBF_ICONONLY, SIIGBF_SCALEUP, SIIGBF_THUMBNAILONLY,
+                    Common::{COMDLG_FILTERSPEC, ITEMIDLIST},
+                    FILEOPENDIALOGOPTIONS, FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST,
+                    FOS_FORCEFILESYSTEM, FOS_NODEREFERENCELINKS, FOS_PATHMUSTEXIST,
+                    FOS_PICKFOLDERS, FileOpenDialog, GCS_VERBA, GCS_VERBW, IContextMenu,
+                    IContextMenu2, IContextMenu3, IFileOpenDialog, IShellFolder, IShellItem,
+                    IShellItemArray, IShellItemImageFactory, SHBindToParent,
+                    SHCreateItemFromParsingName, SHFILEINFOW, SHGFI_ADDOVERLAYS, SHGFI_ICON,
+                    SHGFI_LARGEICON, SHGFI_OVERLAYINDEX, SHGFI_SYSICONINDEX, SHGetFileInfoW,
+                    SHGetImageList, SHIL_EXTRALARGE, SHIL_JUMBO, SHParseDisplayName,
+                    SIGDN_FILESYSPATH, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY, SIIGBF_SCALEUP,
+                    SIIGBF_THUMBNAILONLY,
                 },
                 WindowsAndMessaging::{
-                    AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW,
-                    DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
-                    GetClassNameW, GetIconInfo, GetMenuItemCount, GetMenuItemInfoW,
-                    GetMessageW, HICON,
-                    HMENU, ICONINFO, InsertMenuItemW, MENUITEMINFOW, MFT_SEPARATOR,
-                    MFT_STRING, MF_SEPARATOR, MIIM_FTYPE, MIIM_ID, MIIM_STRING,
-                    MSG, MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW, PostMessageW,
-                    PostThreadMessageW, RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow,
-                    SetWindowsHookExW, TPM_RETURNCMD, TrackPopupMenuEx, TranslateMessage,
-                    UnhookWindowsHookEx, WH_MOUSE_LL, WINDOW_STYLE, WM_DRAWITEM,
-                    WM_INITMENUPOPUP, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MEASUREITEM,
-                    WM_MBUTTONDOWN, WM_MENUCHAR, WM_NULL, WM_QUIT, WM_RBUTTONDOWN,
-                    WM_XBUTTONDOWN, WNDCLASSW, WS_EX_TOPMOST, WindowFromPoint,
+                    ASFW_ANY, AllowSetForegroundWindow, AppendMenuW, CallNextHookEx,
+                    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DeleteMenu, DestroyIcon,
+                    DestroyMenu, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
+                    GetIconInfo, GetMenuItemCount, GetMenuItemInfoW, GetMessageW,
+                    GetWindowThreadProcessId, HICON, HMENU, HWND_NOTOPMOST, HWND_TOPMOST, ICONINFO,
+                    InsertMenuItemW, LWA_ALPHA, MENUITEMINFOW, MF_BYPOSITION, MF_SEPARATOR,
+                    MFT_SEPARATOR, MFT_STRING, MIIM_FTYPE, MIIM_ID, MIIM_STRING, MSG,
+                    MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW, PostMessageW, PostThreadMessageW,
+                    RegisterClassW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+                    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos,
+                    SetWindowsHookExW, ShowWindow, TPM_RETURNCMD, TrackPopupMenuEx,
+                    TranslateMessage, UnhookWindowsHookEx, WH_MOUSE_LL, WINDOW_STYLE, WM_CLOSE,
+                    WM_DRAWITEM, WM_INITMENUPOPUP, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+                    WM_MBUTTONDOWN, WM_MEASUREITEM, WM_MENUCHAR, WM_NULL, WM_QUIT, WM_RBUTTONDOWN,
+                    WM_XBUTTONDOWN, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                    WS_EX_TRANSPARENT, WS_POPUP, WindowFromPoint,
                 },
             },
         },
@@ -140,6 +152,8 @@ mod windows_proxy {
 
     thread_local! {
         static ACTIVE_CONTEXT_MENU: RefCell<Option<ContextMenuMessageHandler>> =
+            const { RefCell::new(None) };
+        static LAST_INVOKE_FAILURE_VERB: RefCell<Option<String>> =
             const { RefCell::new(None) };
     }
 
@@ -214,6 +228,23 @@ mod windows_proxy {
         ContextMenuServer {
             dark: bool,
         },
+        MediaSessionServer,
+        PickFolder {
+            anchor_x: i32,
+            anchor_y: i32,
+            dark: bool,
+            watch_stdin: bool,
+        },
+        PickFiles {
+            anchor_x: i32,
+            anchor_y: i32,
+            default_folder: Option<PathBuf>,
+            filter_spec: Option<String>,
+            allow_multi_select: bool,
+            no_dereference_links: bool,
+            dark: bool,
+            watch_stdin: bool,
+        },
     }
 
     #[derive(Clone)]
@@ -280,8 +311,7 @@ mod windows_proxy {
             // SAFETY: Posting WM_QUIT to the hook thread ends its pump; the
             // thread unhooks itself before acknowledging.
             unsafe {
-                let _ =
-                    PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+                let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
             }
             let _ = self.done.recv_timeout(Duration::from_secs(2));
         }
@@ -356,10 +386,7 @@ mod windows_proxy {
                         .ok()
                     }
                 })();
-                let _ = ready_sender.send(match hook {
-                    Some(_) => Some(thread_id),
-                    None => None,
-                });
+                let _ = ready_sender.send(hook.map(|_| thread_id));
 
                 if let Some(hook) = hook {
                     let mut message = MSG::default();
@@ -399,14 +426,9 @@ mod windows_proxy {
             .collect();
         // SAFETY: The library name is a valid wide string that lives for the
         // call; the returned module stays loaded for the process lifetime.
-        let module = unsafe {
-            LoadLibraryExW(
-                PCWSTR(library.as_ptr()),
-                None,
-                LOAD_LIBRARY_SEARCH_SYSTEM32,
-            )
-        }
-        .ok()?;
+        let module =
+            unsafe { LoadLibraryExW(PCWSTR(library.as_ptr()), None, LOAD_LIBRARY_SEARCH_SYSTEM32) }
+                .ok()?;
 
         // SAFETY: Each ordinal is resolved to the documented-by-community
         // signature; a missing ordinal simply disables that step.
@@ -439,15 +461,17 @@ mod windows_proxy {
                         function,
                     )
                 }),
-                refresh_color_policy: GetProcAddress(
-                    module,
-                    PCSTR(UXTHEME_REFRESH_COLOR_POLICY_ORDINAL as *const u8),
-                )
-                .map(|function| {
-                    std::mem::transmute::<unsafe extern "system" fn() -> isize, RefreshColorPolicyFn>(
-                        function,
+                refresh_color_policy:
+                    GetProcAddress(
+                        module,
+                        PCSTR(UXTHEME_REFRESH_COLOR_POLICY_ORDINAL as *const u8),
                     )
-                }),
+                    .map(|function| {
+                        std::mem::transmute::<
+                            unsafe extern "system" fn() -> isize,
+                            RefreshColorPolicyFn,
+                        >(function)
+                    }),
             })
         }
     }
@@ -489,9 +513,21 @@ mod windows_proxy {
         eprintln!(
             "menu theme applied dark={dark} mode={desired_mode} previous={previous} \
              extras={}{}{}",
-            if api.refresh_color_policy.is_some() { "R" } else { "-" },
-            if api.flush_menu_themes.is_some() { "F" } else { "-" },
-            if api.allow_dark_mode_for_window.is_some() { "W" } else { "-" },
+            if api.refresh_color_policy.is_some() {
+                "R"
+            } else {
+                "-"
+            },
+            if api.flush_menu_themes.is_some() {
+                "F"
+            } else {
+                "-"
+            },
+            if api.allow_dark_mode_for_window.is_some() {
+                "W"
+            } else {
+                "-"
+            },
         );
 
         APPLIED_MENU_THEME.store(desired, Ordering::Relaxed);
@@ -619,20 +655,42 @@ mod windows_proxy {
                 screen_y,
                 dark,
                 rename_label,
-            } => match show_context_menu(
-                &path,
-                screen_x,
-                screen_y,
-                dark,
-                rename_label.as_deref(),
-            ) {
-                Ok(exit_code) => Ok(exit_code),
-                Err(error) => {
-                    eprintln!("{error}");
-                    Ok(CONTEXT_MENU_EXIT_FAILED)
+            } => {
+                match show_context_menu(&path, screen_x, screen_y, dark, rename_label.as_deref()) {
+                    Ok(exit_code) => Ok(exit_code),
+                    Err(error) => {
+                        eprintln!("{error}");
+                        Ok(CONTEXT_MENU_EXIT_FAILED)
+                    }
                 }
-            },
+            }
             ProxyRequest::ContextMenuServer { dark } => run_context_menu_server(dark),
+            ProxyRequest::MediaSessionServer => crate::media_session::run_media_session_server(),
+            ProxyRequest::PickFolder {
+                anchor_x,
+                anchor_y,
+                dark,
+                watch_stdin,
+            } => run_pick_folder(anchor_x, anchor_y, dark, watch_stdin),
+            ProxyRequest::PickFiles {
+                anchor_x,
+                anchor_y,
+                default_folder,
+                filter_spec,
+                allow_multi_select,
+                no_dereference_links,
+                dark,
+                watch_stdin,
+            } => run_pick_files(
+                anchor_x,
+                anchor_y,
+                default_folder.as_deref(),
+                filter_spec.as_deref(),
+                allow_multi_select,
+                no_dereference_links,
+                dark,
+                watch_stdin,
+            ),
         }
     }
 
@@ -663,6 +721,100 @@ mod windows_proxy {
                 return Err("unexpected extra arguments".to_string());
             }
             return Ok(ProxyRequest::ContextMenuServer { dark });
+        }
+        if first == "--media-session-server" {
+            if arguments.next().is_some() {
+                return Err("unexpected extra arguments".to_string());
+            }
+            return Ok(ProxyRequest::MediaSessionServer);
+        }
+        if first == "--pick-folder" {
+            let anchor_x = parse_coordinate(arguments.next(), "x")?;
+            let anchor_y = parse_coordinate(arguments.next(), "y")?;
+            let mut dark = false;
+            let mut watch_stdin = false;
+            while let Some(arg) = arguments.next() {
+                let text = arg.to_string_lossy();
+                match text.as_ref() {
+                    "--watch-stdin" => watch_stdin = true,
+                    "--theme" => {
+                        let token = arguments
+                            .next()
+                            .ok_or_else(|| "missing --theme value".to_string())?;
+                        dark = menu_dark_from_token(&token.to_string_lossy());
+                    }
+                    "dark" | "light" | "1" | "0" | "true" | "false" => {
+                        dark = menu_dark_from_token(&text);
+                    }
+                    _ => return Err("unexpected extra arguments".to_string()),
+                }
+            }
+            return Ok(ProxyRequest::PickFolder {
+                anchor_x,
+                anchor_y,
+                dark,
+                watch_stdin,
+            });
+        }
+        if first == "--pick-files" {
+            let anchor_x = parse_coordinate(arguments.next(), "x")?;
+            let anchor_y = parse_coordinate(arguments.next(), "y")?;
+            let mut default_folder: Option<PathBuf> = None;
+            let mut filter_spec: Option<String> = None;
+            let mut allow_multi_select = true;
+            let mut no_dereference_links = true;
+            let mut dark = false;
+            let mut watch_stdin = false;
+            while let Some(arg) = arguments.next() {
+                let text = arg.to_string_lossy();
+                match text.as_ref() {
+                    "--watch-stdin" => watch_stdin = true,
+                    "--single" => allow_multi_select = false,
+                    "--dereference-links" => no_dereference_links = false,
+                    "--theme" => {
+                        let token = arguments
+                            .next()
+                            .ok_or_else(|| "missing --theme value".to_string())?;
+                        dark = menu_dark_from_token(&token.to_string_lossy());
+                    }
+                    "--default-folder" => {
+                        let folder = arguments
+                            .next()
+                            .ok_or_else(|| "missing --default-folder value".to_string())?
+                            .to_string_lossy()
+                            .into_owned();
+                        if !folder.trim().is_empty() {
+                            default_folder = Some(PathBuf::from(folder));
+                        }
+                    }
+                    "--filter" => {
+                        let raw_filter = arguments
+                            .next()
+                            .ok_or_else(|| "missing --filter value".to_string())?
+                            .to_string_lossy()
+                            .into_owned();
+                        if !raw_filter.trim().is_empty() {
+                            filter_spec = Some(raw_filter);
+                        }
+                    }
+                    _ if default_folder.is_none() && !text.starts_with("--") => {
+                        if !text.trim().is_empty() {
+                            default_folder = Some(PathBuf::from(text.into_owned()));
+                        }
+                    }
+                    _ => return Err("unexpected extra arguments".to_string()),
+                }
+            }
+            return Ok(ProxyRequest::PickFiles {
+                anchor_x,
+                anchor_y,
+                default_folder,
+                filter_spec,
+                allow_multi_select,
+                no_dereference_links,
+                dark,
+                watch_stdin,
+            });
         }
         if first == "--extract-batch" {
             if arguments.next().is_some() {
@@ -772,34 +924,117 @@ mod windows_proxy {
 
         // SAFETY: The parsing name remains alive for the call and the generic
         // return type supplies the exact requested COM interface IID.
-        let factory: IShellItemImageFactory =
-            unsafe { SHCreateItemFromParsingName(PCWSTR(parsing_name.as_ptr()), None) }
-                .map_err(|error| format!("Shell item creation failed: {error}"))?;
-        let flags = match mode {
-            // THUMBNAILONLY is important: returning an icon here would make a
-            // missing third-party thumbnail indistinguishable from a real preview.
-            ExtractionMode::Thumbnail => {
-                SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK | SIIGBF_SCALEUP
+        let factory_result: Result<Vec<u8>, String> = (|| {
+            let factory: IShellItemImageFactory =
+                unsafe { SHCreateItemFromParsingName(PCWSTR(parsing_name.as_ptr()), None) }
+                    .map_err(|error| format!("Shell item creation failed: {error}"))?;
+            let flags = match mode {
+                // THUMBNAILONLY is important: returning an icon here would make a
+                // missing third-party thumbnail indistinguishable from a real preview.
+                ExtractionMode::Thumbnail => {
+                    SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK | SIIGBF_SCALEUP
+                }
+                // ICONONLY asks the Shell item itself to resolve PIDL/AppUserModelID
+                // shortcuts. ADDOVERLAYS is deliberately omitted so DeskBox's
+                // "hide shortcut arrows" setting remains effective. Do not request
+                // SCALEUP here: Shell can otherwise place a 32/48 px glyph inside
+                // a 256 px transparent canvas, which renders as a tiny shortcut
+                // icon in the fixed file tile.
+                ExtractionMode::Icon => SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+                // SHGetFileInfoW above is the API that supports Shell overlays. If
+                // it cannot supply an icon, keep the item visible by falling back
+                // to the high-resolution base icon from IShellItemImageFactory.
+                ExtractionMode::IconWithOverlays => SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+            };
+            // SAFETY: The returned bitmap is owned by the caller and released by
+            // BitmapGuard after its pixels have been copied.
+            let bitmap = unsafe { factory.GetImage(SIZE { cx: size, cy: size }, flags) }
+                .map_err(|error| format!("Shell image extraction failed: {error}"))?;
+            let bitmap_guard = BitmapGuard(bitmap);
+            bitmap_to_bmp_bytes(bitmap_guard.0)
+        })();
+
+        match factory_result {
+            Ok(bytes) => Ok(bytes),
+            Err(factory_error) => {
+                if matches!(mode, ExtractionMode::Icon)
+                    && let Ok(bytes) = load_shell_base_icon_without_overlays(&parsing_name, size)
+                {
+                    return Ok(bytes);
+                }
+                Err(factory_error)
             }
-            // ICONONLY asks the Shell item itself to resolve PIDL/AppUserModelID
-            // shortcuts. ADDOVERLAYS is deliberately omitted so DeskBox's
-            // "hide shortcut arrows" setting remains effective. Do not request
-            // SCALEUP here: Shell can otherwise place a 32/48 px glyph inside
-            // a 256 px transparent canvas, which renders as a tiny shortcut
-            // icon in the fixed file tile.
-            ExtractionMode::Icon => SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
-            // SHGetFileInfoW above is the API that supports Shell overlays. If
-            // it cannot supply an icon, keep the item visible by falling back
-            // to the high-resolution base icon from IShellItemImageFactory.
-            ExtractionMode::IconWithOverlays => SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+        }
+    }
+
+    fn load_shell_base_icon_without_overlays(
+        parsing_name: &[u16],
+        requested_size: i32,
+    ) -> Result<Vec<u8>, String> {
+        let mut index_info = SHFILEINFOW::default();
+        // SAFETY: parsing_name is zero terminated and index_info is valid for
+        // the call. SHGFI_SYSICONINDEX fills iIcon only; no handle is returned.
+        let index_queried = unsafe {
+            SHGetFileInfoW(
+                PCWSTR(parsing_name.as_ptr()),
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                Some(&mut index_info),
+                size_of::<SHFILEINFOW>() as u32,
+                SHGFI_SYSICONINDEX,
+            )
+        } != 0;
+        let base_index = if index_queried { index_info.iIcon } else { -1 };
+
+        if base_index >= 0 {
+            let image_lists = if requested_size <= 48 {
+                [SHIL_EXTRALARGE as i32, SHIL_JUMBO as i32]
+            } else {
+                [SHIL_JUMBO as i32, SHIL_EXTRALARGE as i32]
+            };
+            for shell_image_list in image_lists {
+                // SAFETY: the image-list interface is released at the end of
+                // the iteration and the icon handle is owned by IconGuard.
+                let Ok(image_list) = (unsafe { SHGetImageList::<IImageList>(shell_image_list) })
+                else {
+                    continue;
+                };
+                let Ok(base_icon) = (unsafe { image_list.GetIcon(base_index, ILD_TRANSPARENT.0) })
+                else {
+                    continue;
+                };
+                let base = IconGuard(base_icon);
+
+                if shell_image_list == SHIL_JUMBO as i32
+                    && requested_size > 48
+                    && icon_artwork_is_padded(base.0)
+                {
+                    continue;
+                }
+
+                if let Ok(bytes) = icon_to_bmp_bytes(base.0) {
+                    return Ok(bytes);
+                }
+            }
+        }
+
+        let mut file_info = SHFILEINFOW::default();
+        // SAFETY: parsing_name is zero terminated and file_info is valid for
+        // the duration of the call. SHGFI_ICON transfers ownership of hIcon.
+        let image_list = unsafe {
+            SHGetFileInfoW(
+                PCWSTR(parsing_name.as_ptr()),
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                Some(&mut file_info),
+                size_of::<SHFILEINFOW>() as u32,
+                SHGFI_ICON | SHGFI_LARGEICON,
+            )
         };
-        // SAFETY: The returned bitmap is owned by the caller and released by
-        // BitmapGuard after its pixels have been copied.
-        let bitmap = unsafe { factory.GetImage(SIZE { cx: size, cy: size }, flags) }
-            .map_err(|error| format!("Shell image extraction failed: {error}"))?;
-        let bitmap_guard = BitmapGuard(bitmap);
-        let bytes = bitmap_to_bmp_bytes(bitmap_guard.0)?;
-        Ok(bytes)
+        if image_list == 0 || file_info.hIcon.is_invalid() {
+            return Err("Shell base icon extraction failed".to_string());
+        }
+
+        let icon = IconGuard(file_info.hIcon);
+        icon_to_bmp_bytes(icon.0)
     }
 
     fn load_shell_icon_with_overlays(parsing_name: &[u16]) -> Result<Vec<u8>, String> {
@@ -864,28 +1099,22 @@ mod windows_proxy {
             for shell_image_list in [SHIL_JUMBO as i32, SHIL_EXTRALARGE as i32] {
                 // SAFETY: the image-list interface is released at the end of
                 // the iteration and the icon handle is owned by IconGuard.
-                let Ok(image_list) =
-                    (unsafe { SHGetImageList::<IImageList>(shell_image_list) })
+                let Ok(image_list) = (unsafe { SHGetImageList::<IImageList>(shell_image_list) })
                 else {
                     continue;
                 };
-                let Ok(base_icon) =
-                    (unsafe { image_list.GetIcon(base_index, ILD_TRANSPARENT.0) })
+                let Ok(base_icon) = (unsafe { image_list.GetIcon(base_index, ILD_TRANSPARENT.0) })
                 else {
                     continue;
                 };
                 let base = IconGuard(base_icon);
 
-                if shell_image_list == SHIL_JUMBO as i32
-                    && icon_artwork_is_padded(base.0)
-                {
+                if shell_image_list == SHIL_JUMBO as i32 && icon_artwork_is_padded(base.0) {
                     // Padded JUMBO frame — continue to the 48 px slot.
                     continue;
                 }
 
-                if let Some(bytes) =
-                    composite_overlay_bitmap(&image_list, base.0, overlay_index)
-                {
+                if let Some(bytes) = composite_overlay_bitmap(&image_list, base.0, overlay_index) {
                     return Ok(bytes);
                 }
 
@@ -990,14 +1219,13 @@ mod windows_proxy {
         // center patch, so the source rectangle is the artwork's alpha
         // bounding box — blending the whole canvas would shrink the arrow to
         // that patch's share of the target edge.
-        let overlay_source = measure_overlay_artwork(&overlay_bitmaps.0.hbmColor)
-            .unwrap_or((
-                0,
-                0,
-                overlay_bitmap.bmWidth,
-                overlay_bitmap.bmHeight,
-            ));
-        let overlay_edge = ((base.bmWidth.max(base.bmHeight) as i32) / 3).max(16);
+        let overlay_source = measure_overlay_artwork(&overlay_bitmaps.0.hbmColor).unwrap_or((
+            0,
+            0,
+            overlay_bitmap.bmWidth,
+            overlay_bitmap.bmHeight,
+        ));
+        let overlay_edge = (base.bmWidth.max(base.bmHeight) / 3).max(16);
         let x = 0;
         let y = base.bmHeight - overlay_edge;
 
@@ -1065,9 +1293,7 @@ mod windows_proxy {
             return true;
         }
 
-        let Some((left, top, width, height)) =
-            measure_overlay_artwork(&bitmaps.0.hbmColor)
-        else {
+        let Some((left, top, width, height)) = measure_overlay_artwork(&bitmaps.0.hbmColor) else {
             return true;
         };
 
@@ -1089,8 +1315,8 @@ mod windows_proxy {
         let _ = (left, top);
         // A genuine 256 px frame fills most of its canvas; the padded frame
         // centers a glyph at roughly a 32/256 share.
-        let share = (width as f64 / canvas.bmWidth as f64)
-            .min(height as f64 / canvas.bmHeight as f64);
+        let share =
+            (width as f64 / canvas.bmWidth as f64).min(height as f64 / canvas.bmHeight as f64);
         share < 0.7
     }
 
@@ -1156,7 +1382,7 @@ mod windows_proxy {
 
         // Top-down BGRA: the alpha channel is every fourth byte. A small
         // threshold skips decoder noise at fully transparent edges.
-        const AlphaThreshold: u8 = 8;
+        const ALPHA_THRESHOLD: u8 = 8;
         let mut left = width;
         let mut top = height;
         let mut right: i32 = -1;
@@ -1164,7 +1390,7 @@ mod windows_proxy {
         for row in 0..height {
             for column in 0..width {
                 let alpha = pixels[(row * width + column) as usize * 4 + 3];
-                if alpha >= AlphaThreshold {
+                if alpha >= ALPHA_THRESHOLD {
                     if column < left {
                         left = column;
                     }
@@ -1274,8 +1500,8 @@ mod windows_proxy {
                     break;
                 }
 
-                let unclaimed = requests.len()
-                    - next_request.load(Ordering::Relaxed).min(requests.len());
+                let unclaimed =
+                    requests.len() - next_request.load(Ordering::Relaxed).min(requests.len());
                 if !spawning_exhausted
                     && workers.len() < EXTRACT_BATCH_MAX_WORKERS
                     && unclaimed > workers.len()
@@ -1291,8 +1517,7 @@ mod windows_proxy {
                                 &completed,
                                 &client_gone,
                             );
-                        })
-                    {
+                        }) {
                         Ok(handle) => workers.push(handle),
                         Err(error) => {
                             // Creating one more thread failed (the same
@@ -1358,8 +1583,7 @@ mod windows_proxy {
             } else {
                 None
             };
-            let payload =
-                extract_shell_image_payload(&request.path, request.size, request.mode);
+            let payload = extract_shell_image_payload(&request.path, request.size, request.mode);
             drop(directory_guard);
             let frame = match payload {
                 Ok(bytes) => encode_batch_frame(index as u32, 0, &bytes),
@@ -1404,7 +1628,10 @@ mod windows_proxy {
             let mode_value = u32::from_le_bytes(entry[0..4].try_into().unwrap());
             let size = u32::from_le_bytes(entry[4..8].try_into().unwrap()) as i32;
             let path_len = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as usize;
-            if path_len == 0 || path_len % 2 != 0 || path_len > EXTRACT_BATCH_MAX_PATH_BYTES {
+            if path_len == 0
+                || !path_len.is_multiple_of(2)
+                || path_len > EXTRACT_BATCH_MAX_PATH_BYTES
+            {
                 return Err("batch path length out of range".to_string());
             }
 
@@ -1483,8 +1710,8 @@ mod windows_proxy {
         if !matches!(requests[0].mode, ExtractionMode::Icon) || requests[0].size != 48 {
             return Err("self-test batch manifest parsed wrong icon request".to_string());
         }
-        if !matches!(requests[1].mode, ExtractionMode::Thumbnail) ||
-            requests[1].size != MAX_THUMBNAIL_SIZE
+        if !matches!(requests[1].mode, ExtractionMode::Thumbnail)
+            || requests[1].size != MAX_THUMBNAIL_SIZE
         {
             return Err("self-test batch manifest parsed wrong thumbnail request".to_string());
         }
@@ -1571,8 +1798,10 @@ mod windows_proxy {
         query_result
             .ok()
             .map_err(|error| format!("Shell menu population failed: {error}"))?;
+        remove_unsupported_non_explorer_items(&context_menu, menu.0);
         insert_host_rename_item(&context_menu, menu.0, rename_label)?;
         LAST_INVOKE_FAILURE_HR.store(0, Ordering::Relaxed);
+        LAST_INVOKE_FAILURE_VERB.with(|slot| *slot.borrow_mut() = None);
 
         ACTIVE_CONTEXT_MENU.with(|active| {
             *active.borrow_mut() = message_handler;
@@ -1594,7 +1823,14 @@ mod windows_proxy {
         let foreground_ok = unsafe { SetForegroundWindow(owner) }.as_bool();
         MENU_CANCELLED_BY_OUTSIDE_CLICK.store(false, Ordering::Relaxed);
         MENU_FOREGROUND_OK.store(foreground_ok, Ordering::Relaxed);
-        ACTIVE_MENU_OWNER.store(owner.0 as isize, Ordering::Relaxed);
+        ACTIVE_MENU_OWNER.store(owner.0 as isize, Ordering::Release);
+        struct ActiveMenuOwnerReset;
+        impl Drop for ActiveMenuOwnerReset {
+            fn drop(&mut self) {
+                ACTIVE_MENU_OWNER.store(0, Ordering::Release);
+            }
+        }
+        let _active_owner_reset = ActiveMenuOwnerReset;
         // The hook covers what activation cannot: clicks on DeskBox's own
         // topmost, non-activating widget windows.
         let _mouse_hook = install_menu_mouse_hook();
@@ -1603,15 +1839,14 @@ mod windows_proxy {
         // is what fills the Shell's delay-generated submenus ("Send to",
         // "Open with", archiver menus) - they would open empty. TPM_RETURNCMD
         // already routes the selection through the return value.
-        let track_flags =
-            TPM_RETURNCMD.0 | TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_VERTICAL;
+        let track_flags = TPM_RETURNCMD.0 | TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_VERTICAL;
         // SAFETY: The proxy-owned hidden HWND is the in-process owner and its
         // window procedure forwards owner-drawn menu messages to the active
         // Shell interface.
         let selected =
             unsafe { TrackPopupMenuEx(menu.0, track_flags, screen_x, screen_y, owner, None) }.0
                 as u32;
-        ACTIVE_MENU_OWNER.store(0, Ordering::Relaxed);
+        drop(_active_owner_reset);
         // The menu is closed, so the input hook has no job left. It MUST be
         // gone before InvokeCommand: a low-level hook whose owning thread is
         // blocked stops receiving mouse input and stalls the desktop input
@@ -1623,8 +1858,12 @@ mod windows_proxy {
             return Ok(CONTEXT_MENU_EXIT_CANCELLED);
         }
         if selected >= CONTEXT_MENU_CUSTOM_COMMAND_FIRST {
-            // Host-owned command (rename today). The host executes it with its
-            // own view-host pipeline; nothing to invoke on the Shell side.
+            // Host-owned command (rename today). Hand foreground activation
+            // permission back to DeskBox before returning so inline rename can
+            // claim Win32 foreground on desktop-pinned / popover surfaces.
+            unsafe {
+                let _ = AllowSetForegroundWindow(ASFW_ANY);
+            }
             return Ok(CONTEXT_MENU_EXIT_CUSTOM_COMMAND);
         }
         if selected < CONTEXT_MENU_FIRST_COMMAND_ID {
@@ -1639,10 +1878,11 @@ mod windows_proxy {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty());
         let parent_wide: Vec<u16> = parent_path.map(encode_wide_path).unwrap_or_default();
-        let mut parent_ansi: Vec<u8> = parent_path
-            .map(|parent| parent.to_string_lossy().into_owned().into_bytes())
-            .unwrap_or_default();
-        parent_ansi.push(0);
+        let parent_ansi: Vec<u8> = if parent_wide.is_empty() {
+            Vec::new()
+        } else {
+            encode_ansi_directory_path(&parent_wide)
+        };
         // Capture the modifier state at invocation time; Shift+Delete and
         // friends must be reported to the handler, not polled later. The
         // high-order bit of GetKeyState means the key is down.
@@ -1683,14 +1923,13 @@ mod windows_proxy {
                 y: screen_y,
             },
         };
+        let selected_verb = shell_menu_item_verb(&context_menu, selected);
         // SAFETY: CMINVOKECOMMANDINFOEX is ABI-compatible with the
         // CMINVOKECOMMANDINFO prefix the interface expects; numeric lpVerb
         // offsets are the documented IContextMenu ABI and the structure lives
         // through the call.
         if let Err(error) = unsafe {
-            context_menu.InvokeCommand(
-                (&invoke_info as *const CMINVOKECOMMANDINFOEX).cast(),
-            )
+            context_menu.InvokeCommand((&invoke_info as *const CMINVOKECOMMANDINFOEX).cast())
         } {
             // A refused command is a classified outcome, not a proxy failure:
             // the exit code lets the host say "unsupported"/"cancelled"/
@@ -1698,7 +1937,17 @@ mod windows_proxy {
             // HRESULT rides along in the server result line.
             let hresult = error.code().0 as u32;
             LAST_INVOKE_FAILURE_HR.store(hresult, Ordering::Relaxed);
-            eprintln!("Shell command invocation failed: {error} (hr=0x{hresult:08X})");
+            let sanitized_verb = selected_verb
+                .as_deref()
+                .and_then(sanitize_protocol_token);
+            LAST_INVOKE_FAILURE_VERB.with(|slot| *slot.borrow_mut() = sanitized_verb.clone());
+            if let Some(verb) = sanitized_verb.as_deref() {
+                eprintln!(
+                    "Shell command invocation failed: {error} (hr=0x{hresult:08X} verb={verb})"
+                );
+            } else {
+                eprintln!("Shell command invocation failed: {error} (hr=0x{hresult:08X})");
+            }
             return Ok(classify_invoke_failure(hresult));
         }
 
@@ -1724,38 +1973,182 @@ mod windows_proxy {
         })
     }
 
-    /// Verb probe for a populated Shell menu command id. GCS_VERBW is the
-    /// documented wide-verb query and works on every shell that implements
-    /// IContextMenu; handlers that do not implement it simply fail, which the
-    /// caller treats as "unknown item".
+    /// Verb probe for a populated Shell menu command id. GCS_VERBW is queried
+    /// first; handlers that only implement the legacy ANSI variant fall back
+    /// to GCS_VERBA. Handlers that implement neither fail, which the caller
+    /// treats as "unknown item".
     fn shell_menu_item_verb(context_menu: &IContextMenu, command_id: u32) -> Option<String> {
-        if command_id < CONTEXT_MENU_FIRST_COMMAND_ID || command_id > CONTEXT_MENU_LAST_COMMAND_ID
-        {
+        if !(CONTEXT_MENU_FIRST_COMMAND_ID..=CONTEXT_MENU_LAST_COMMAND_ID).contains(&command_id) {
             return None;
         }
 
-        let mut buffer = [0u16; 64];
+        let offset = (command_id - CONTEXT_MENU_FIRST_COMMAND_ID) as usize;
+        let mut wide_buffer = [0u16; 64];
         // SAFETY: The buffer outlives the call; GCS_VERBW writes wide
         // characters through the byte-typed parameter, which is the documented
         // ABI for the wide variant.
-        let queried = unsafe {
+        let wide_queried = unsafe {
             context_menu.GetCommandString(
-                (command_id - CONTEXT_MENU_FIRST_COMMAND_ID) as usize,
+                offset,
                 GCS_VERBW,
                 None,
-                PSTR(buffer.as_mut_ptr().cast()),
-                buffer.len() as u32,
+                PSTR(wide_buffer.as_mut_ptr().cast()),
+                wide_buffer.len() as u32,
             )
         };
-        if queried.is_err() {
+        if wide_queried.is_ok() {
+            let length = wide_buffer
+                .iter()
+                .position(|&wide| wide == 0)
+                .unwrap_or(wide_buffer.len());
+            if length > 0 {
+                return Some(String::from_utf16_lossy(&wide_buffer[..length]));
+            }
+        }
+
+        let mut ansi_buffer = [0u8; 128];
+        // SAFETY: The buffer outlives the call; GCS_VERBA writes a
+        // NUL-terminated ANSI verb string up to cchMax bytes.
+        let ansi_queried = unsafe {
+            context_menu.GetCommandString(
+                offset,
+                GCS_VERBA,
+                None,
+                PSTR(ansi_buffer.as_mut_ptr()),
+                ansi_buffer.len() as u32,
+            )
+        };
+        if ansi_queried.is_err() {
             return None;
         }
 
-        let length = buffer
+        let length = ansi_buffer
             .iter()
-            .position(|&wide| wide == 0)
-            .unwrap_or(buffer.len());
-        Some(String::from_utf16_lossy(&buffer[..length]))
+            .position(|&byte| byte == 0)
+            .unwrap_or(ansi_buffer.len());
+        if length == 0 {
+            return None;
+        }
+
+        Some(String::from_utf8_lossy(&ansi_buffer[..length]).into_owned())
+    }
+
+    /// Shell verbs that Windows 10 1909+ and Windows 11 restrict exclusively
+    /// to explorer.exe; invoking them from any third-party host always fails
+    /// with E_ACCESSDENIED (0x80070005), even when running elevated.
+    fn is_unsupported_non_explorer_shell_verb(verb: &str) -> bool {
+        let trimmed = verb.trim();
+        matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "pintostartscreen"
+                | "windows.pintostartscreen"
+                | "startpin"
+                | "startunpin"
+                | "unpinfromstartscreen"
+                | "taskbarpin"
+                | "taskbarunpin"
+        )
+    }
+
+    fn sanitize_protocol_token(raw: &str) -> Option<String> {
+        let cleaned: String = raw
+            .trim()
+            .chars()
+            .filter(|ch| ch.is_ascii_graphic() && !ch.is_whitespace())
+            .take(64)
+            .collect();
+        (!cleaned.is_empty()).then_some(cleaned)
+    }
+
+    /// Removes top-level Shell menu items whose canonical verb is known to be
+    /// restricted to explorer.exe and cleans up any orphaned separators left
+    /// behind by the removal.
+    fn remove_unsupported_non_explorer_items(context_menu: &IContextMenu, menu: HMENU) {
+        remove_unsupported_non_explorer_items_with_verb_probe(menu, |command_id| {
+            shell_menu_item_verb(context_menu, command_id)
+        });
+    }
+
+    fn remove_unsupported_non_explorer_items_with_verb_probe(
+        menu: HMENU,
+        verb_of_command_id: impl Fn(u32) -> Option<String>,
+    ) {
+        let count = unsafe { GetMenuItemCount(Some(menu)) };
+        if count <= 0 {
+            return;
+        }
+
+        let mut removed_any = false;
+        for index in (0..count as u32).rev() {
+            let mut info = MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_ID | MIIM_FTYPE,
+                ..Default::default()
+            };
+            // SAFETY: Read-only query over a valid index of this menu.
+            if unsafe { GetMenuItemInfoW(menu, index, true, &mut info) }.is_err() {
+                continue;
+            }
+            if info.fType == MFT_SEPARATOR {
+                continue;
+            }
+            if !(CONTEXT_MENU_FIRST_COMMAND_ID..=CONTEXT_MENU_LAST_COMMAND_ID).contains(&info.wID) {
+                continue;
+            }
+
+            let is_unsupported = verb_of_command_id(info.wID)
+                .is_some_and(|verb| is_unsupported_non_explorer_shell_verb(&verb));
+            if is_unsupported {
+                // SAFETY: index is within the current menu item range and
+                // iterating in reverse keeps lower indexes stable.
+                if unsafe { DeleteMenu(menu, index, MF_BYPOSITION) }.is_ok() {
+                    removed_any = true;
+                }
+            }
+        }
+
+        if removed_any {
+            prune_redundant_separators(menu);
+        }
+    }
+
+    fn prune_redundant_separators(menu: HMENU) {
+        let mut index: u32 = 0;
+        let mut previous_was_separator = true;
+        loop {
+            let count = unsafe { GetMenuItemCount(Some(menu)) };
+            if count <= 0 || index >= count as u32 {
+                break;
+            }
+
+            if menu_item_is_separator(menu, index) {
+                if previous_was_separator {
+                    // SAFETY: index < count for this menu.
+                    let _ = unsafe { DeleteMenu(menu, index, MF_BYPOSITION) };
+                    continue;
+                }
+                previous_was_separator = true;
+            } else {
+                previous_was_separator = false;
+            }
+
+            index += 1;
+        }
+
+        loop {
+            let count = unsafe { GetMenuItemCount(Some(menu)) };
+            if count <= 0 {
+                break;
+            }
+            let last = (count - 1) as u32;
+            if !menu_item_is_separator(menu, last) {
+                break;
+            }
+            // SAFETY: last == count - 1 is valid because count > 0.
+            if unsafe { DeleteMenu(menu, last, MF_BYPOSITION) }.is_err() {
+                break;
+            }
+        }
     }
 
     fn insert_host_rename_item_with_verb_probe(
@@ -1819,7 +2212,7 @@ mod windows_proxy {
                 ..Default::default()
             };
             // SAFETY: Read-only query against a valid index of this menu.
-            if !unsafe { GetMenuItemInfoW(menu, index, true, &mut info) }.is_ok() {
+            if unsafe { GetMenuItemInfoW(menu, index, true, &mut info) }.is_err() {
                 continue;
             }
 
@@ -1849,10 +2242,7 @@ mod windows_proxy {
     /// collide. A plain text item matches the classic Win10 menu look (no
     /// icon, no owner-draw); the trailing separator is skipped when the Shell
     /// menu already ends with one, so no blank gap is doubled.
-    fn append_host_rename_item(
-        menu: HMENU,
-        rename_label: Option<&str>,
-    ) -> Result<(), String> {
+    fn append_host_rename_item(menu: HMENU, rename_label: Option<&str>) -> Result<(), String> {
         let Some(label) = rename_label.map(str::trim) else {
             return Ok(());
         };
@@ -1872,9 +2262,7 @@ mod windows_proxy {
             };
             // SAFETY: The last item index is valid because item_count > 0 and
             // the menu is not concurrently modified on this STA thread.
-            let query = unsafe {
-                GetMenuItemInfoW(menu, (item_count - 1) as u32, true, &mut info)
-            };
+            let query = unsafe { GetMenuItemInfoW(menu, (item_count - 1) as u32, true, &mut info) };
             if query.is_ok() && info.fType == MFT_SEPARATOR {
                 separator_needed = false;
             }
@@ -1907,7 +2295,7 @@ mod windows_proxy {
     fn classify_invoke_failure(hresult: u32) -> i32 {
         const E_FAIL: u32 = 0x8000_4005;
         const E_ABORT: u32 = 0x8000_4004;
-        const ERROR_CANCELLED_AS_HRESULT: u32 = 0x8007_007A;
+        const ERROR_CANCELLED_AS_HRESULT: u32 = 0x8007_04C7;
         const E_ACCESSDENIED: u32 = 0x8007_0005;
         const ERROR_ELEVATION_REQUIRED_AS_HRESULT: u32 = 0x8007_02E4;
         match hresult {
@@ -1947,7 +2335,10 @@ mod windows_proxy {
             loop {
                 let mut line = String::new();
                 match lines.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => {
+                        dismiss_open_menu(owner_raw);
+                        break;
+                    }
                     Ok(_) => {
                         let command = normalize_command_line(&line);
                         if command == "cancel" {
@@ -2041,6 +2432,11 @@ mod windows_proxy {
             if invoke_hr != 0 {
                 detail.push_str(&format!(" hr=0x{invoke_hr:08X}"));
             }
+            LAST_INVOKE_FAILURE_VERB.with(|slot| {
+                if let Some(verb) = slot.borrow().as_deref() {
+                    detail.push_str(&format!(" verb={verb}"));
+                }
+            });
             // The host reads this with a line reader; without the terminating
             // newline the round stalls until the pipe EOFs or the 10-minute
             // interaction budget expires, swallowing every later right-click.
@@ -2052,14 +2448,31 @@ mod windows_proxy {
             } else {
                 consecutive_failures = 0;
             }
-            if menus_served >= CONTEXT_MENU_SERVER_MAX_MENUS
-                || consecutive_failures >= CONTEXT_MENU_SERVER_MAX_CONSECUTIVE_FAILURES
-            {
+            if should_retire_context_menu_server(result_code, menus_served, consecutive_failures) {
                 write_stdout(b"bye\n")?;
                 return Ok(0);
             }
         }
         Ok(0)
+    }
+
+    /// Retires the warm context-menu server once its menu budget or consecutive
+    /// failure cap is reached, except on host-owned custom commands (such as
+    /// rename): destroying the foreground proxy owner HWND immediately after
+    /// `AllowSetForegroundWindow(ASFW_ANY)` causes Windows to hand foreground to
+    /// an arbitrary third-party window and revokes DeskBox's foreground grant
+    /// before the inline rename editor can activate.
+    fn should_retire_context_menu_server(
+        result_code: i32,
+        menus_served: u32,
+        consecutive_failures: u32,
+    ) -> bool {
+        if consecutive_failures >= CONTEXT_MENU_SERVER_MAX_CONSECUTIVE_FAILURES {
+            return true;
+        }
+
+        result_code != CONTEXT_MENU_EXIT_CUSTOM_COMMAND
+            && menus_served >= CONTEXT_MENU_SERVER_MAX_MENUS
     }
 
     /// Loads and populates one throwaway menu so the shared handler DLLs are
@@ -2134,10 +2547,15 @@ mod windows_proxy {
     /// widget windows are non-activating, so an outside click on them never
     /// produces the WM_ACTIVATE(WA_INACTIVE) that would otherwise dismiss the
     /// menu. Posting Escape to the owner is that input.
+    #[rustfmt::skip]
     fn dismiss_open_menu(owner_raw: isize) {
+        if ACTIVE_MENU_OWNER.load(Ordering::Acquire) == 0 {
+            return;
+        }
         let owner = HWND(owner_raw as *mut std::ffi::c_void);
         // SAFETY: The handle belongs to this process and outlives the reader
-        // thread; posting a key to a window without an open menu is a no-op.
+        // thread; posting Escape only while a menu is actively tracked avoids
+        // queueing stale keystrokes that could dismiss the next popup menu.
         unsafe {
             let _ = PostMessageW(Some(owner), WM_KEYDOWN, WPARAM(VK_ESCAPE.0 as usize), LPARAM(0));
             let _ = PostMessageW(Some(owner), WM_KEYUP, WPARAM(VK_ESCAPE.0 as usize), LPARAM(0));
@@ -2186,8 +2604,7 @@ mod windows_proxy {
         // owner-drawn menu content use the same physical pixels. A failure
         // keeps the system default and only degrades scaled displays.
         unsafe {
-            let _ =
-                SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
     }
 
@@ -2258,6 +2675,353 @@ mod windows_proxy {
         }
         .map_err(|error| format!("Context menu owner window creation failed: {error}"))?;
         Ok(WindowGuard(window))
+    }
+
+    const PICK_DIALOG_EXIT_PICKED: i32 = 0;
+    const PICK_DIALOG_EXIT_CANCELLED: i32 = 2;
+    const PICK_DIALOG_EXIT_FAILED: i32 = 3;
+    const HRESULT_ERROR_CANCELLED: i32 = 0x8007_04C7_u32 as i32;
+
+    struct CoTaskMemStringGuard(PWSTR);
+
+    impl Drop for CoTaskMemStringGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: Allocated by IShellItem::GetDisplayName via CoTaskMemAlloc.
+                unsafe {
+                    CoTaskMemFree(Some(self.0.0.cast()));
+                }
+            }
+        }
+    }
+
+    fn create_picker_owner_window(anchor_x: i32, anchor_y: i32) -> Result<WindowGuard, String> {
+        let class_name: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let window_name: Vec<u16> = "DeskBox Picker Host\0".encode_utf16().collect();
+        let module = unsafe { GetModuleHandleW(None) }
+            .map_err(|error| format!("Module handle lookup failed: {error}"))?;
+        let window = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(window_name.as_ptr()),
+                WS_POPUP,
+                anchor_x,
+                anchor_y,
+                1,
+                1,
+                None,
+                None,
+                Some(module.into()),
+                None,
+            )
+        }
+        .map_err(|error| format!("Picker owner window creation failed: {error}"))?;
+
+        let guard = WindowGuard(window);
+        unsafe {
+            let _ = SetLayeredWindowAttributes(window, COLORREF(0), 0, LWA_ALPHA);
+            let _ = ShowWindow(window, SW_SHOWNORMAL);
+            if !SetForegroundWindow(window).as_bool() {
+                let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+                let _ = SetWindowPos(window, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
+                let _ = SetWindowPos(window, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags);
+            }
+        }
+        pump_messages_once();
+        Ok(guard)
+    }
+
+    fn shell_item_filesystem_path(item: &IShellItem) -> Result<Option<String>, windows::core::Error> {
+        let raw_name = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }?;
+        let _guard = CoTaskMemStringGuard(raw_name);
+        if raw_name.is_null() {
+            return Ok(None);
+        }
+
+        // SAFETY: GetDisplayName returns a NUL-terminated UTF-16 string on S_OK.
+        let mut len = 0usize;
+        unsafe {
+            while *raw_name.0.add(len) != 0 {
+                len += 1;
+            }
+            let slice = std::slice::from_raw_parts(raw_name.0, len);
+            let text = OsString::from_wide(slice).to_string_lossy().into_owned();
+            if text.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(text))
+            }
+        }
+    }
+
+    fn close_current_process_file_dialogs() {
+        unsafe extern "system" fn close_dialog_callback(hwnd: HWND, l_param: LPARAM) -> BOOL {
+            let target_pid = l_param.0 as u32;
+            let mut window_pid = 0u32;
+            unsafe {
+                let _ = GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
+            }
+            if window_pid != target_pid {
+                return BOOL(1);
+            }
+
+            let mut class_buf = [0u16; 32];
+            let len = unsafe { GetClassNameW(hwnd, &mut class_buf) };
+            if len > 0 {
+                let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
+                if class_name == "#32770" {
+                    unsafe {
+                        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    }
+                }
+            }
+            BOOL(1)
+        }
+
+        let self_pid = std::process::id() as isize;
+        unsafe {
+            let _ = EnumWindows(Some(close_dialog_callback), LPARAM(self_pid));
+        }
+    }
+
+    fn spawn_picker_stdin_eof_watchdog(picker_done: &Arc<AtomicBool>) {
+        let done = Arc::clone(picker_done);
+        let _ = std::thread::Builder::new()
+            .name("picker-stdin-eof".to_string())
+            .spawn(move || {
+                let mut buf = [0u8; 1];
+                loop {
+                    match io::stdin().read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+                if !done.load(Ordering::Acquire) {
+                    close_current_process_file_dialogs();
+                    std::thread::sleep(Duration::from_millis(350));
+                    if !done.load(Ordering::Acquire) {
+                        std::process::exit(PICK_DIALOG_EXIT_CANCELLED);
+                    }
+                }
+            });
+    }
+
+    fn parse_file_filter_entries(raw: Option<&str>) -> Vec<(String, String)> {
+        let Some(raw_text) = raw else {
+            return Vec::new();
+        };
+        let mut patterns: Vec<String> = Vec::new();
+        for token in raw_text.split(';') {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed == "*" || trimmed == "*.*" || trimmed == ".*" {
+                return Vec::new();
+            }
+            let normalized = if let Some(stripped) = trimmed.strip_prefix("*.") {
+                format!("*.{stripped}")
+            } else if let Some(stripped) = trimmed.strip_prefix('.') {
+                format!("*.{stripped}")
+            } else {
+                format!("*.{trimmed}")
+            };
+            if normalized.len() <= 2 {
+                continue;
+            }
+            if !patterns
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&normalized))
+            {
+                patterns.push(normalized);
+            }
+        }
+        if patterns.is_empty() {
+            return Vec::new();
+        }
+        if patterns.len() == 1 {
+            let single = patterns.remove(0);
+            return vec![(single.clone(), single)];
+        }
+        let combined_spec = patterns.join(";");
+        let combined_label = patterns.join("; ");
+        let mut entries = Vec::with_capacity(patterns.len() + 1);
+        entries.push((combined_label, combined_spec));
+        for pattern in patterns {
+            entries.push((pattern.clone(), pattern));
+        }
+        entries
+    }
+
+    fn run_pick_folder(
+        anchor_x: i32,
+        anchor_y: i32,
+        dark: bool,
+        watch_stdin: bool,
+    ) -> Result<i32, String> {
+        apply_per_monitor_dpi_awareness();
+        set_process_menu_theme(dark);
+        let picker_done = Arc::new(AtomicBool::new(false));
+        if watch_stdin {
+            spawn_picker_stdin_eof_watchdog(&picker_done);
+        }
+        let _com_guard = initialize_com()?;
+        let outcome: Result<Option<String>, windows::core::Error> = (|| {
+            let owner = create_picker_owner_window(anchor_x, anchor_y).ok();
+            let owner_hwnd = owner.as_ref().map(|guard| guard.0);
+            if let Some(hwnd) = owner_hwnd {
+                apply_menu_theme(hwnd, dark);
+            }
+            let dialog: IFileOpenDialog =
+                unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }?;
+            let options: FILEOPENDIALOGOPTIONS =
+                FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST;
+            unsafe { dialog.SetOptions(options) }?;
+            unsafe { dialog.Show(owner_hwnd) }?;
+            let item = unsafe { dialog.GetResult() }?;
+            let picked = shell_item_filesystem_path(&item)?;
+            drop(item);
+            drop(dialog);
+            drop(owner);
+            pump_messages_once();
+            Ok(picked)
+        })();
+        picker_done.store(true, Ordering::Release);
+
+        match outcome {
+            Ok(Some(folder)) => {
+                let mut payload = folder;
+                payload.push('\n');
+                write_stdout(payload.as_bytes())?;
+                unsafe {
+                    let _ = AllowSetForegroundWindow(ASFW_ANY);
+                }
+                Ok(PICK_DIALOG_EXIT_PICKED)
+            }
+            Ok(None) => Ok(PICK_DIALOG_EXIT_CANCELLED),
+            Err(error) if error.code().0 == HRESULT_ERROR_CANCELLED => Ok(PICK_DIALOG_EXIT_CANCELLED),
+            Err(error) => {
+                eprintln!("hr=0x{:08X} {error}", error.code().0 as u32);
+                Ok(PICK_DIALOG_EXIT_FAILED)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_pick_files(
+        anchor_x: i32,
+        anchor_y: i32,
+        default_folder: Option<&Path>,
+        filter_spec: Option<&str>,
+        allow_multi_select: bool,
+        no_dereference_links: bool,
+        dark: bool,
+        watch_stdin: bool,
+    ) -> Result<i32, String> {
+        apply_per_monitor_dpi_awareness();
+        set_process_menu_theme(dark);
+        let picker_done = Arc::new(AtomicBool::new(false));
+        if watch_stdin {
+            spawn_picker_stdin_eof_watchdog(&picker_done);
+        }
+        let _com_guard = initialize_com()?;
+        let filter_entries = parse_file_filter_entries(filter_spec);
+        let outcome: Result<Vec<String>, windows::core::Error> = (|| {
+            let owner = create_picker_owner_window(anchor_x, anchor_y).ok();
+            let owner_hwnd = owner.as_ref().map(|guard| guard.0);
+            if let Some(hwnd) = owner_hwnd {
+                apply_menu_theme(hwnd, dark);
+            }
+            let dialog: IFileOpenDialog =
+                unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }?;
+            let mut options: FILEOPENDIALOGOPTIONS =
+                FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_FILEMUSTEXIST;
+            if allow_multi_select {
+                options |= FOS_ALLOWMULTISELECT;
+            }
+            if no_dereference_links {
+                options |= FOS_NODEREFERENCELINKS;
+            }
+            unsafe { dialog.SetOptions(options) }?;
+
+            let wide_filters: Vec<(Vec<u16>, Vec<u16>)> = filter_entries
+                .iter()
+                .map(|(label, spec)| {
+                    let wide_label: Vec<u16> =
+                        label.encode_utf16().chain(std::iter::once(0)).collect();
+                    let wide_spec: Vec<u16> =
+                        spec.encode_utf16().chain(std::iter::once(0)).collect();
+                    (wide_label, wide_spec)
+                })
+                .collect();
+            if !wide_filters.is_empty() {
+                let specs: Vec<COMDLG_FILTERSPEC> = wide_filters
+                    .iter()
+                    .map(|(wide_label, wide_spec)| COMDLG_FILTERSPEC {
+                        pszName: PCWSTR(wide_label.as_ptr()),
+                        pszSpec: PCWSTR(wide_spec.as_ptr()),
+                    })
+                    .collect();
+                unsafe { dialog.SetFileTypes(&specs) }?;
+                unsafe { dialog.SetFileTypeIndex(1) }?;
+            }
+
+            if let Some(folder_path) = default_folder {
+                let wide: Vec<u16> = folder_path
+                    .as_os_str()
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect();
+                if let Ok(folder_item) =
+                    unsafe { SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide.as_ptr()), None) }
+                {
+                    let _ = unsafe { dialog.SetDefaultFolder(&folder_item) };
+                }
+            }
+
+            unsafe { dialog.Show(owner_hwnd) }?;
+            let mut paths = Vec::new();
+            if allow_multi_select {
+                let results: IShellItemArray = unsafe { dialog.GetResults() }?;
+                let count = unsafe { results.GetCount() }?;
+                paths.reserve(count as usize);
+                for index in 0..count {
+                    let item = unsafe { results.GetItemAt(index) }?;
+                    if let Some(path) = shell_item_filesystem_path(&item)? {
+                        paths.push(path);
+                    }
+                }
+            } else {
+                let item = unsafe { dialog.GetResult() }?;
+                if let Some(path) = shell_item_filesystem_path(&item)? {
+                    paths.push(path);
+                }
+            }
+            drop(dialog);
+            drop(owner);
+            pump_messages_once();
+            Ok(paths)
+        })();
+        picker_done.store(true, Ordering::Release);
+
+        match outcome {
+            Ok(paths) if !paths.is_empty() => {
+                let mut payload = paths.join("\n");
+                payload.push('\n');
+                write_stdout(payload.as_bytes())?;
+                unsafe {
+                    let _ = AllowSetForegroundWindow(ASFW_ANY);
+                }
+                Ok(PICK_DIALOG_EXIT_PICKED)
+            }
+            Ok(_) => Ok(PICK_DIALOG_EXIT_CANCELLED),
+            Err(error) if error.code().0 == HRESULT_ERROR_CANCELLED => Ok(PICK_DIALOG_EXIT_CANCELLED),
+            Err(error) => {
+                eprintln!("hr=0x{:08X} {error}", error.code().0 as u32);
+                Ok(PICK_DIALOG_EXIT_FAILED)
+            }
+        }
     }
 
     unsafe extern "system" fn context_menu_window_proc(
@@ -2553,15 +3317,17 @@ mod windows_proxy {
             assert_eq!(screen_x, 120);
             assert_eq!(screen_y, -845);
             assert!(dark);
-            assert!(rename_label.is_none(), "no label field means no custom item");
+            assert!(
+                rename_label.is_none(),
+                "no label field means no custom item"
+            );
         }
 
         #[test]
         fn menu_command_payload_accepts_optional_rename_label() {
-            let (path, screen_x, screen_y, dark, rename_label) = parse_menu_command(
-                "120\t-845\tlight\tC:\\file.txt\t重命名 (&R)",
-            )
-            .expect("menu command payload with label");
+            let (path, screen_x, screen_y, dark, rename_label) =
+                parse_menu_command("120\t-845\tlight\tC:\\file.txt\t重命名 (&R)")
+                    .expect("menu command payload with label");
 
             assert_eq!(path, PathBuf::from(r"C:\file.txt"));
             assert_eq!(screen_x, 120);
@@ -2573,9 +3339,8 @@ mod windows_proxy {
                 "label may be any localized text"
             );
 
-            let (_, _, _, _, blank) =
-                parse_menu_command("120\t-845\tlight\tC:\\file.txt\t   ")
-                    .expect("whitespace-only label still parses");
+            let (_, _, _, _, blank) = parse_menu_command("120\t-845\tlight\tC:\\file.txt\t   ")
+                .expect("whitespace-only label still parses");
             assert!(blank.is_none(), "blank label means no custom item");
         }
 
@@ -2656,35 +3421,60 @@ mod windows_proxy {
                 CONTEXT_MENU_EXIT_FAILED_UNSUPPORTED,
                 "E_FAIL is the documented unrecognized-verb answer"
             );
-            assert_eq!(classify_invoke_failure(0x8000_4004), CONTEXT_MENU_EXIT_FAILED_CANCELLED);
-            assert_eq!(classify_invoke_failure(0x8007_007A), CONTEXT_MENU_EXIT_FAILED_CANCELLED);
-            assert_eq!(classify_invoke_failure(0x8007_0005), CONTEXT_MENU_EXIT_FAILED_ACCESS_DENIED);
+            assert_eq!(
+                classify_invoke_failure(0x8000_4004),
+                CONTEXT_MENU_EXIT_FAILED_CANCELLED
+            );
+            assert_eq!(
+                classify_invoke_failure(0x8007_04C7),
+                CONTEXT_MENU_EXIT_FAILED_CANCELLED
+            );
+            assert_eq!(
+                classify_invoke_failure(0x8007_007A),
+                CONTEXT_MENU_EXIT_FAILED
+            );
+            assert_eq!(
+                classify_invoke_failure(0x8007_0005),
+                CONTEXT_MENU_EXIT_FAILED_ACCESS_DENIED
+            );
             assert_eq!(
                 classify_invoke_failure(0x8007_02E4),
                 CONTEXT_MENU_EXIT_FAILED_ACCESS_DENIED,
                 "elevation required reads as a permission problem"
             );
-            assert_eq!(classify_invoke_failure(0xC000_0005), CONTEXT_MENU_EXIT_FAILED);
-            assert_eq!(classify_invoke_failure(0x8007_0057), CONTEXT_MENU_EXIT_FAILED);
+            assert_eq!(
+                classify_invoke_failure(0xC000_0005),
+                CONTEXT_MENU_EXIT_FAILED
+            );
+            assert_eq!(
+                classify_invoke_failure(0x8007_0057),
+                CONTEXT_MENU_EXIT_FAILED
+            );
             // The custom command id must stay outside the Shell handler range
             // so a handler can never mint it.
-            assert!(CONTEXT_MENU_CUSTOM_RENAME_COMMAND_ID > CONTEXT_MENU_LAST_COMMAND_ID);
+            const {
+                assert!(CONTEXT_MENU_CUSTOM_RENAME_COMMAND_ID > CONTEXT_MENU_LAST_COMMAND_ID);
+            }
             assert_eq!(CONTEXT_MENU_EXIT_CUSTOM_COMMAND, 5);
         }
 
         #[test]
         fn host_rename_item_inserts_above_properties_joining_the_edit_group() {
             let menu = MenuGuard(unsafe { CreatePopupMenu() }.expect("popup menu"));
-            let mut push_item = |label: &str, id: u32| {
+            let push_item = |label: &str, id: u32| {
                 let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
                 unsafe {
-                    AppendMenuW(menu.0, Default::default(), id as usize, PCWSTR(wide.as_ptr()))
+                    AppendMenuW(
+                        menu.0,
+                        Default::default(),
+                        id as usize,
+                        PCWSTR(wide.as_ptr()),
+                    )
                 }
                 .expect("seed item");
             };
             unsafe {
-                AppendMenuW(menu.0, MF_SEPARATOR, 0, PCWSTR::null())
-                    .expect("seed separator");
+                AppendMenuW(menu.0, MF_SEPARATOR, 0, PCWSTR::null()).expect("seed separator");
             }
             push_item("Cut", 1);
             push_item("Copy", 2);
@@ -2720,7 +3510,10 @@ mod windows_proxy {
         #[test]
         fn host_rename_item_inserts_directly_above_properties_without_separator() {
             let menu = MenuGuard(unsafe { CreatePopupMenu() }.expect("popup menu"));
-            let wide: Vec<u16> = "Properties".encode_utf16().chain(std::iter::once(0)).collect();
+            let wide: Vec<u16> = "Properties"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             unsafe {
                 AppendMenuW(menu.0, Default::default(), 7, PCWSTR(wide.as_ptr()))
                     .expect("seed properties");
@@ -2774,15 +3567,13 @@ mod windows_proxy {
             // Two plain Shell-style items: separator logic must see the last
             // one is not a separator and add its own.
             unsafe {
-                AppendMenuW(menu.0, MF_SEPARATOR, 0, PCWSTR::null())
-                    .expect("seed separator");
+                AppendMenuW(menu.0, MF_SEPARATOR, 0, PCWSTR::null()).expect("seed separator");
                 let item: Vec<u16> = "Open".encode_utf16().chain(std::iter::once(0)).collect();
                 AppendMenuW(menu.0, Default::default(), 1, PCWSTR(item.as_ptr()))
                     .expect("seed item");
             }
 
-            append_host_rename_item(menu.0, Some("Rename"))
-                .expect("rename item appended");
+            append_host_rename_item(menu.0, Some("Rename")).expect("rename item appended");
             let count = unsafe { GetMenuItemCount(Some(menu.0)) };
             assert_eq!(count, 4, "separator + rename appended after two items");
 
@@ -2792,8 +3583,7 @@ mod windows_proxy {
                 AppendMenuW(menu2.0, MF_SEPARATOR, 0, PCWSTR::null())
                     .expect("seed trailing separator");
             }
-            append_host_rename_item(menu2.0, Some("Rename"))
-                .expect("rename item appended");
+            append_host_rename_item(menu2.0, Some("Rename")).expect("rename item appended");
             let count2 = unsafe { GetMenuItemCount(Some(menu2.0)) };
             assert_eq!(count2, 2, "existing trailing separator is reused");
 
@@ -2804,7 +3594,6 @@ mod windows_proxy {
             let count3 = unsafe { GetMenuItemCount(Some(menu3.0)) };
             assert_eq!(count3, 0, "no custom item without a label");
         }
-
 
         #[test]
         fn icon_with_overlays_request_has_a_distinct_extraction_mode() {
@@ -2859,6 +3648,461 @@ mod windows_proxy {
 
             assert!(error.contains("empty transparent bitmap"));
         }
+
+        #[test]
+        fn classify_invoke_failure_maps_win32_cancelled_and_not_insufficient_buffer() {
+            assert_eq!(
+                classify_invoke_failure(0x8007_04C7),
+                CONTEXT_MENU_EXIT_FAILED_CANCELLED,
+                "HRESULT_FROM_WIN32(ERROR_CANCELLED = 1223) must classify as cancelled"
+            );
+            assert_eq!(
+                classify_invoke_failure(0x8000_4004),
+                CONTEXT_MENU_EXIT_FAILED_CANCELLED,
+                "E_ABORT must classify as cancelled"
+            );
+            assert_eq!(
+                classify_invoke_failure(0x8007_007A),
+                CONTEXT_MENU_EXIT_FAILED,
+                "ERROR_INSUFFICIENT_BUFFER (122) must not be misclassified as cancelled"
+            );
+            assert_eq!(
+                classify_invoke_failure(0x8007_0005),
+                CONTEXT_MENU_EXIT_FAILED_ACCESS_DENIED
+            );
+            assert_eq!(
+                classify_invoke_failure(0x8007_02E4),
+                CONTEXT_MENU_EXIT_FAILED_ACCESS_DENIED
+            );
+        }
+
+        #[test]
+        fn unsupported_non_explorer_pin_verbs_are_matched_case_insensitively() {
+            for verb in [
+                "pintostartscreen",
+                "PinToStartScreen",
+                "Windows.pintostartscreen",
+                "  startpin ",
+                "startunpin",
+                "unpinfromstartscreen",
+                "taskbarpin",
+                "TaskbarUnpin",
+            ] {
+                assert!(
+                    is_unsupported_non_explorer_shell_verb(verb),
+                    "expected verb '{verb}' to be filtered as explorer-only"
+                );
+            }
+
+            for allowed in ["open", "properties", "cut", "copy", "delete", "runas", ""] {
+                assert!(
+                    !is_unsupported_non_explorer_shell_verb(allowed),
+                    "expected verb '{allowed}' to remain visible"
+                );
+            }
+        }
+
+        #[test]
+        fn non_explorer_pin_items_are_removed_and_redundant_separators_are_pruned() {
+            let menu = MenuGuard(unsafe { CreatePopupMenu() }.expect("popup menu"));
+            let push_item = |label: &str, id: u32| {
+                let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+                unsafe {
+                    AppendMenuW(
+                        menu.0,
+                        Default::default(),
+                        id as usize,
+                        PCWSTR(wide.as_ptr()),
+                    )
+                }
+                .expect("seed item");
+            };
+            let push_sep = || {
+                unsafe { AppendMenuW(menu.0, MF_SEPARATOR, 0, PCWSTR::null()) }
+                    .expect("seed separator");
+            };
+
+            // Leading pin item followed by separator, middle pin group between
+            // two separators, normal edit/properties items, and trailing pin.
+            push_item("Pin to Start", 1);
+            push_sep();
+            push_item("Open", 2);
+            push_sep();
+            push_item("Pin to taskbar", 3);
+            push_item("Unpin from Start", 4);
+            push_sep();
+            push_item("Properties", 5);
+            push_sep();
+            push_item("Windows Pin", 6);
+
+            let verb_of = |command_id: u32| -> Option<String> {
+                match command_id {
+                    1 => Some("pintostartscreen".to_string()),
+                    2 => Some("open".to_string()),
+                    3 => Some("taskbarpin".to_string()),
+                    4 => Some("unpinfromstartscreen".to_string()),
+                    5 => Some("properties".to_string()),
+                    6 => Some("Windows.pintostartscreen".to_string()),
+                    _ => None,
+                }
+            };
+
+            remove_unsupported_non_explorer_items_with_verb_probe(menu.0, &verb_of);
+            insert_host_rename_item_with_verb_probe(menu.0, Some("Rename"), &verb_of)
+                .expect("rename inserted");
+
+            // Expected layout: [Open (2), Rename (0x7001), SEP, Properties (5)]
+            let count = unsafe { GetMenuItemCount(Some(menu.0)) };
+            assert_eq!(count, 4, "all pin verbs and redundant separators removed");
+
+            let read_entry = |index: u32| -> (u32, bool) {
+                let mut info = MENUITEMINFOW {
+                    cbSize: size_of::<MENUITEMINFOW>() as u32,
+                    fMask: MIIM_ID | MIIM_FTYPE,
+                    ..Default::default()
+                };
+                unsafe { GetMenuItemInfoW(menu.0, index, true, &mut info) }.expect("menu entry");
+                (info.wID, info.fType == MFT_SEPARATOR)
+            };
+
+            assert_eq!(read_entry(0), (2, false));
+            assert_eq!(read_entry(1), (CONTEXT_MENU_CUSTOM_RENAME_COMMAND_ID, false));
+            assert_eq!(read_entry(2).1, true);
+            assert_eq!(read_entry(3), (5, false));
+        }
+
+        #[test]
+        fn media_session_server_request_parses_without_extra_arguments() {
+            let parsed = parse_request_from(["--media-session-server"].into_iter().map(OsString::from))
+                .expect("media session server request");
+            assert!(matches!(parsed, ProxyRequest::MediaSessionServer));
+
+            let rejected = parse_request_from(
+                ["--media-session-server", "extra"]
+                    .into_iter()
+                    .map(OsString::from),
+            )
+            .expect_err("extra arguments must be rejected");
+            assert!(rejected.contains("unexpected extra arguments"));
+        }
+
+        #[test]
+        fn pick_folder_and_pick_files_requests_parse_coordinates_and_optional_folder() {
+            let folder_req = parse_request_from(
+                ["--pick-folder", "320", "240"]
+                    .into_iter()
+                    .map(OsString::from),
+            )
+            .expect("pick folder request");
+            assert!(matches!(
+                folder_req,
+                ProxyRequest::PickFolder {
+                    anchor_x: 320,
+                    anchor_y: 240,
+                    dark: false,
+                    watch_stdin: false,
+                }
+            ));
+
+            let folder_dark_watched = parse_request_from(
+                ["--pick-folder", "320", "240", "--theme", "dark", "--watch-stdin"]
+                    .into_iter()
+                    .map(OsString::from),
+            )
+            .expect("pick folder dark watched");
+            assert!(matches!(
+                folder_dark_watched,
+                ProxyRequest::PickFolder {
+                    anchor_x: 320,
+                    anchor_y: 240,
+                    dark: true,
+                    watch_stdin: true,
+                }
+            ));
+
+            let files_without_default = parse_request_from(
+                ["--pick-files", "-100", "480"]
+                    .into_iter()
+                    .map(OsString::from),
+            )
+            .expect("pick files without default folder");
+            assert!(matches!(
+                files_without_default,
+                ProxyRequest::PickFiles {
+                    anchor_x: -100,
+                    anchor_y: 480,
+                    default_folder: None,
+                    filter_spec: None,
+                    allow_multi_select: true,
+                    no_dereference_links: true,
+                    dark: false,
+                    watch_stdin: false,
+                }
+            ));
+
+            let files_with_default = parse_request_from(
+                ["--pick-files", "120", "160", r"C:\Work"]
+                    .into_iter()
+                    .map(OsString::from),
+            )
+            .expect("pick files with default folder");
+            match files_with_default {
+                ProxyRequest::PickFiles {
+                    anchor_x,
+                    anchor_y,
+                    default_folder,
+                    filter_spec,
+                    allow_multi_select,
+                    no_dereference_links,
+                    dark,
+                    watch_stdin,
+                } => {
+                    assert_eq!((anchor_x, anchor_y), (120, 160));
+                    assert_eq!(default_folder, Some(PathBuf::from(r"C:\Work")));
+                    assert_eq!(filter_spec, None);
+                    assert!(allow_multi_select);
+                    assert!(no_dereference_links);
+                    assert!(!dark);
+                    assert!(!watch_stdin);
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+
+            let filtered_single = parse_request_from(
+                [
+                    "--pick-files",
+                    "40",
+                    "80",
+                    "--theme",
+                    "dark",
+                    "--watch-stdin",
+                    "--single",
+                    "--dereference-links",
+                    "--default-folder",
+                    "shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}",
+                    "--filter",
+                    "*.png;*.jpg",
+                ]
+                .into_iter()
+                .map(OsString::from),
+            )
+            .expect("filtered single file request");
+            match filtered_single {
+                ProxyRequest::PickFiles {
+                    anchor_x,
+                    anchor_y,
+                    default_folder,
+                    filter_spec,
+                    allow_multi_select,
+                    no_dereference_links,
+                    dark,
+                    watch_stdin,
+                } => {
+                    assert_eq!((anchor_x, anchor_y), (40, 80));
+                    assert_eq!(
+                        default_folder,
+                        Some(PathBuf::from("shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"))
+                    );
+                    assert_eq!(filter_spec.as_deref(), Some("*.png;*.jpg"));
+                    assert!(!allow_multi_select);
+                    assert!(!no_dereference_links);
+                    assert!(dark);
+                    assert!(watch_stdin);
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn parse_file_filter_entries_builds_combined_and_per_extension_specs() {
+            assert!(parse_file_filter_entries(None).is_empty());
+            assert!(parse_file_filter_entries(Some("*.*")).is_empty());
+            assert_eq!(
+                parse_file_filter_entries(Some(".zip")),
+                vec![("*.zip".to_string(), "*.zip".to_string())]
+            );
+            assert_eq!(
+                parse_file_filter_entries(Some("*.png; .jpg ; *.PNG")),
+                vec![
+                    ("*.png; *.jpg".to_string(), "*.png;*.jpg".to_string()),
+                    ("*.png".to_string(), "*.png".to_string()),
+                    ("*.jpg".to_string(), "*.jpg".to_string()),
+                ]
+            );
+        }
+
+        #[test]
+        fn context_menu_server_retirement_defers_for_custom_rename_command() {
+            assert!(!should_retire_context_menu_server(
+                CONTEXT_MENU_EXIT_CUSTOM_COMMAND,
+                CONTEXT_MENU_SERVER_MAX_MENUS,
+                0
+            ));
+            assert!(should_retire_context_menu_server(
+                CONTEXT_MENU_EXIT_INVOKED,
+                CONTEXT_MENU_SERVER_MAX_MENUS,
+                0
+            ));
+            assert!(should_retire_context_menu_server(
+                CONTEXT_MENU_EXIT_CANCELLED,
+                CONTEXT_MENU_SERVER_MAX_MENUS,
+                0
+            ));
+            assert!(should_retire_context_menu_server(
+                CONTEXT_MENU_EXIT_FAILED,
+                1,
+                CONTEXT_MENU_SERVER_MAX_CONSECUTIVE_FAILURES
+            ));
+        }
+
+        #[test]
+        fn encode_ansi_directory_path_preserves_ascii_and_rejects_unmappable_emoji_under_non_utf8_acp() {
+            let ascii_wide = encode_wide_path(Path::new(r"C:\Users\Public\DeskBox"));
+            let ascii_ansi = encode_ansi_directory_path(&ascii_wide);
+            assert_eq!(ascii_ansi, b"C:\\Users\\Public\\DeskBox\0".to_vec());
+
+            let emoji_wide = encode_wide_path(Path::new(r"C:\Users\Public\🚀NonExistentEmojiDir_DeskBoxTest"));
+            let emoji_ansi = encode_ansi_directory_path(&emoji_wide);
+            unsafe extern "system" {
+                fn GetACP() -> u32;
+            }
+            let acp = unsafe { GetACP() };
+            if acp == 65001 {
+                assert!(!emoji_ansi.is_empty());
+                assert_eq!(*emoji_ansi.last().unwrap(), 0);
+            } else {
+                // Non-UTF8 ACP (e.g. GBK 936 or Windows-1252) cannot represent 🚀 losslessly
+                // and the path does not exist on disk (no 8.3 short name), so it must fall back
+                // to empty (PCSTR::null()) rather than passing '?' or raw UTF-8 Mojibake.
+                assert!(emoji_ansi.is_empty());
+            }
+        }
+    }
+
+    fn encode_ansi_directory_path(wide_nul_terminated: &[u16]) -> Vec<u8> {
+        if wide_nul_terminated.len() <= 1 {
+            return Vec::new();
+        }
+
+        const CP_ACP: u32 = 0;
+        const CP_UTF8: u32 = 65001;
+        const WC_NO_BEST_FIT_CHARS: u32 = 0x0000_0400;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetACP() -> u32;
+            fn WideCharToMultiByte(
+                code_page: u32,
+                dw_flags: u32,
+                lp_wide_char_str: *const u16,
+                cch_wide_char: i32,
+                lp_multi_byte_str: *mut u8,
+                cb_multi_byte: i32,
+                lp_default_char: *const u8,
+                lp_used_default_char: *mut i32,
+            ) -> i32;
+            fn GetShortPathNameW(
+                lpsz_long_path: *const u16,
+                lpsz_short_path: *mut u16,
+                cch_buffer: u32,
+            ) -> u32;
+        }
+
+        fn try_encode_lossless_acp(wide: &[u16], acp: u32) -> Option<Vec<u8>> {
+            if acp == CP_UTF8 {
+                let needed = unsafe {
+                    WideCharToMultiByte(
+                        CP_UTF8,
+                        0,
+                        wide.as_ptr(),
+                        -1,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if needed <= 1 {
+                    return None;
+                }
+                let mut buf = vec![0u8; needed as usize];
+                let written = unsafe {
+                    WideCharToMultiByte(
+                        CP_UTF8,
+                        0,
+                        wide.as_ptr(),
+                        -1,
+                        buf.as_mut_ptr(),
+                        needed,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                return (written == needed).then_some(buf);
+            }
+
+            let mut used_default: i32 = 0;
+            let needed = unsafe {
+                WideCharToMultiByte(
+                    CP_ACP,
+                    WC_NO_BEST_FIT_CHARS,
+                    wide.as_ptr(),
+                    -1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                    &mut used_default,
+                )
+            };
+            if needed <= 1 || used_default != 0 {
+                return None;
+            }
+
+            let mut buf = vec![0u8; needed as usize];
+            used_default = 0;
+            let written = unsafe {
+                WideCharToMultiByte(
+                    CP_ACP,
+                    WC_NO_BEST_FIT_CHARS,
+                    wide.as_ptr(),
+                    -1,
+                    buf.as_mut_ptr(),
+                    needed,
+                    std::ptr::null(),
+                    &mut used_default,
+                )
+            };
+            (written == needed && used_default == 0).then_some(buf)
+        }
+
+        let acp = unsafe { GetACP() };
+        if let Some(encoded) = try_encode_lossless_acp(wide_nul_terminated, acp) {
+            return encoded;
+        }
+
+        // Fall back to 8.3 short path when the folder contains Unicode characters
+        // outside the active legacy code page (e.g. Japanese/Emoji on CP936).
+        let short_needed =
+            unsafe { GetShortPathNameW(wide_nul_terminated.as_ptr(), std::ptr::null_mut(), 0) };
+        if short_needed > 1 {
+            let mut short_buf = vec![0u16; short_needed as usize];
+            let short_written = unsafe {
+                GetShortPathNameW(
+                    wide_nul_terminated.as_ptr(),
+                    short_buf.as_mut_ptr(),
+                    short_needed,
+                )
+            };
+            if short_written > 0 && (short_written as usize) < short_buf.len() {
+                short_buf.truncate((short_written as usize) + 1);
+                short_buf[short_written as usize] = 0;
+                if let Some(encoded_short) = try_encode_lossless_acp(&short_buf, acp) {
+                    return encoded_short;
+                }
+            }
+        }
+
+        Vec::new()
     }
 }
 

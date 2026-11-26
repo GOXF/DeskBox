@@ -1,22 +1,69 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace DeskBox.Platform;
 
+internal enum RecycleBinEmptyOperationOutcome
+{
+    Emptied,
+    AlreadyEmpty,
+    Cancelled,
+    Failed
+}
+
 /// <summary>
-/// Recycle-bin verbs for the native-aligned namespace shortcut menu.
+/// Recycle-bin verbs, stock-icon location query, and shell change-notification
+/// primitives shared by the namespace shortcut menu and Custom Widget RecycleBin cards.
 /// Entry points are pinned with ExactSpelling + EntryPoint so a resolver
 /// mismatch surfaces as a compile-time constant here rather than as a
-/// first-call EntryPointNotFound that unit tests can never see (the
-/// entry-point probe test in DeskBox.Tests guards the export side).
+/// first-call EntryPointNotFound that unit tests can never see.
 /// </summary>
 internal static class ShellRecycleBinInterop
 {
+    internal const string RecycleBinParsingName = "::{645FF040-5081-101B-9F08-00AA002F954E}";
+    internal const string RecycleBinShellOpenArg = "shell:::{645FF040-5081-101B-9F08-00AA002F954E}";
+
+    private const int HResultCancelledWin32 = unchecked((int)0x800704C7);
+    private const int HResultAbort = unchecked((int)0x80004004);
+    private const int HResultUnexpected = unchecked((int)0x8000FFFF);
+
+    private const uint SherbNoConfirmation = 0x00000001;
+    private const uint SherbNoSound = 0x00000004;
+
+    private const uint SiidRecycler = 31;
+    private const uint SiidRecyclerFull = 32;
+    private const uint ShgsiIconLocation = 0;
+
+    private const int ShcnrfInterruptLevel = 0x0001;
+    private const int ShcnrfShellLevel = 0x0002;
+    private const int ShcnrfNewDelivery = 0x8000;
+    private const uint ShcneAllEvents = 0x7FFFFFFF;
+
     [StructLayout(LayoutKind.Sequential)]
     private struct SHQUERYRBINFO
     {
         public uint cbSize;
         public long totalSize;
         public long totalItems;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private unsafe struct SHSTOCKICONINFO
+    {
+        public uint cbSize;
+        public IntPtr hIcon;
+        public int iSysImageIndex;
+        public int iIcon;
+        public fixed char szPath[260];
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private struct SHChangeNotifyEntry
+    {
+        public IntPtr pidl;
+        public int fRecursive;
     }
 
     // A null root aggregates every drive's bin — what the desktop icon's
@@ -34,12 +81,193 @@ internal static class ShellRecycleBinInterop
         string? rootPath,
         uint flags);
 
+    [DllImport("shell32.dll", ExactSpelling = true, EntryPoint = "SHGetStockIconInfo")]
+    private static extern int SHGetStockIconInfo(
+        uint siid,
+        uint uFlags,
+        ref SHSTOCKICONINFO psii);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true,
+        EntryPoint = "SHParseDisplayName")]
+    private static extern int SHParseDisplayName(
+        string pszName,
+        IntPtr pbc,
+        out IntPtr ppidl,
+        uint sfgaoIn,
+        out uint psfgaoOut);
+
+    [DllImport("shell32.dll", ExactSpelling = true, EntryPoint = "ILFree")]
+    private static extern void ILFree(IntPtr pidl);
+
+    [DllImport("shell32.dll", ExactSpelling = true, EntryPoint = "SHChangeNotifyRegister")]
+    private static extern uint SHChangeNotifyRegister(
+        IntPtr hwnd,
+        int fSources,
+        uint fEvents,
+        uint wMsg,
+        int cEntries,
+        ref SHChangeNotifyEntry pshcne);
+
+    [DllImport("shell32.dll", ExactSpelling = true, EntryPoint = "SHChangeNotifyDeregister")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SHChangeNotifyDeregister(uint ulID);
+
     /// <summary>
     /// Total item count across all bins; false when the aggregate query
     /// itself fails (callers then keep the menu row enabled rather than
-    /// graying a working verb).
+    /// graying a working verb). Must run off the UI thread.
     /// </summary>
-    internal static bool TryQueryTotalItemCount(out long totalItems)
+    internal static bool TryQueryTotalItemCount(out long totalItems) =>
+        TryQueryRootItemCount(null, out totalItems);
+
+    /// <summary>
+    /// Determines whether any Recycle Bin contains at least one item without
+    /// scanning every drive up front: checks the live subscribed service first,
+    /// then probes non-SUBST local fixed drives (system drive first) so any
+    /// non-empty local bin short-circuits before touching secondary sleeping
+    /// disks or network mounts, falling back to the aggregate null-root query
+    /// only when every local fixed drive reports zero items. Must run off the
+    /// UI thread.
+    /// </summary>
+    internal static bool TryQueryHasAnyItems(out bool hasItems)
+    {
+        if (Services.CustomWidgetRecycleBinService.Shared.TryGetLiveSubscribedItemCount(out long liveCount))
+        {
+            hasItems = liveCount > 0;
+            return true;
+        }
+
+        IReadOnlyList<string> fixedRoots = GetOrderedLocalFixedDriveRoots();
+        return TryEvaluateTwoStageHasAnyItems(
+            fixedRoots,
+            TryQueryRootItemCount,
+            out hasItems);
+    }
+
+    internal delegate bool TryQueryBinRootItemCountDelegate(string? rootPath, out long itemCount);
+
+    internal static bool TryEvaluateTwoStageHasAnyItems(
+        IReadOnlyList<string> orderedFixedRoots,
+        TryQueryBinRootItemCountDelegate tryQueryRootCount,
+        out bool hasItems)
+    {
+        ArgumentNullException.ThrowIfNull(orderedFixedRoots);
+        ArgumentNullException.ThrowIfNull(tryQueryRootCount);
+
+        for (int i = 0; i < orderedFixedRoots.Count; i++)
+        {
+            string root = orderedFixedRoots[i];
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                continue;
+            }
+
+            if (tryQueryRootCount(root, out long rootItems) && rootItems > 0)
+            {
+                hasItems = true;
+                return true;
+            }
+        }
+
+        if (!tryQueryRootCount(null, out long totalItems))
+        {
+            hasItems = false;
+            return false;
+        }
+
+        hasItems = totalItems > 0;
+        return true;
+    }
+
+    internal static IReadOnlyList<string> OrderFixedDriveRootsForProbe(
+        IEnumerable<(string Root, DriveType DriveType, bool IsSubst)> candidates,
+        string? systemRoot)
+    {
+        ArgumentNullException.ThrowIfNull(candidates);
+
+        string normalizedSystemRoot = NormalizeDriveRoot(systemRoot);
+        var roots = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach ((string rawRoot, DriveType driveType, bool isSubst) in candidates)
+        {
+            if (driveType != DriveType.Fixed || isSubst)
+            {
+                continue;
+            }
+
+            string normalized = NormalizeDriveRoot(rawRoot);
+            if (normalized.Length == 0 || !seen.Add(normalized))
+            {
+                continue;
+            }
+
+            if (normalizedSystemRoot.Length > 0 &&
+                string.Equals(normalized, normalizedSystemRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                roots.Insert(0, normalized);
+            }
+            else
+            {
+                roots.Add(normalized);
+            }
+        }
+
+        return roots;
+    }
+
+    private static IReadOnlyList<string> GetOrderedLocalFixedDriveRoots()
+    {
+        try
+        {
+            string? systemRoot = Path.GetPathRoot(Environment.SystemDirectory);
+            DriveInfo[] drives = DriveInfo.GetDrives();
+            var candidates = new List<(string Root, DriveType DriveType, bool IsSubst)>(drives.Length);
+            foreach (DriveInfo drive in drives)
+            {
+                try
+                {
+                    string root = drive.Name;
+                    DriveType driveType = drive.DriveType;
+                    bool isSubst = driveType == DriveType.Fixed &&
+                        FileOperationNativeMethods.IsSubstDriveRoot(root);
+                    candidates.Add((root, driveType, isSubst));
+                }
+                catch
+                {
+                }
+            }
+
+            return OrderFixedDriveRootsForProbe(candidates, systemRoot);
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private static string NormalizeDriveRoot(string? root)
+    {
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return string.Empty;
+        }
+
+        string trimmed = root.Trim();
+        if (trimmed.Length < 2 || trimmed[1] != Path.VolumeSeparatorChar)
+        {
+            return string.Empty;
+        }
+
+        return string.Create(3, trimmed[0], static (span, driveLetter) =>
+        {
+            span[0] = char.ToUpperInvariant(driveLetter);
+            span[1] = Path.VolumeSeparatorChar;
+            span[2] = Path.DirectorySeparatorChar;
+        });
+    }
+
+    private static bool TryQueryRootItemCount(string? rootPath, out long totalItems)
     {
         totalItems = 0;
         try
@@ -48,12 +276,12 @@ internal static class ShellRecycleBinInterop
             {
                 cbSize = (uint)Marshal.SizeOf<SHQUERYRBINFO>()
             };
-            if (SHQueryRecycleBin(null, ref info) < 0)
+            if (SHQueryRecycleBin(rootPath, ref info) < 0)
             {
                 return false;
             }
 
-            totalItems = info.totalItems;
+            totalItems = Math.Max(0, info.totalItems);
             return true;
         }
         catch
@@ -65,17 +293,351 @@ internal static class ShellRecycleBinInterop
     /// <summary>
     /// Empties every bin with flags 0, so the system shows its own
     /// confirmation and progress dialogs — the same behavior as the native
-    /// desktop verb.
+    /// desktop verb. Must run off the UI thread.
     /// </summary>
-    internal static bool TryEmptyAllBins(IntPtr ownerWindow)
+    internal static bool TryEmptyAllBins(IntPtr ownerWindow) =>
+        EmptyAllBinsWithOutcome(ownerWindow) is
+            RecycleBinEmptyOperationOutcome.Emptied or
+            RecycleBinEmptyOperationOutcome.AlreadyEmpty;
+
+    /// <summary>
+    /// Empties every bin with flags 0 and classifies cancellation and
+    /// already-empty HRESULTs separately from genuine failures. Must run on a
+    /// dedicated STA worker off the UI thread.
+    /// </summary>
+    internal static RecycleBinEmptyOperationOutcome EmptyAllBinsWithOutcome(IntPtr ownerWindow)
     {
         try
         {
-            return SHEmptyRecycleBin(ownerWindow, null, 0) >= 0;
+            int hr = SHEmptyRecycleBin(ownerWindow, null, 0);
+            return ClassifyEmptyAllBinsHResult(hr);
+        }
+        catch
+        {
+            return RecycleBinEmptyOperationOutcome.Failed;
+        }
+    }
+
+    internal static RecycleBinEmptyOperationOutcome ClassifyEmptyAllBinsHResult(int hr)
+    {
+        if (hr >= 0)
+        {
+            return RecycleBinEmptyOperationOutcome.Emptied;
+        }
+
+        return hr switch
+        {
+            HResultCancelledWin32 or HResultAbort => RecycleBinEmptyOperationOutcome.Cancelled,
+            HResultUnexpected => RecycleBinEmptyOperationOutcome.AlreadyEmpty,
+            _ => RecycleBinEmptyOperationOutcome.Failed
+        };
+    }
+
+    /// <summary>
+    /// Empties every bin without a duplicate system confirmation prompt when
+    /// the caller has already presented a dedicated confirmation dialog.
+    /// Must run off the UI thread.
+    /// </summary>
+    internal static bool TryEmptyAllBinsConfirmed(IntPtr ownerWindow)
+    {
+        try
+        {
+            return SHEmptyRecycleBin(ownerWindow, null, SherbNoConfirmation | SherbNoSound) >= 0;
         }
         catch
         {
             return false;
         }
     }
+
+    /// <summary>
+    /// Extracts the Windows stock Recycle Bin artwork (empty or full) via
+    /// SHDefExtractIcon without binding third-party shell extensions in-process.
+    /// </summary>
+    internal static unsafe byte[]? ExtractRecycleBinStockIconPngBytes(bool isEmpty, int pixelSize = 32)
+    {
+        try
+        {
+            var sii = new SHSTOCKICONINFO
+            {
+                cbSize = (uint)sizeof(SHSTOCKICONINFO)
+            };
+            uint stockId = isEmpty ? SiidRecycler : SiidRecyclerFull;
+            if (SHGetStockIconInfo(stockId, ShgsiIconLocation, ref sii) >= 0)
+            {
+                string iconModulePath = new(sii.szPath);
+                if (!string.IsNullOrWhiteSpace(iconModulePath))
+                {
+                    byte[]? stockBytes = Helpers.IconHelper.GetIndexedIconPngBytes(
+                        iconModulePath,
+                        sii.iIcon,
+                        pixelSize);
+                    if (stockBytes is { Length: > 0 })
+                    {
+                        return stockBytes;
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            string imageres = Path.Combine(Environment.SystemDirectory, "imageres.dll");
+            return Helpers.IconHelper.GetIndexedIconPngBytes(
+                imageres,
+                isEmpty ? -55 : -54,
+                pixelSize);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    internal static bool TryRegisterRecycleBinChangeNotify(
+        IntPtr hwnd,
+        uint messageId,
+        out uint registrationId)
+    {
+        registrationId = 0;
+        if (hwnd == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        IntPtr binPidl = IntPtr.Zero;
+        try
+        {
+            if (SHParseDisplayName(RecycleBinParsingName, IntPtr.Zero, out binPidl, 0, out _) != 0 ||
+                binPidl == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            var entry = new SHChangeNotifyEntry
+            {
+                pidl = binPidl,
+                fRecursive = 1
+            };
+            registrationId = SHChangeNotifyRegister(
+                hwnd,
+                ShcnrfInterruptLevel | ShcnrfShellLevel | ShcnrfNewDelivery,
+                ShcneAllEvents,
+                messageId,
+                1,
+                ref entry);
+            return registrationId != 0;
+        }
+        catch
+        {
+            registrationId = 0;
+            return false;
+        }
+        finally
+        {
+            if (binPidl != IntPtr.Zero)
+            {
+                ILFree(binPidl);
+            }
+        }
+    }
+
+    internal static void UnregisterRecycleBinChangeNotify(uint registrationId)
+    {
+        if (registrationId == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            _ = SHChangeNotifyDeregister(registrationId);
+        }
+        catch
+        {
+        }
+    }
+
+    internal readonly record struct RecycleBinChangeWatcherHandle(IntPtr Hwnd, uint RegistrationId)
+    {
+        public bool IsValid => Hwnd != IntPtr.Zero && RegistrationId != 0;
+    }
+
+    private const string NotifyWindowClassName = "DeskBoxCustomWidgetRecycleNotifyWindow";
+    private const uint NotifyWindowMessage = 0x8000 + 0x019A; // WM_APP + 0x19A
+    private const uint WsPopup = 0x80000000;
+    private const uint WsExToolWindow = 0x00000080;
+
+    private static readonly object s_windowClassGate = new();
+    private static bool s_windowClassRegistered;
+    private static readonly ConcurrentDictionary<IntPtr, Action> s_notifyCallbacks = new();
+
+    internal static unsafe bool TryStartRecycleBinChangeWatcher(
+        Action onChanged,
+        out RecycleBinChangeWatcherHandle handle)
+    {
+        ArgumentNullException.ThrowIfNull(onChanged);
+        handle = default;
+
+        try
+        {
+            IntPtr hInstance = GetModuleHandleW(null);
+            lock (s_windowClassGate)
+            {
+                if (!s_windowClassRegistered)
+                {
+                    fixed (char* classNamePtr = NotifyWindowClassName)
+                    {
+                        var wc = new WNDCLASSEXW
+                        {
+                            cbSize = (uint)sizeof(WNDCLASSEXW),
+                            lpfnWndProc = (IntPtr)(delegate* unmanaged[Stdcall]<IntPtr, uint, UIntPtr, IntPtr, IntPtr>)&NotifyWndProc,
+                            hInstance = hInstance,
+                            lpszClassName = (IntPtr)classNamePtr
+                        };
+                        if (RegisterClassExW(&wc) != 0)
+                        {
+                            s_windowClassRegistered = true;
+                        }
+                    }
+                }
+            }
+
+            IntPtr hwnd = CreateWindowExW(
+                WsExToolWindow,
+                NotifyWindowClassName,
+                string.Empty,
+                WsPopup,
+                0, 0, 0, 0,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                hInstance,
+                IntPtr.Zero);
+
+            if (hwnd == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            s_notifyCallbacks[hwnd] = onChanged;
+            if (TryRegisterRecycleBinChangeNotify(hwnd, NotifyWindowMessage, out uint regId))
+            {
+                handle = new RecycleBinChangeWatcherHandle(hwnd, regId);
+                return true;
+            }
+
+            s_notifyCallbacks.TryRemove(hwnd, out _);
+            _ = DestroyWindow(hwnd);
+        }
+        catch (Exception ex)
+        {
+            App.Log($"[RecycleBin] Native watcher setup failed: {ex.Message}");
+        }
+
+        return false;
+    }
+
+    internal static void StopRecycleBinChangeWatcher(RecycleBinChangeWatcherHandle handle)
+    {
+        if (handle.RegistrationId != 0)
+        {
+            UnregisterRecycleBinChangeNotify(handle.RegistrationId);
+        }
+
+        if (handle.Hwnd != IntPtr.Zero)
+        {
+            s_notifyCallbacks.TryRemove(handle.Hwnd, out _);
+            try
+            {
+                _ = DestroyWindow(handle.Hwnd);
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvStdcall)])]
+    private static IntPtr NotifyWndProc(IntPtr hWnd, uint msg, UIntPtr wParam, IntPtr lParam)
+    {
+        if (msg == NotifyWindowMessage)
+        {
+            if (s_notifyCallbacks.TryGetValue(hWnd, out Action? cb))
+            {
+                try
+                {
+                    cb();
+                }
+                catch
+                {
+                }
+            }
+            return IntPtr.Zero;
+        }
+
+        return DefWindowProcW(hWnd, msg, wParam, lParam);
+    }
+
+    internal static void OpenRecycleBinInExplorer()
+    {
+        try
+        {
+            using Process? _ = Process.Start(new ProcessStartInfo("explorer.exe", RecycleBinShellOpenArg)
+            {
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            App.Log($"[RecycleBin] Failed to open Explorer Recycle Bin: {ex.Message}");
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WNDCLASSEXW
+    {
+        public uint cbSize;
+        public uint style;
+        public IntPtr lpfnWndProc;
+        public int cbClsExtra;
+        public int cbWndExtra;
+        public IntPtr hInstance;
+        public IntPtr hIcon;
+        public IntPtr hCursor;
+        public IntPtr hbrBackground;
+        public IntPtr lpszMenuName;
+        public IntPtr lpszClassName;
+        public IntPtr hIconSm;
+    }
+
+    [DllImport("kernel32.dll", EntryPoint = "GetModuleHandleW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern IntPtr GetModuleHandleW(string? lpModuleName);
+
+    [DllImport("user32.dll", EntryPoint = "RegisterClassExW", ExactSpelling = true)]
+    private static extern unsafe ushort RegisterClassExW(WNDCLASSEXW* lpwcx);
+
+    [DllImport("user32.dll", EntryPoint = "CreateWindowExW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern IntPtr CreateWindowExW(
+        uint dwExStyle,
+        string lpClassName,
+        string lpWindowName,
+        uint dwStyle,
+        int x,
+        int y,
+        int nWidth,
+        int nHeight,
+        IntPtr hWndParent,
+        IntPtr hMenu,
+        IntPtr hInstance,
+        IntPtr lpParam);
+
+    [DllImport("user32.dll", EntryPoint = "DestroyWindow", ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DestroyWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll", EntryPoint = "DefWindowProcW", ExactSpelling = true)]
+    private static extern IntPtr DefWindowProcW(IntPtr hWnd, uint msg, UIntPtr wParam, IntPtr lParam);
 }

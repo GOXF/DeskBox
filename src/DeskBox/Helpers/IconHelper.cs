@@ -1,5 +1,7 @@
-﻿using System.Drawing;
+using System.Buffers;
+using System.Buffers.Binary;
 using System.Diagnostics;
+using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Collections.Concurrent;
 using DeskBox.Platform;
@@ -11,7 +13,7 @@ namespace DeskBox.Helpers;
 /// <summary>
 /// Extracts native Windows file and folder icons using the Win32 Shell API.
 /// </summary>
-public static class IconHelper
+public static partial class IconHelper
 {
     private const int BaseMaxIconCacheEntries = 200;
     private const long BaseMaxIconCacheBytes = 32L * 1024 * 1024;
@@ -39,6 +41,7 @@ public static class IconHelper
     private static long MaxThumbnailCacheBytes =>
         ScaleCacheByteLimit(BaseMaxThumbnailCacheBytes);
     private const string SharedCacheScope = "shared";
+    internal const int MaxNonSharedIconBytePayloadLength = 85_000;
     private const int MaxIconSourceTimeoutEntries = 256;
     private const long IconSourceTimeoutRetryMs = 30_000;
     private static readonly TimeSpan IconSourceResolutionTimeout =
@@ -52,11 +55,13 @@ public static class IconHelper
     // resource is gone. Requesting one of these returns a canvas the artwork
     // actually fills, unlike a Jumbo request that pads it.
     private static readonly int[] s_shellItemIconNativeFrameSizes = { 48, 32 };
-    private const string InternetShortcutIconStrategyVersion = "url-shell-v2";
+    private const string InternetShortcutIconStrategyVersion = "url-shell-v3";
 
     // Icon bytes cache: path → PNG bytes (for shell icons, not image thumbnails)
     private static readonly ConcurrentDictionary<string, byte[]?> s_iconBytesCache = new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, long> s_iconBytesLastAccess = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly object s_iconBytesMutationLock = new();
+    private static long s_totalIconCacheBytes;
 
     // Bitmap cache for shell icons (not image thumbnails)
     private static readonly ConcurrentDictionary<string, Task<BitmapImage?>> s_bitmapImageCache = new(StringComparer.OrdinalIgnoreCase);
@@ -65,15 +70,20 @@ public static class IconHelper
     private static readonly Dictionary<string, LinkedListNode<string>> s_bitmapLruNodes = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, long> s_bitmapEstimatedBytes = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, long> s_bitmapLastAccess = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, HashSet<string>> s_bitmapKeysByScope = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, HashSet<string>> s_iconByteKeysByScope = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, HashSet<string>> s_scopesByIconByteKey = new(StringComparer.OrdinalIgnoreCase);
     private static long s_totalBitmapEstimatedBytes;
 
     // ── Media thumbnail LRU cache (separate from icon cache) ──────
-    // Uses a linked list + dictionary for simple LRU eviction.
+    // Uses a linked list + dictionary for O(1) LRU eviction.
     private static readonly object s_thumbLock = new();
     private static readonly LinkedList<string> s_thumbLru = new();
+    private static readonly Dictionary<string, LinkedListNode<string>> s_thumbLruNodes = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, Task<BitmapImage?>> s_thumbCache = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, long> s_thumbEstimatedBytes = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, long> s_thumbLastAccess = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, HashSet<string>> s_thumbKeysByScope = new(StringComparer.OrdinalIgnoreCase);
     private static long s_totalThumbnailEstimatedBytes;
 
     internal readonly record struct IdleIconCacheReleaseResult(
@@ -168,11 +178,17 @@ public static class IconHelper
         }
 
         string cacheKey = resolvedIconSource.CacheKey;
-        TouchCachedIconBytes(cacheKey);
         bool isShortcutPath = ShortcutHelper.IsShortcutPath(path);
         bool isInternetShortcutPath =
             ShortcutHelper.IsInternetShortcutPath(path);
         int normalizedDecodePixelWidth = Math.Clamp(decodePixelWidth, 0, 256);
+        int requestedIconSize = QuantizeShellIconRequestSize(normalizedDecodePixelWidth);
+        string iconBytesCacheKey = $"{cacheKey}:size={requestedIconSize}";
+        TouchCachedIconBytes(iconBytesCacheKey);
+        if (s_iconBytesCache.ContainsKey(iconBytesCacheKey))
+        {
+            IndexIconBytesScopeKey(normalizedCacheScope, iconBytesCacheKey);
+        }
         string bitmapCacheKey = $"{normalizedCacheScope}|{cacheKey}:decode={normalizedDecodePixelWidth}";
         Task<BitmapImage?> bitmapTask;
         if (s_bitmapImageCache.TryGetValue(bitmapCacheKey, out bitmapTask!))
@@ -187,7 +203,7 @@ public static class IconHelper
                 _ => LoadBitmapImageWithDiagnosticsAsync(
                     dispatcher,
                     iconSource,
-                    cacheKey,
+                    iconBytesCacheKey,
                     bitmapCacheKey,
                     NormalizeSourcePath(path),
                     hideShortcutArrowOverlay,
@@ -198,7 +214,13 @@ public static class IconHelper
         TrackDecodedBitmap(
             bitmapCacheKey,
             EstimateDecodedBitmapBytes(normalizedDecodePixelWidth));
-        return await bitmapTask;
+        BitmapImage? decodedBitmap = await bitmapTask;
+        if (s_iconBytesCache.ContainsKey(iconBytesCacheKey))
+        {
+            IndexIconBytesScopeKey(normalizedCacheScope, iconBytesCacheKey);
+        }
+
+        return decodedBitmap;
     }
 
     public static bool IsImageFile(string path)
@@ -292,8 +314,7 @@ public static class IconHelper
             if (s_thumbCache.TryGetValue(cacheKey, out var cached))
             {
                 // Move to front of LRU
-                RemoveThumbnailLruKey(cacheKey);
-                s_thumbLru.AddFirst(cacheKey);
+                TouchThumbnailLruLocked(cacheKey);
                 s_thumbLastAccess[cacheKey] = Stopwatch.GetTimestamp();
                 cachedTask = cached;
             }
@@ -316,18 +337,18 @@ public static class IconHelper
             {
                 task = CreateThumbnailWithDiagnosticsAsync(createThumbnail);
                 s_thumbCache[cacheKey] = task;
+                IndexThumbnailScopeKey(cacheKey);
                 createdTask = true;
                 long estimatedBytes = EstimateDecodedBitmapBytes(decodePixelWidth);
                 s_thumbEstimatedBytes[cacheKey] = estimatedBytes;
                 s_totalThumbnailEstimatedBytes += estimatedBytes;
-                s_thumbLru.AddFirst(cacheKey);
+                TouchThumbnailLruLocked(cacheKey);
                 s_thumbLastAccess[cacheKey] = Stopwatch.GetTimestamp();
                 EvictThumbnailCacheIfNeeded();
             }
             else
             {
-                RemoveThumbnailLruKey(cacheKey);
-                s_thumbLru.AddFirst(cacheKey);
+                TouchThumbnailLruLocked(cacheKey);
                 s_thumbLastAccess[cacheKey] = Stopwatch.GetTimestamp();
             }
 
@@ -434,16 +455,18 @@ public static class IconHelper
                 return null;
             }
 
-            // Fallback: decode to the requested display size.
-            byte[] bytes = await File.ReadAllBytesAsync(path);
-            if (bytes.Length == 0)
-            {
-                return null;
-            }
-
-            image = await CreateBitmapImageAsync(dispatcher, bytes, decodePixelWidth);
-
-            return image;
+            // Fallback: decode to the requested display size through the
+            // pinned built-in WIC thumbnail decoder so WinUI never retains an
+            // arbitrary multi-megabyte original file stream in CBitmapImage.
+            byte[]? decodedBytes = await WicBuiltInThumbnailDecoder.DecodeAsync(
+                path,
+                decodePixelWidth);
+            return decodedBytes is { Length: > 0 }
+                ? await CreateBitmapImageAsync(
+                    dispatcher,
+                    decodedBytes,
+                    decodePixelWidth)
+                : null;
         }
         catch (Exception ex)
         {
@@ -515,6 +538,7 @@ public static class IconHelper
     private static void RemoveThumbnailCacheEntry(string cacheKey)
     {
         s_thumbCache.Remove(cacheKey);
+        UnindexThumbnailScopeKey(cacheKey);
         RemoveThumbnailLruKey(cacheKey);
         s_thumbLastAccess.Remove(cacheKey);
         if (s_thumbEstimatedBytes.Remove(cacheKey, out long estimatedBytes))
@@ -526,15 +550,24 @@ public static class IconHelper
             Math.Max(0, s_totalThumbnailEstimatedBytes);
     }
 
+    private static void TouchThumbnailLruLocked(string cacheKey)
+    {
+        if (s_thumbLruNodes.TryGetValue(cacheKey, out LinkedListNode<string>? existingNode))
+        {
+            s_thumbLru.Remove(existingNode);
+            s_thumbLru.AddFirst(existingNode);
+        }
+        else
+        {
+            s_thumbLruNodes[cacheKey] = s_thumbLru.AddFirst(cacheKey);
+        }
+    }
+
     private static void RemoveThumbnailLruKey(string cacheKey)
     {
-        for (var node = s_thumbLru.First; node is not null; node = node.Next)
+        if (s_thumbLruNodes.Remove(cacheKey, out LinkedListNode<string>? node))
         {
-            if (node.Value.Equals(cacheKey, StringComparison.OrdinalIgnoreCase))
-            {
-                s_thumbLru.Remove(node);
-                return;
-            }
+            s_thumbLru.Remove(node);
         }
     }
 
@@ -557,7 +590,32 @@ public static class IconHelper
                 return null;
             }
 
-            var storageFile = await Windows.Storage.StorageFile.GetFileFromPathAsync(path);
+            string dataRoot = Services.DeskBoxDataPathService.Current.RootPath;
+            if (!string.IsNullOrWhiteSpace(dataRoot))
+            {
+                string dataRootPrefix = dataRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                string fullCandidate = Path.GetFullPath(path);
+                if ((Services.AppDistributionService.Current.IsPackaged ||
+                     Services.AppDistributionService.Current.IsMicrosoftStore) &&
+                    fullCandidate.StartsWith(dataRootPrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    // RuntimeBroker rejects StorageFile on hidden .appdata (0x8007016C);
+                    // return null immediately so caller uses in-process WIC stream decode.
+                    return null;
+                }
+
+                string clipboardPrefix = Path.Combine(Services.DeskBoxDataPathService.Current.DataDirectory, "clipboard")
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                if (fullCandidate.StartsWith(clipboardPrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Avoid populating Windows Explorer's persistent thumbcache with clipboard screenshots.
+                    return null;
+                }
+            }
+
+            string resolvedPath = Platform.Win32Helper.ResolveUnvirtualizedPhysicalPath(path);
+            var storageFile = await Windows.Storage.StorageFile.GetFileFromPathAsync(
+                File.Exists(resolvedPath) ? resolvedPath : path);
             using var thumbnail = await storageFile.GetThumbnailAsync(
                 thumbnailMode,
                 (uint)decodePixelWidth,
@@ -606,7 +664,12 @@ public static class IconHelper
         int decodePixelWidth)
     {
         var bmp = new BitmapImage();
-        bmp.DecodePixelWidth = decodePixelWidth;
+        if (decodePixelWidth > 0)
+        {
+            bmp.DecodePixelType = DecodePixelType.Physical;
+            bmp.DecodePixelWidth = decodePixelWidth;
+        }
+
         await bmp.SetSourceAsync(stream);
         return bmp;
     }
@@ -666,13 +729,9 @@ public static class IconHelper
         string normalizedSourcePath = NormalizeSourcePath(path);
         string sourceCachePrefix = BuildSourceCachePrefix(normalizedSourcePath);
         string bitmapCacheMarker = $"|{sourceCachePrefix}";
-        string extensionCacheKey = $"ext:{Path.GetExtension(normalizedSourcePath)}";
-        string extensionBitmapMarker = $"|{extensionCacheKey}:decode=";
         bool invalidatedDirectoryIcon = false;
         foreach (string bitmapKey in s_bitmapImageCache.Keys.Where(
-                     key =>
-                         key.Contains(bitmapCacheMarker, StringComparison.OrdinalIgnoreCase) ||
-                         key.Contains(extensionBitmapMarker, StringComparison.OrdinalIgnoreCase)))
+                     key => key.Contains(bitmapCacheMarker, StringComparison.OrdinalIgnoreCase)))
         {
             RemoveDecodedBitmap(bitmapKey);
         }
@@ -686,14 +745,10 @@ public static class IconHelper
             RemoveCachedIconBytes(cacheKey, out _);
         }
 
-        RemoveCachedIconBytes(extensionCacheKey, out _);
-
         if (resetTransientFailures)
         {
             foreach (string timeoutKey in s_iconBytesTimeouts.Keys.Where(
-                         key =>
-                             key.StartsWith(sourceCachePrefix, StringComparison.OrdinalIgnoreCase) ||
-                             key.Equals(extensionCacheKey, StringComparison.OrdinalIgnoreCase)))
+                         key => key.StartsWith(sourceCachePrefix, StringComparison.OrdinalIgnoreCase)))
             {
                 s_iconBytesTimeouts.TryRemove(timeoutKey, out _);
             }
@@ -744,7 +799,9 @@ public static class IconHelper
         lock (s_thumbLock)
         {
             s_thumbCache.Clear();
+            s_thumbKeysByScope.Clear();
             s_thumbLru.Clear();
+            s_thumbLruNodes.Clear();
             s_thumbEstimatedBytes.Clear();
             s_thumbLastAccess.Clear();
             s_totalThumbnailEstimatedBytes = 0;
@@ -928,7 +985,9 @@ public static class IconHelper
 
         int iconByteEntriesBefore = s_iconBytesCache.Count;
         long iconBytesBefore = GetIconByteCacheSize();
-        TrimIconByteCacheTo(0, 0);
+        TrimIconByteCacheTo(
+            Math.Max(1, MaxIconCacheEntries / 2),
+            Math.Max(1, MaxIconCacheBytes / 2));
         long iconBytesAfter = GetIconByteCacheSize();
 
         // Timeout/failure markers are cheap but should not survive a full hidden
@@ -1005,24 +1064,90 @@ public static class IconHelper
         }
 
         string normalizedScope = cacheScope.Trim();
-        string bitmapPrefix = normalizedScope + "|";
-        foreach (string key in s_bitmapImageCache.Keys.Where(
-                     key => key.StartsWith(bitmapPrefix, StringComparison.OrdinalIgnoreCase)))
+        List<string>? exclusiveIconByteKeys = null;
+        lock (s_bitmapCacheLock)
         {
-            RemoveDecodedBitmap(key);
+            if (s_bitmapKeysByScope.TryGetValue(normalizedScope, out HashSet<string>? bitmapKeys) &&
+                bitmapKeys.Count > 0)
+            {
+                foreach (string key in bitmapKeys.ToArray())
+                {
+                    RemoveDecodedBitmapCore(key);
+                }
+
+                UpdateDecodedBitmapDiagnostics();
+            }
+
+            if (s_iconByteKeysByScope.Remove(normalizedScope, out HashSet<string>? iconByteKeys))
+            {
+                bool allowEvictByteEntries = !string.Equals(
+                    normalizedScope,
+                    SharedCacheScope,
+                    StringComparison.OrdinalIgnoreCase);
+                foreach (string iconByteKey in iconByteKeys)
+                {
+                    if (!s_scopesByIconByteKey.TryGetValue(iconByteKey, out HashSet<string>? scopes))
+                    {
+                        continue;
+                    }
+
+                    scopes.Remove(normalizedScope);
+                    if (scopes.Count == 0)
+                    {
+                        s_scopesByIconByteKey.Remove(iconByteKey);
+                        if (allowEvictByteEntries &&
+                            !iconByteKey.StartsWith("ext:", StringComparison.OrdinalIgnoreCase))
+                        {
+                            (exclusiveIconByteKeys ??= []).Add(iconByteKey);
+                        }
+                    }
+                }
+            }
         }
 
-        string thumbnailPrefix = $"thumb:{normalizedScope}|";
+        if (exclusiveIconByteKeys is not null)
+        {
+            foreach (string iconByteKey in exclusiveIconByteKeys)
+            {
+                RemoveCachedIconBytes(iconByteKey, out _);
+            }
+
+            PerformanceLogger.IconCacheCount = s_iconBytesCache.Count;
+        }
+
         lock (s_thumbLock)
         {
-            foreach (string key in s_thumbCache.Keys.Where(
-                         key => key.StartsWith(thumbnailPrefix, StringComparison.OrdinalIgnoreCase)).ToList())
+            if (s_thumbKeysByScope.TryGetValue(normalizedScope, out HashSet<string>? thumbKeys) &&
+                thumbKeys.Count > 0)
             {
-                RemoveThumbnailCacheEntry(key);
+                foreach (string key in thumbKeys.ToArray())
+                {
+                    RemoveThumbnailCacheEntry(key);
+                }
             }
 
             PerformanceLogger.ThumbnailCacheCount = s_thumbCache.Count;
         }
+    }
+
+    internal static int QuantizeShellIconRequestSize(int decodePixelWidth)
+    {
+        if (decodePixelWidth <= 0)
+        {
+            return PreferredShellItemIconSize;
+        }
+
+        if (decodePixelWidth <= 48)
+        {
+            return 48;
+        }
+
+        if (decodePixelWidth <= 96)
+        {
+            return 96;
+        }
+
+        return PreferredShellItemIconSize;
     }
 
     private static async Task<BitmapImage?> LoadBitmapImageAsync(
@@ -1036,38 +1161,58 @@ public static class IconHelper
         bool isInternetShortcutPath,
         int decodePixelWidth)
     {
+        int requestedIconSize = QuantizeShellIconRequestSize(decodePixelWidth);
         if (!TryGetCachedIconBytes(iconBytesCacheKey, out var bytes))
         {
             bool shortcutProxyAttempted = false;
             IconSource loadIconSource = iconSource;
             if (isInternetShortcutPath)
             {
-                // Resolve the original .url as a Shell item before interpreting
-                // IconFile ourselves. This mirrors Explorer and preserves Steam
-                // game artwork, custom protocol icons and per-user associations.
-                shortcutProxyAttempted = true;
-                bytes = await TryLoadHighResolutionShellItemIconAsync(
-                    originalSourcePath,
-                    includeOverlays: !hideShortcutArrowOverlay);
-                if (bytes is { Length: > 0 })
+                InternetShortcutLoadDecision urlDecision =
+                    await DecideInternetShortcutLoadAsync(
+                        originalSourcePath,
+                        hideShortcutArrowOverlay);
+                if (urlDecision.UseShellProxyFirst)
                 {
-                    App.LogVerbose(
-                        $"[IconHelper] Loaded Internet shortcut icon through " +
-                        $"Shell proxy path={originalSourcePath} " +
-                        $"overlays={!hideShortcutArrowOverlay}");
-                }
-                else
-                {
-                    // Only parse IconFile after the isolated Shell route fails.
-                    // The fallback resolver is itself bounded because IconFile
-                    // can name an unavailable drive or network location.
-                    IconSource? fallbackSource =
-                        await ResolveInternetShortcutFallbackSourceAsync(
-                            originalSourcePath);
-                    if (fallbackSource is not null)
+                    // Resolve the original .url as a Shell item when it has no
+                    // missing IconFile / broken Steam game icon, preserving web
+                    // favicons (:favicon:$DATA), custom protocol icons and overlays.
+                    shortcutProxyAttempted = true;
+                    bytes = await TryLoadHighResolutionShellItemIconAsync(
+                        originalSourcePath,
+                        includeOverlays: !hideShortcutArrowOverlay,
+                        requestedSize: requestedIconSize);
+                    if (bytes is { Length: > 0 } &&
+                        !hideShortcutArrowOverlay &&
+                        requestedIconSize > 48 &&
+                        ShellThumbnailProxy.IsLikelyPaddedIconPayload(bytes))
                     {
-                        loadIconSource = fallbackSource;
+                        bytes = await RecoverPaddedShellItemIconAsync(
+                            originalSourcePath,
+                            bytes);
                     }
+
+                    if (bytes is { Length: > 0 })
+                    {
+                        App.LogVerbose(
+                            $"[IconHelper] Loaded Internet shortcut icon through " +
+                            $"Shell proxy path={originalSourcePath} " +
+                            $"overlays={!hideShortcutArrowOverlay}");
+                    }
+                    else
+                    {
+                        IconSource? fallbackSource = urlDecision.FallbackSource ??
+                            await ResolveInternetShortcutFallbackSourceAsync(
+                                originalSourcePath);
+                        if (fallbackSource is not null)
+                        {
+                            loadIconSource = fallbackSource;
+                        }
+                    }
+                }
+                else if (urlDecision.FallbackSource is not null)
+                {
+                    loadIconSource = urlDecision.FallbackSource;
                 }
             }
 
@@ -1080,16 +1225,30 @@ public static class IconHelper
             if (!ShortcutHelper.IsShortcutPath(loadIconSource.Path) &&
                 !loadIconSource.UsesExplicitIconIndex)
             {
-                // Ask the same isolated Shell-item pipeline used by Explorer for
-                // every real file and folder. This also covers a shortcut whose
-                // icon source resolved past the .lnk (the target file): the
-                // resolved source is an ordinary file, no shortcut overlay is
-                // involved, and skipping this pipeline is what made shortcut
-                // tiles render as pre-scaled 32/48 px image-list bitmaps. A
-                // source that still is the .lnk itself keeps the image-list
-                // path so the arrow-overlay rendering the user chose is
-                // preserved.
-                bytes = await TryLoadFileShellItemIconAsync(loadIconSource.Path);
+                if (IsImageFile(loadIconSource.Path))
+                {
+                    bytes = await BoundedBackgroundWorkScheduler.SharedShell.RunAsync(
+                        () => TryReadDirectImageIconBytes(loadIconSource.Path),
+                        IconBytesLoadTimeout) is { Status: BoundedBackgroundWorkStatus.Completed, Value: { Length: > 0 } imgBytes }
+                            ? imgBytes
+                            : null;
+                }
+                else
+                {
+                    // Ask the same isolated Shell-item pipeline used by Explorer for
+                    // every real file and folder. This also covers a shortcut whose
+                    // icon source resolved past the .lnk (the target file): the
+                    // resolved source is an ordinary file, no shortcut overlay is
+                    // involved, and skipping this pipeline is what made shortcut
+                    // tiles render as pre-scaled 32/48 px image-list bitmaps. A
+                    // source that still is the .lnk itself keeps the image-list
+                    // path so the arrow-overlay rendering the user chose is
+                    // preserved.
+                    bytes = await TryLoadFileShellItemIconAsync(
+                        loadIconSource.Path,
+                        requestedIconSize);
+                }
+
                 if (bytes is { Length: > 0 })
                 {
                     App.LogVerbose(
@@ -1097,7 +1256,11 @@ public static class IconHelper
                         $"path={loadIconSource.Path}");
                 }
             }
-            else if (isShortcutPath && !hideShortcutArrowOverlay)
+            else if (bytes is not { Length: > 0 } &&
+                     isShortcutPath &&
+                     !hideShortcutArrowOverlay &&
+                     ShortcutHelper.IsShortcutPath(loadIconSource.Path) &&
+                     !shortcutProxyAttempted)
             {
                 // Arrow-overlay mode: the source is the .lnk itself, so ask the
                 // Shell explicitly for the item icon WITH overlays through the
@@ -1106,7 +1269,8 @@ public static class IconHelper
                 // which rendered every arrow shortcut as a blurry tile.
                 bytes = await TryLoadHighResolutionShellItemIconAsync(
                     originalSourcePath,
-                    includeOverlays: true);
+                    includeOverlays: true,
+                    requestedSize: requestedIconSize);
                 if (bytes is { Length: > 0 })
                 {
                     bytes = ShellThumbnailProxy.NormalizeIconPayload(bytes) ?? bytes;
@@ -1136,7 +1300,9 @@ public static class IconHelper
                 // fallback if the handler is unavailable.
                 shortcutProxyAttempted = true;
                 bytes = await TryLoadHighResolutionShellItemIconAsync(
-                    originalSourcePath);
+                    originalSourcePath,
+                    includeOverlays: false,
+                    requestedSize: requestedIconSize);
                 if (bytes is { Length: > 0 })
                 {
                     bytes = ShellThumbnailProxy.NormalizeIconPayload(bytes);
@@ -1160,7 +1326,9 @@ public static class IconHelper
                 // third-party Shell code.
                 shortcutProxyAttempted = true;
                 bytes = await TryLoadHighResolutionShellItemIconAsync(
-                    loadIconSource.Path);
+                    loadIconSource.Path,
+                    includeOverlays: false,
+                    requestedSize: requestedIconSize);
 
                 if (isShortcutPath && bytes is { Length: > 0 })
                 {
@@ -1194,7 +1362,8 @@ public static class IconHelper
                             ? cachedBytes
                             : LoadIconBytes(
                                 loadIconSource,
-                                rejectPaddedShortcutIcon),
+                                rejectPaddedShortcutIcon,
+                                allowGenericPerInstanceFallback: false),
                         IconBytesLoadTimeout);
                 if (loadResult.Status == BoundedBackgroundWorkStatus.Completed)
                 {
@@ -1226,6 +1395,7 @@ public static class IconHelper
 
             if (bytes is { Length: > 0 })
             {
+                bytes = CompressBmpPayloadToPngIfPossible(bytes);
                 StoreCachedIconBytes(iconBytesCacheKey, bytes);
                 EvictIconCachesIfNeeded();
             }
@@ -1244,6 +1414,7 @@ public static class IconHelper
                 bytes = await TryLoadFileShellItemIconAsync(loadIconSource.Path);
                 if (bytes is { Length: > 0 })
                 {
+                    bytes = CompressBmpPayloadToPngIfPossible(bytes);
                     StoreCachedIconBytes(iconBytesCacheKey, bytes);
                     EvictIconCachesIfNeeded();
                     App.LogVerbose(
@@ -1272,6 +1443,7 @@ public static class IconHelper
 
                 if (bytes is { Length: > 0 })
                 {
+                    bytes = CompressBmpPayloadToPngIfPossible(bytes);
                     StoreCachedIconBytes(iconBytesCacheKey, bytes);
                     EvictIconCachesIfNeeded();
                     App.LogVerbose(
@@ -1279,6 +1451,15 @@ public static class IconHelper
                         $"path={originalSourcePath}");
                 }
             }
+        }
+
+        if (bytes is { Length: > 0 })
+        {
+            bytes = CompressBmpPayloadToPngIfPossible(bytes);
+            UpdateDecodedBitmapEstimatedBytes(
+                bitmapCacheKey,
+                decodePixelWidth,
+                bytes.Length);
         }
 
         // Decode near the intended display size. This keeps large icons sharp while
@@ -1296,14 +1477,17 @@ public static class IconHelper
 
     private static async Task<byte[]?> TryLoadHighResolutionShellItemIconAsync(
         string path,
-        bool includeOverlays = false)
+        bool includeOverlays = false,
+        int requestedSize = PreferredShellItemIconSize)
     {
         await s_shellIconLoadSemaphore.WaitAsync();
         try
         {
             return await ShellThumbnailProxy.TryLoadIconAsync(
                 path,
-                requestedSize: PreferredShellItemIconSize,
+                requestedSize: requestedSize > 0
+                    ? requestedSize
+                    : PreferredShellItemIconSize,
                 includeOverlays: includeOverlays);
         }
         finally
@@ -1322,12 +1506,18 @@ public static class IconHelper
     /// the frame sizes such an icon can fill so it keeps the same framing as
     /// every other tile. Failing that, fall back to the cropped artwork.
     /// </summary>
-    private static async Task<byte[]?> TryLoadFileShellItemIconAsync(string path)
+    private static async Task<byte[]?> TryLoadFileShellItemIconAsync(
+        string path,
+        int requestedSize = PreferredShellItemIconSize)
     {
+        int effectiveSize = requestedSize > 0
+            ? requestedSize
+            : PreferredShellItemIconSize;
         byte[]? bytes = await TryLoadRawShellItemIconAsync(
             path,
-            PreferredShellItemIconSize);
+            effectiveSize);
         if (bytes is not { Length: > 0 } ||
+            effectiveSize <= 48 ||
             !ShellThumbnailProxy.IsLikelyPaddedIconPayload(bytes))
         {
             return bytes;
@@ -1349,6 +1539,49 @@ public static class IconHelper
         }
 
         return ShellThumbnailProxy.NormalizeIconPayload(bytes) ?? bytes;
+    }
+
+    private static async Task<byte[]> RecoverPaddedShellItemIconAsync(
+        string path,
+        byte[] paddedBytes)
+    {
+        foreach (int frameSize in s_shellItemIconNativeFrameSizes)
+        {
+            byte[]? nativeFrame = await TryLoadRawShellItemIconAsync(
+                path,
+                frameSize);
+            if (nativeFrame is { Length: > 0 } &&
+                !ShellThumbnailProxy.IsLikelyPaddedIconPayload(nativeFrame))
+            {
+                return nativeFrame;
+            }
+        }
+
+        return ShellThumbnailProxy.NormalizeIconPayload(paddedBytes) ?? paddedBytes;
+    }
+
+    private static byte[]? TryReadDirectImageIconBytes(string imagePath)
+    {
+        const int MaxDirectImageIconBytes = 512 * 1024;
+        try
+        {
+            if (!File.Exists(imagePath))
+            {
+                return null;
+            }
+
+            var info = new FileInfo(imagePath);
+            if (info.Length is <= 0 or > MaxDirectImageIconBytes)
+            {
+                return null;
+            }
+
+            return File.ReadAllBytes(imagePath);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static async Task<byte[]?> TryLoadRawShellItemIconAsync(
@@ -1465,7 +1698,16 @@ public static class IconHelper
 
     private static byte[]? LoadIconBytes(
         IconSource iconSource,
-        bool rejectPaddedShortcutIcon = false)
+        bool rejectPaddedShortcutIcon = false) =>
+        LoadIconBytes(
+            iconSource,
+            rejectPaddedShortcutIcon,
+            allowGenericPerInstanceFallback: true);
+
+    private static byte[]? LoadIconBytes(
+        IconSource iconSource,
+        bool rejectPaddedShortcutIcon,
+        bool allowGenericPerInstanceFallback)
     {
         using var perfScope = PerformanceLogger.Measure("IconHelper.LoadIconBytes", $"path={iconSource.Path}");
         try
@@ -1479,24 +1721,48 @@ public static class IconHelper
                 {
                     return indexedBytes;
                 }
+
+                if (!allowGenericPerInstanceFallback)
+                {
+                    return null;
+                }
             }
 
             // Shell's Jumbo image list can contain a 32/48 px icon that has already
             // been enlarged to 256 px. Explorer can still render the same executable
             // crisply because it extracts the best resource frame directly. Do that
-            // first for executable-backed items (including resolved shortcuts), then
-            // retain the image-list path as a compatibility fallback.
-            if (Path.GetExtension(iconSource.Path).Equals(".exe", StringComparison.OrdinalIgnoreCase))
+            // first for executable/icon-backed items (including resolved shortcuts),
+            // then retain the image-list path as a compatibility fallback.
+            string extension = Path.GetExtension(iconSource.Path);
+            if (extension.Equals(".exe", StringComparison.OrdinalIgnoreCase) ||
+                extension.Equals(".scr", StringComparison.OrdinalIgnoreCase) ||
+                extension.Equals(".ico", StringComparison.OrdinalIgnoreCase))
             {
-                byte[]? executableBytes = TryExtractHighResIndexedIcon(
-                    iconSource.Path,
-                    iconSource.IconIndex,
-                    256,
+                int resourceIndex = iconSource.UsesExplicitIconIndex
+                    ? iconSource.IconIndex
+                    : 0;
+                byte[]? executableBytes = LoadIndexedIconBytes(
+                    iconSource with { IconIndex = resourceIndex },
                     rejectPaddedShortcutIcon);
                 if (executableBytes is not null)
                 {
                     return executableBytes;
                 }
+            }
+
+            bool isExistingDirectory = Directory.Exists(iconSource.Path);
+            if (!allowGenericPerInstanceFallback &&
+                RequiresPerInstanceShellIcon(
+                    iconSource,
+                    extension,
+                    isExistingDirectory))
+            {
+                // Never fall back to SHGFI_USEFILEATTRIBUTES for per-instance
+                // Shell items (.lnk, .url, 0-byte AppExecutionAlias .exe,
+                // PIDL targets, or desktop.ini folders): Windows returns the
+                // generic blank white-sheet icon (imageres.dll,-2), which would
+                // poison the icon cache and stamp the freshness ledger.
+                return null;
             }
 
             // Get the system icon index, then extract the highest-resolution
@@ -1511,12 +1777,16 @@ public static class IconHelper
             // handler show the generic per-type icon in the proxy-fallback
             // window (the same degradation the pinned WIC decoder accepted).
             var shinfo = new ShellIconNativeMethods.SHFILEINFO();
+            const uint fileAttributeDirectory = 0x10;
             const uint fileAttributeNormal = 0x80;
+            uint fileAttributes = isExistingDirectory
+                ? fileAttributeDirectory
+                : fileAttributeNormal;
             IntPtr hImg = ShellIconNativeMethods.SHGetFileInfo(
                 iconSource.Path,
-                fileAttributeNormal,
+                fileAttributes,
                 ref shinfo,
-                (uint)Marshal.SizeOf(shinfo),
+                ShellIconNativeMethods.ShFileInfoSize,
                 ShellIconNativeMethods.SHGFI_SYSICONINDEX |
                 ShellIconNativeMethods.SHGFI_USEFILEATTRIBUTES);
 
@@ -1524,7 +1794,12 @@ public static class IconHelper
             {
                 // Fallback: registry-only direct large icon (same
                 // USEFILEATTRIBUTES stance as the index probe).
-                return GetFileTypeIconPngBytes(iconSource.Path);
+                return isExistingDirectory
+                    ? LoadIconBytesFromShGetFileInfo(
+                        iconSource.Path,
+                        rejectPaddedShortcutIcon,
+                        isExistingDirectory: true)
+                    : GetFileTypeIconPngBytes(iconSource.Path);
             }
 
             int iconIndex = shinfo.iIcon;
@@ -1552,13 +1827,45 @@ public static class IconHelper
             // Final fallback: Large (32×32) via ShellIconNativeMethods.SHGetFileInfo.
             return LoadIconBytesFromShGetFileInfo(
                 iconSource.Path,
-                rejectPaddedShortcutIcon);
+                rejectPaddedShortcutIcon,
+                isExistingDirectory);
         }
         catch (Exception ex)
         {
             App.Log($"[IconHelper] Failed to load icon for {iconSource.Path}: {ex.Message}");
             return null;
         }
+    }
+
+    private static bool RequiresPerInstanceShellIcon(
+        IconSource iconSource,
+        string extension,
+        bool isExistingDirectory)
+    {
+        if (iconSource.UsesShellItemIcon ||
+            ShortcutHelper.IsShortcutPath(iconSource.Path))
+        {
+            return true;
+        }
+
+        if (isExistingDirectory)
+        {
+            try
+            {
+                return File.Exists(Path.Combine(iconSource.Path, "desktop.ini"));
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        return extension.Equals(".exe", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".ico", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".scr", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".appref-ms", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".msc", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".cpl", StringComparison.OrdinalIgnoreCase);
     }
 
     private static byte[]? TryGetIconFromImageList(
@@ -1588,9 +1895,7 @@ public static class IconHelper
                 return null;
             }
 
-            using var icon = Icon.FromHandle(iconHandle);
-            using var bitmap = icon.ToBitmap();
-            return EncodeIconBitmapAsPng(bitmap, rejectPaddedShortcutIcon);
+            return EncodeIconHandleAsPng(iconHandle, rejectPaddedShortcutIcon);
         }
         catch
         {
@@ -1612,18 +1917,20 @@ public static class IconHelper
 
     private static byte[]? LoadIconBytesFromShGetFileInfo(
         string path,
-        bool rejectPaddedShortcutIcon = false)
+        bool rejectPaddedShortcutIcon = false,
+        bool isExistingDirectory = false)
     {
         // Deep review R18 (E-1): registry-only — the real-path form of this
         // query could invoke a third-party IconHandler in-process. See the
         // SYSICONINDEX probe above for the degradation trade-off.
+        const uint fileAttributeDirectory = 0x10;
         const uint fileAttributeNormal = 0x80;
         var shinfo = new ShellIconNativeMethods.SHFILEINFO();
         IntPtr hImg = ShellIconNativeMethods.SHGetFileInfo(
             path,
-            fileAttributeNormal,
+            isExistingDirectory ? fileAttributeDirectory : fileAttributeNormal,
             ref shinfo,
-            (uint)Marshal.SizeOf(shinfo),
+            ShellIconNativeMethods.ShFileInfoSize,
             ShellIconNativeMethods.SHGFI_ICON |
             ShellIconNativeMethods.SHGFI_LARGEICON |
             ShellIconNativeMethods.SHGFI_USEFILEATTRIBUTES);
@@ -1635,9 +1942,7 @@ public static class IconHelper
 
         try
         {
-            using var icon = Icon.FromHandle(shinfo.hIcon);
-            using var bitmap = icon.ToBitmap();
-            return EncodeIconBitmapAsPng(bitmap, rejectPaddedShortcutIcon: false);
+            return EncodeIconHandleAsPng(shinfo.hIcon, rejectPaddedShortcutIcon: false);
         }
         finally
         {
@@ -1659,7 +1964,7 @@ public static class IconHelper
             fileNameWithExtension,
             fileAttributeNormal,
             ref shinfo,
-            (uint)Marshal.SizeOf(shinfo),
+            ShellIconNativeMethods.ShFileInfoSize,
             ShellIconNativeMethods.SHGFI_ICON |
             ShellIconNativeMethods.SHGFI_LARGEICON |
             ShellIconNativeMethods.SHGFI_USEFILEATTRIBUTES);
@@ -1671,9 +1976,7 @@ public static class IconHelper
 
         try
         {
-            using var icon = Icon.FromHandle(shinfo.hIcon);
-            using var bitmap = icon.ToBitmap();
-            return EncodeIconBitmapAsPng(bitmap, rejectPaddedShortcutIcon: false);
+            return EncodeIconHandleAsPng(shinfo.hIcon, rejectPaddedShortcutIcon: false);
         }
         finally
         {
@@ -1685,6 +1988,11 @@ public static class IconHelper
         IconSource iconSource,
         bool rejectPaddedShortcutIcon = false)
     {
+        if (DeskBox.Platform.DriveMediaInterop.HasUnhydratedCloudAttributesOnDisk(iconSource.Path))
+        {
+            return null;
+        }
+
         // Try ShellIconNativeMethods.SHDefExtractIcon first — it can extract 256×256 icons from exe/dll/ico resources.
         byte[]? hiResBytes = TryExtractHighResIndexedIcon(
             iconSource.Path,
@@ -1708,29 +2016,27 @@ public static class IconHelper
         }
 
         // Final fallback: ShellIconNativeMethods.ExtractIconEx (32×32 large / 16×16 small)
-        var largeIcons = new IntPtr[1];
-        var smallIcons = new IntPtr[1];
-        uint count = ShellIconNativeMethods.ExtractIconEx(
-            iconSource.Path,
-            iconSource.IconIndex,
-            largeIcons,
-            smallIcons,
-            1);
-
-        IntPtr iconHandle = largeIcons[0] != IntPtr.Zero
-            ? largeIcons[0]
-            : smallIcons[0];
-
-        if (count == 0 || iconHandle == IntPtr.Zero)
-        {
-            return null;
-        }
-
+        Span<IntPtr> largeIcons = stackalloc IntPtr[1];
+        Span<IntPtr> smallIcons = stackalloc IntPtr[1];
         try
         {
-            using var icon = Icon.FromHandle(iconHandle);
-            using var bitmap = icon.ToBitmap();
-            return EncodeIconBitmapAsPng(bitmap, rejectPaddedShortcutIcon);
+            uint count = ShellIconNativeMethods.ExtractIconEx(
+                iconSource.Path,
+                iconSource.IconIndex,
+                largeIcons,
+                smallIcons,
+                1);
+
+            IntPtr iconHandle = largeIcons[0] != IntPtr.Zero
+                ? largeIcons[0]
+                : smallIcons[0];
+
+            if (count == 0 || iconHandle == IntPtr.Zero)
+            {
+                return null;
+            }
+
+            return EncodeIconHandleAsPng(iconHandle, rejectPaddedShortcutIcon);
         }
         finally
         {
@@ -1746,28 +2052,25 @@ public static class IconHelper
         }
     }
 
-    private static byte[]? TryExtractHighResIndexedIcon(
+    private static unsafe byte[]? TryExtractHighResIndexedIcon(
         string filePath,
         int iconIndex,
         int size,
         bool rejectPaddedShortcutIcon = false)
     {
         IntPtr hLarge = IntPtr.Zero;
-        IntPtr hSmall = IntPtr.Zero;
 
         try
         {
-            // nIconSize: high word = large icon size, low word = small icon size
-            uint nIconSize = ((uint)size << 16) | (uint)size;
-            int hr = ShellIconNativeMethods.SHDefExtractIcon(filePath, iconIndex, 0, out hLarge, out hSmall, nIconSize);
+            // SHDefExtractIconW nIconSize = MAKELPARAM(cxLarge, cxSmall): low word = large icon size.
+            uint nIconSize = (ushort)size;
+            int hr = ShellIconNativeMethods.SHDefExtractIcon(filePath, iconIndex, 0, out hLarge, null, nIconSize);
             if (hr != 0 || hLarge == IntPtr.Zero)
             {
                 return null;
             }
 
-            using var icon = Icon.FromHandle(hLarge);
-            using var bitmap = icon.ToBitmap();
-            return EncodeIconBitmapAsPng(bitmap, rejectPaddedShortcutIcon);
+            return EncodeIconHandleAsPng(hLarge, rejectPaddedShortcutIcon);
         }
         catch
         {
@@ -1778,11 +2081,6 @@ public static class IconHelper
             if (hLarge != IntPtr.Zero)
             {
                 ShellIconNativeMethods.DestroyIcon(hLarge);
-            }
-
-            if (hSmall != IntPtr.Zero && hSmall != hLarge)
-            {
-                ShellIconNativeMethods.DestroyIcon(hSmall);
             }
         }
     }
@@ -1810,6 +2108,11 @@ public static class IconHelper
         {
             return Task.FromResult<BitmapImage?>(null);
         }
+
+        // Transcode uncompressed 32bpp BMP/BMPv5 payloads to compact PNG off the
+        // UI thread before handing the stream to WinUI: CBitmapImage copies and
+        // retains the encoded source stream alongside the decoded surface.
+        bytes = CompressBmpPayloadToPngIfPossible(bytes);
 
         if (dispatcher.HasThreadAccess)
         {
@@ -1841,6 +2144,7 @@ public static class IconHelper
         var bmp = new BitmapImage();
         if (decodePixelWidth > 0)
         {
+            bmp.DecodePixelType = DecodePixelType.Physical;
             bmp.DecodePixelWidth = decodePixelWidth;
         }
 
@@ -1991,6 +2295,101 @@ public static class IconHelper
             $"overlay={(hideShortcutArrowOverlay ? "hidden" : "shown")}:" +
             sourceVersion);
 
+    private readonly record struct InternetShortcutLoadDecision(
+        bool UseShellProxyFirst,
+        IconSource? FallbackSource);
+
+    private static async Task<InternetShortcutLoadDecision>
+        DecideInternetShortcutLoadAsync(
+            string normalizedSourcePath,
+            bool hideShortcutArrowOverlay)
+    {
+        string timeoutKey = BuildInternetShortcutFallbackTimeoutKey(normalizedSourcePath);
+        if (IsRecentTimeout(s_iconSourceTimeouts, timeoutKey))
+        {
+            return new InternetShortcutLoadDecision(UseShellProxyFirst: true, FallbackSource: null);
+        }
+
+        BoundedBackgroundWorkResult<InternetShortcutLoadDecision> result =
+            await s_iconSourceScheduler.RunAsync(
+                () => EvaluateInternetShortcutLoadDecision(
+                    normalizedSourcePath,
+                    hideShortcutArrowOverlay),
+                IconSourceResolutionTimeout);
+        if (result.Status == BoundedBackgroundWorkStatus.Completed)
+        {
+            s_iconSourceTimeouts.TryRemove(timeoutKey, out _);
+            return result.Value;
+        }
+
+        if (result.Status == BoundedBackgroundWorkStatus.ExecutionTimedOut)
+        {
+            RecordTimeout(s_iconSourceTimeouts, timeoutKey);
+        }
+
+        return new InternetShortcutLoadDecision(UseShellProxyFirst: true, FallbackSource: null);
+    }
+
+    private static InternetShortcutLoadDecision EvaluateInternetShortcutLoadDecision(
+        string normalizedSourcePath,
+        bool hideShortcutArrowOverlay)
+    {
+        ShortcutInfo? shortcut = ShortcutHelper.ReadStoredMetadata(normalizedSourcePath);
+        if (shortcut is null)
+        {
+            return new InternetShortcutLoadDecision(UseShellProxyFirst: true, FallbackSource: null);
+        }
+
+        var (iconFilePath, iconFileIndex) = SplitIconLocation(shortcut.IconLocation);
+        string? iconLocation = NormalizeIconLocation(iconFilePath);
+        int resolvedIconIndex = iconFileIndex ?? shortcut.IconIndex;
+        if (!string.IsNullOrWhiteSpace(iconLocation) &&
+            TryResolveRelativeIconLocation(normalizedSourcePath, iconLocation, out string relativeIcon))
+        {
+            iconLocation = relativeIcon;
+        }
+
+        bool hasDeclaredIconLocation = !string.IsNullOrWhiteSpace(iconLocation);
+        bool declaredIconExists = hasDeclaredIconLocation && File.Exists(iconLocation);
+        if (declaredIconExists)
+        {
+            IconSource directSource = new(
+                iconLocation!,
+                resolvedIconIndex,
+                UsesExplicitIconIndex: true);
+
+            // When shortcut arrows are hidden, extracting directly from the
+            // verified .ico/.exe/.dll avoids spawning ThumbnailProxy, eliminates
+            // url.dll batch contention, and avoids Shell item canvas padding on
+            // 32/48 px Steam game icons inside a 96/256 px canvas.
+            return new InternetShortcutLoadDecision(
+                UseShellProxyFirst: !hideShortcutArrowOverlay,
+                FallbackSource: directSource);
+        }
+
+        bool isSteamShortcut = !string.IsNullOrWhiteSpace(shortcut.TargetPath) &&
+            shortcut.TargetPath.StartsWith("steam://", StringComparison.OrdinalIgnoreCase);
+
+        // Whenever a .url declares an IconFile that no longer exists on disk, or
+        // is a steam:// game shortcut without an IconFile, Windows url.dll returns
+        // S_OK with the generic url.dll,5 blue globe bitmap — poisoning the cache.
+        // Resolve the real game/custom icon source before falling back to Shell.
+        if (hasDeclaredIconLocation || isSteamShortcut)
+        {
+            IconSource resolved = ResolveIconSource(
+                normalizedSourcePath,
+                hideShortcutArrowOverlay: true);
+            if (!ShortcutHelper.IsShortcutPath(resolved.Path))
+            {
+                return new InternetShortcutLoadDecision(
+                    UseShellProxyFirst: false,
+                    FallbackSource: resolved);
+            }
+        }
+
+        return new InternetShortcutLoadDecision(UseShellProxyFirst: true, FallbackSource: null);
+    }
+
     private static async Task<IconSource?>
         ResolveInternetShortcutFallbackSourceAsync(
             string normalizedSourcePath)
@@ -2100,23 +2499,48 @@ public static class IconHelper
         }
     }
 
-    private static byte[]? EncodeVisibleBitmapAsPng(Bitmap bitmap)
+    private static byte[]? EncodeIconHandleAsPng(
+        IntPtr iconHandle,
+        bool rejectPaddedShortcutIcon)
     {
-        if (!HasVisiblePixels(bitmap))
+        if (!IconPngEncoder.TryExtractIconBitmap(
+                iconHandle,
+                out IconPngEncoder.IconPixelBuffer bitmap))
         {
             return null;
         }
 
-        using var stream = new MemoryStream();
-        bitmap.Save(stream, System.Drawing.Imaging.ImageFormat.Png);
-        return stream.ToArray();
+        using (bitmap)
+        {
+            return EncodeIconBitmapAsPng(bitmap, rejectPaddedShortcutIcon);
+        }
+    }
+
+    private static byte[]? EncodeVisibleBitmapAsPng(IconPngEncoder.IconPixelBuffer bitmap)
+    {
+        if (!IconPngEncoder.HasVisiblePixels(bitmap))
+        {
+            return null;
+        }
+
+        return IconPngEncoder.EncodeRegionAsPng(
+            bitmap,
+            0,
+            0,
+            bitmap.Width,
+            bitmap.Height);
     }
 
     private static byte[]? EncodeVisibleBitmapAsPng(
-        Bitmap bitmap,
+        IconPngEncoder.IconPixelBuffer bitmap,
         bool rejectPaddedShortcutIcon)
     {
-        if (!TryGetVisibleBounds(bitmap, out Rectangle visibleBounds))
+        if (!IconPngEncoder.TryGetVisibleBounds(
+                bitmap,
+                out int minX,
+                out int minY,
+                out int visibleWidth,
+                out int visibleHeight))
         {
             return null;
         }
@@ -2125,175 +2549,27 @@ public static class IconHelper
             IconBitmapQuality.IsLikelyPadded(
                 bitmap.Width,
                 bitmap.Height,
-                visibleBounds.Width,
-                visibleBounds.Height))
+                visibleWidth,
+                visibleHeight))
         {
-            using var cropped = bitmap.Clone(
-                visibleBounds,
-                System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-            return EncodeVisibleBitmapAsPng(cropped);
+            return IconPngEncoder.EncodeRegionAsPng(
+                bitmap,
+                minX,
+                minY,
+                visibleWidth,
+                visibleHeight);
         }
 
         return EncodeVisibleBitmapAsPng(bitmap);
     }
 
     private static byte[]? EncodeIconBitmapAsPng(
-        Bitmap bitmap,
+        IconPngEncoder.IconPixelBuffer bitmap,
         bool rejectPaddedShortcutIcon)
     {
         return rejectPaddedShortcutIcon
             ? EncodeVisibleBitmapAsPng(bitmap, rejectPaddedShortcutIcon: true)
             : EncodeVisibleBitmapAsPng(bitmap);
-    }
-
-    private static bool TryGetVisibleBounds(
-        Bitmap bitmap,
-        out Rectangle visibleBounds)
-    {
-        visibleBounds = Rectangle.Empty;
-        if (bitmap.Width <= 0 || bitmap.Height <= 0)
-        {
-            return false;
-        }
-
-        try
-        {
-            return TryGetVisibleBoundsWithLockBits(bitmap, out visibleBounds);
-        }
-        catch
-        {
-            // A few Shell icon handles expose an indexed or device-dependent
-            // pixel format that LockBits cannot convert directly. The fallback
-            // is used only for those rare formats and keeps the quality gate
-            // from turning a valid icon into a blank result.
-            return TryGetVisibleBoundsWithGetPixel(bitmap, out visibleBounds);
-        }
-    }
-
-    private static unsafe bool TryGetVisibleBoundsWithLockBits(
-        Bitmap bitmap,
-        out Rectangle visibleBounds)
-    {
-        visibleBounds = Rectangle.Empty;
-        var bounds = new Rectangle(0, 0, bitmap.Width, bitmap.Height);
-        System.Drawing.Imaging.BitmapData data = bitmap.LockBits(
-            bounds,
-            System.Drawing.Imaging.ImageLockMode.ReadOnly,
-            System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-        int minX = bitmap.Width;
-        int minY = bitmap.Height;
-        int maxX = -1;
-        int maxY = -1;
-        try
-        {
-            for (int y = 0; y < bitmap.Height; y++)
-            {
-                int stride = data.Stride;
-                int rowOffset = stride >= 0
-                    ? y * stride
-                    : (bitmap.Height - 1 - y) * -stride;
-                byte* row = (byte*)data.Scan0 + rowOffset;
-                for (int x = 0; x < bitmap.Width; x++)
-                {
-                    if (row[(x * 4) + 3] == 0)
-                    {
-                        continue;
-                    }
-
-                    minX = Math.Min(minX, x);
-                    maxX = Math.Max(maxX, x);
-                    minY = Math.Min(minY, y);
-                    maxY = Math.Max(maxY, y);
-                }
-            }
-        }
-        finally
-        {
-            bitmap.UnlockBits(data);
-        }
-
-        if (maxX < minX || maxY < minY)
-        {
-            return false;
-        }
-
-        visibleBounds = Rectangle.FromLTRB(
-            minX,
-            minY,
-            maxX + 1,
-            maxY + 1);
-        return true;
-    }
-
-    private static bool TryGetVisibleBoundsWithGetPixel(
-        Bitmap bitmap,
-        out Rectangle visibleBounds)
-    {
-        visibleBounds = Rectangle.Empty;
-        int minX = bitmap.Width;
-        int minY = bitmap.Height;
-        int maxX = -1;
-        int maxY = -1;
-        for (int y = 0; y < bitmap.Height; y++)
-        {
-            for (int x = 0; x < bitmap.Width; x++)
-            {
-                if (bitmap.GetPixel(x, y).A == 0)
-                {
-                    continue;
-                }
-
-                minX = Math.Min(minX, x);
-                maxX = Math.Max(maxX, x);
-                minY = Math.Min(minY, y);
-                maxY = Math.Max(maxY, y);
-            }
-        }
-
-        if (maxX < minX || maxY < minY)
-        {
-            return false;
-        }
-
-        visibleBounds = Rectangle.FromLTRB(
-            minX,
-            minY,
-            maxX + 1,
-            maxY + 1);
-        return true;
-    }
-
-    private static unsafe bool HasVisiblePixels(Bitmap bitmap)
-    {
-        var bounds = new Rectangle(0, 0, bitmap.Width, bitmap.Height);
-        System.Drawing.Imaging.BitmapData data = bitmap.LockBits(
-            bounds,
-            System.Drawing.Imaging.ImageLockMode.ReadOnly,
-            System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-        try
-        {
-            int stride = data.Stride;
-            for (int y = 0; y < bitmap.Height; y++)
-            {
-                int rowOffset = stride >= 0
-                    ? y * stride
-                    : (bitmap.Height - 1 - y) * -stride;
-                byte* row = (byte*)data.Scan0 + rowOffset;
-                for (int x = 0; x < bitmap.Width; x++)
-                {
-                    if (row[(x * 4) + 3] != 0)
-                    {
-                        return true;
-                    }
-                }
-            }
-
-            return false;
-        }
-        finally
-        {
-            bitmap.UnlockBits(data);
-        }
     }
 
     private static IconSource ResolveIconSource(string path, bool hideShortcutArrowOverlay)
@@ -2335,11 +2611,23 @@ public static class IconHelper
             return new IconSource(iconLocation, resolvedIconIndex, UsesExplicitIconIndex: true);
         }
 
-        // For Steam .url shortcuts, the IconFile may point to a steam.exe path
-        // that doesn't exist on this machine. Try to locate steam.exe via registry.
+        // For Steam .url shortcuts whose literal IconFile is missing or stale,
+        // resolve the actual game's .ico, installed executable, or librarycache
+        // square artwork before falling back to generic steam.exe.
         if (!string.IsNullOrWhiteSpace(shortcut.TargetPath) &&
             shortcut.TargetPath.StartsWith("steam://", StringComparison.OrdinalIgnoreCase))
         {
+            SteamResolvedIcon? steamIcon = SteamShortcutIconResolver.TryResolve(
+                shortcut.TargetPath,
+                iconLocation);
+            if (steamIcon is { Path.Length: > 0 })
+            {
+                return new IconSource(
+                    steamIcon.Value.Path,
+                    steamIcon.Value.IconIndex,
+                    UsesExplicitIconIndex: steamIcon.Value.UsesExplicitIconIndex);
+            }
+
             string? steamExe = TryFindSteamExecutable();
             if (steamExe is not null && File.Exists(steamExe))
             {
@@ -2363,6 +2651,44 @@ public static class IconHelper
             (File.Exists(shortcut.TargetPath) || Directory.Exists(shortcut.TargetPath)))
         {
             return new IconSource(shortcut.TargetPath);
+        }
+
+        if (ShortcutHelper.IsShellLinkPath(path) &&
+            ShellLinkVtableInterop.TryReadExpandedShortcutPaths(
+                path,
+                out string? expandedIconLocation,
+                out int expandedIconIndex,
+                out string? longTargetPath))
+        {
+            if (!string.IsNullOrWhiteSpace(expandedIconLocation))
+            {
+                var (expandedIconFile, inlineIndex) = SplitIconLocation(expandedIconLocation);
+                string? normalizedExpandedIcon = NormalizeIconLocation(expandedIconFile);
+                int effectiveIconIndex = inlineIndex ?? expandedIconIndex;
+                if (!string.IsNullOrWhiteSpace(normalizedExpandedIcon) &&
+                    TryResolveRelativeIconLocation(
+                        path,
+                        normalizedExpandedIcon,
+                        out string resolvedExpandedRelative))
+                {
+                    normalizedExpandedIcon = resolvedExpandedRelative;
+                }
+
+                if (!string.IsNullOrWhiteSpace(normalizedExpandedIcon) &&
+                    File.Exists(normalizedExpandedIcon))
+                {
+                    return new IconSource(
+                        normalizedExpandedIcon,
+                        effectiveIconIndex,
+                        UsesExplicitIconIndex: true);
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(longTargetPath) &&
+                (File.Exists(longTargetPath) || Directory.Exists(longTargetPath)))
+            {
+                return new IconSource(longTargetPath);
+            }
         }
 
         return new IconSource(path, UsesShellItemIcon: true);
@@ -2427,7 +2753,7 @@ public static class IconHelper
         }
 
         string indexPart = trimmed[(lastComma + 1)..].Trim();
-        if (int.TryParse(indexPart, out int index))
+        if (int.TryParse(indexPart, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int index))
         {
             return (trimmed[..lastComma].Trim().Trim('"'), index);
         }
@@ -2565,14 +2891,21 @@ public static class IconHelper
         if (lastComma > 0 && lastComma < trimmed.Length - 1)
         {
             string afterComma = trimmed[(lastComma + 1)..];
-            if (int.TryParse(afterComma, out _))
+            if (int.TryParse(afterComma, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out _))
             {
                 trimmed = trimmed[..lastComma];
             }
         }
 
         string expanded = Environment.ExpandEnvironmentVariables(trimmed);
-        return string.IsNullOrWhiteSpace(expanded) ? null : expanded;
+        if (string.IsNullOrWhiteSpace(expanded))
+        {
+            return null;
+        }
+
+        return !expanded.Contains("://", StringComparison.Ordinal)
+            ? expanded.Replace('/', '\\')
+            : expanded;
     }
 
     private static string BuildCacheKey(string sourcePath, IconSource iconSource)
@@ -2644,10 +2977,92 @@ public static class IconHelper
         }
     }
 
-    private static long EstimateDecodedBitmapBytes(int decodePixelWidth)
+    internal static long EstimateDecodedBitmapBytes(
+        int decodePixelWidth,
+        int encodedPayloadBytes = 0)
     {
         int width = decodePixelWidth <= 0 ? 256 : decodePixelWidth;
-        return (long)width * width * 4;
+        long decodedSurfaceBytes = (long)width * width * 4;
+        long retainedEncodedBytes = encodedPayloadBytes > 0
+            ? encodedPayloadBytes
+            : Math.Max(4096L, decodedSurfaceBytes / 8);
+        return decodedSurfaceBytes + retainedEncodedBytes;
+    }
+
+    private static void UpdateDecodedBitmapEstimatedBytes(
+        string cacheKey,
+        int decodePixelWidth,
+        int encodedPayloadBytes)
+    {
+        long updatedEstimate = EstimateDecodedBitmapBytes(
+            decodePixelWidth,
+            encodedPayloadBytes);
+        lock (s_bitmapCacheLock)
+        {
+            if (!s_bitmapImageCache.ContainsKey(cacheKey) ||
+                !s_bitmapEstimatedBytes.TryGetValue(cacheKey, out long previousEstimate))
+            {
+                return;
+            }
+
+            s_bitmapEstimatedBytes[cacheKey] = updatedEstimate;
+            s_totalBitmapEstimatedBytes += updatedEstimate - previousEstimate;
+            UpdateDecodedBitmapDiagnostics();
+        }
+    }
+
+    internal static void IndexIconBytesScopeKey(
+        string cacheScope,
+        string iconBytesCacheKey)
+    {
+        if (string.IsNullOrWhiteSpace(cacheScope) ||
+            string.IsNullOrWhiteSpace(iconBytesCacheKey))
+        {
+            return;
+        }
+
+        string normalizedScope = cacheScope.Trim();
+        lock (s_bitmapCacheLock)
+        {
+            if (!s_iconByteKeysByScope.TryGetValue(normalizedScope, out HashSet<string>? keys))
+            {
+                keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                s_iconByteKeysByScope[normalizedScope] = keys;
+            }
+
+            keys.Add(iconBytesCacheKey);
+
+            if (!s_scopesByIconByteKey.TryGetValue(iconBytesCacheKey, out HashSet<string>? scopes))
+            {
+                scopes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                s_scopesByIconByteKey[iconBytesCacheKey] = scopes;
+            }
+
+            scopes.Add(normalizedScope);
+        }
+    }
+
+    private static void UnindexIconByteKeyAllScopes(string iconBytesCacheKey)
+    {
+        lock (s_bitmapCacheLock)
+        {
+            if (!s_scopesByIconByteKey.Remove(iconBytesCacheKey, out HashSet<string>? scopes))
+            {
+                return;
+            }
+
+            foreach (string scope in scopes)
+            {
+                if (s_iconByteKeysByScope.TryGetValue(scope, out HashSet<string>? keys))
+                {
+                    keys.Remove(iconBytesCacheKey);
+                    if (keys.Count == 0)
+                    {
+                        s_iconByteKeysByScope.Remove(scope);
+                    }
+                }
+            }
+        }
     }
 
     private static void TrackDecodedBitmap(string cacheKey, long estimatedBytes)
@@ -2669,6 +3084,7 @@ public static class IconHelper
             {
                 var node = s_bitmapLru.AddFirst(cacheKey);
                 s_bitmapLruNodes[cacheKey] = node;
+                IndexBitmapScopeKey(cacheKey);
                 s_bitmapEstimatedBytes[cacheKey] = estimatedBytes;
                 s_totalBitmapEstimatedBytes += estimatedBytes;
             }
@@ -2685,16 +3101,7 @@ public static class IconHelper
                     break;
                 }
 
-                string oldestKey = oldestNode.Value;
-                s_bitmapLru.Remove(oldestNode);
-                s_bitmapLruNodes.Remove(oldestKey);
-                s_bitmapLastAccess.Remove(oldestKey);
-                if (s_bitmapEstimatedBytes.Remove(oldestKey, out long removedBytes))
-                {
-                    s_totalBitmapEstimatedBytes -= removedBytes;
-                }
-
-                s_bitmapImageCache.TryRemove(oldestKey, out _);
+                RemoveDecodedBitmapCore(oldestNode.Value);
             }
 
             UpdateDecodedBitmapDiagnostics();
@@ -2705,19 +3112,150 @@ public static class IconHelper
     {
         lock (s_bitmapCacheLock)
         {
-            s_bitmapImageCache.TryRemove(cacheKey, out _);
-            if (s_bitmapLruNodes.Remove(cacheKey, out var node))
-            {
-                s_bitmapLru.Remove(node);
-            }
-
-            s_bitmapLastAccess.Remove(cacheKey);
-            if (s_bitmapEstimatedBytes.Remove(cacheKey, out long removedBytes))
-            {
-                s_totalBitmapEstimatedBytes -= removedBytes;
-            }
-
+            RemoveDecodedBitmapCore(cacheKey);
             UpdateDecodedBitmapDiagnostics();
+        }
+    }
+
+    private static void RemoveDecodedBitmapCore(string cacheKey)
+    {
+        s_bitmapImageCache.TryRemove(cacheKey, out _);
+        UnindexBitmapScopeKey(cacheKey);
+        if (s_bitmapLruNodes.Remove(cacheKey, out var node))
+        {
+            s_bitmapLru.Remove(node);
+        }
+
+        s_bitmapLastAccess.Remove(cacheKey);
+        if (s_bitmapEstimatedBytes.Remove(cacheKey, out long removedBytes))
+        {
+            s_totalBitmapEstimatedBytes -= removedBytes;
+        }
+    }
+
+    private static void IndexBitmapScopeKey(string cacheKey)
+    {
+        if (!TryExtractBitmapScope(cacheKey, out string scope))
+        {
+            return;
+        }
+
+        if (!s_bitmapKeysByScope.TryGetValue(scope, out HashSet<string>? keys))
+        {
+            keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            s_bitmapKeysByScope[scope] = keys;
+        }
+
+        keys.Add(cacheKey);
+    }
+
+    private static void UnindexBitmapScopeKey(string cacheKey)
+    {
+        if (!TryExtractBitmapScope(cacheKey, out string scope) ||
+            !s_bitmapKeysByScope.TryGetValue(scope, out HashSet<string>? keys))
+        {
+            return;
+        }
+
+        keys.Remove(cacheKey);
+        if (keys.Count == 0)
+        {
+            s_bitmapKeysByScope.Remove(scope);
+        }
+    }
+
+    private static bool TryExtractBitmapScope(string cacheKey, out string scope)
+    {
+        int pipeIndex = cacheKey.IndexOf('|');
+        if (pipeIndex > 0)
+        {
+            scope = cacheKey[..pipeIndex];
+            return true;
+        }
+
+        scope = string.Empty;
+        return false;
+    }
+
+    private static void IndexThumbnailScopeKey(string cacheKey)
+    {
+        if (!TryExtractThumbnailScope(cacheKey, out string scope))
+        {
+            return;
+        }
+
+        if (!s_thumbKeysByScope.TryGetValue(scope, out HashSet<string>? keys))
+        {
+            keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            s_thumbKeysByScope[scope] = keys;
+        }
+
+        keys.Add(cacheKey);
+    }
+
+    private static void UnindexThumbnailScopeKey(string cacheKey)
+    {
+        if (!TryExtractThumbnailScope(cacheKey, out string scope) ||
+            !s_thumbKeysByScope.TryGetValue(scope, out HashSet<string>? keys))
+        {
+            return;
+        }
+
+        keys.Remove(cacheKey);
+        if (keys.Count == 0)
+        {
+            s_thumbKeysByScope.Remove(scope);
+        }
+    }
+
+    private static bool TryExtractThumbnailScope(string cacheKey, out string scope)
+    {
+        int prefixLength = 0;
+        if (cacheKey.StartsWith("thumb:", StringComparison.OrdinalIgnoreCase))
+        {
+            prefixLength = 6;
+        }
+        else if (cacheKey.StartsWith("shell-thumb:", StringComparison.OrdinalIgnoreCase))
+        {
+            prefixLength = 12;
+        }
+
+        if (prefixLength > 0)
+        {
+            int pipeIndex = cacheKey.IndexOf('|', prefixLength);
+            if (pipeIndex > prefixLength)
+            {
+                scope = cacheKey[prefixLength..pipeIndex];
+                return true;
+            }
+        }
+
+        scope = string.Empty;
+        return false;
+    }
+
+    internal static void IndexThumbnailTaskForTest(
+        string cacheKey,
+        Task<BitmapImage?> task,
+        long estimatedBytes = 1024)
+    {
+        lock (s_thumbLock)
+        {
+            RemoveThumbnailCacheEntry(cacheKey);
+            s_thumbCache[cacheKey] = task;
+            IndexThumbnailScopeKey(cacheKey);
+            s_thumbEstimatedBytes[cacheKey] = estimatedBytes;
+            s_totalThumbnailEstimatedBytes += estimatedBytes;
+            TouchThumbnailLruLocked(cacheKey);
+            s_thumbLastAccess[cacheKey] = Stopwatch.GetTimestamp();
+        }
+    }
+
+    internal static bool HasThumbnailCacheEntryForTest(string cacheKey)
+    {
+        lock (s_thumbLock)
+        {
+            return s_thumbCache.ContainsKey(cacheKey);
         }
     }
 
@@ -2783,6 +3321,25 @@ public static class IconHelper
         long nowTimestamp = 0,
         TimeSpan? minimumAge = null)
     {
+        if (!coldOnly && targetCount <= 0 && targetBytes <= 0)
+        {
+            lock (s_iconBytesMutationLock)
+            {
+                s_iconBytesCache.Clear();
+                s_totalIconCacheBytes = 0;
+            }
+
+            s_iconBytesLastAccess.Clear();
+            lock (s_bitmapCacheLock)
+            {
+                s_iconByteKeysByScope.Clear();
+                s_scopesByIconByteKey.Clear();
+            }
+
+            PerformanceLogger.IconCacheCount = 0;
+            return;
+        }
+
         long cachedBytes = GetIconByteCacheSize();
         var candidates = s_iconBytesCache
             .Select(entry => (
@@ -2820,7 +3377,7 @@ public static class IconHelper
     }
 
     private static long GetIconByteCacheSize() =>
-        s_iconBytesCache.Values.Sum(bytes => bytes?.LongLength ?? 0);
+        Math.Max(0, Volatile.Read(ref s_totalIconCacheBytes));
 
     private static bool TryGetCachedIconBytes(
         string cacheKey,
@@ -2843,18 +3400,57 @@ public static class IconHelper
         }
     }
 
-    private static void StoreCachedIconBytes(string cacheKey, byte[] bytes)
+    internal static void StoreCachedIconBytes(string cacheKey, byte[] bytes)
     {
-        s_iconBytesCache[cacheKey] = bytes;
+        bytes = CompressBmpPayloadToPngIfPossible(bytes);
+
+        // If a non-BMP or uncompressible payload still reaches the Large Object
+        // Heap (>= 85,000 bytes), skip pinning per-path LOH byte arrays in
+        // s_iconBytesCache while keeping compact shared "ext:" icons.
+        if (bytes.Length >= MaxNonSharedIconBytePayloadLength &&
+            !cacheKey.StartsWith("ext:", StringComparison.OrdinalIgnoreCase))
+        {
+            UnindexIconByteKeyAllScopes(cacheKey);
+            return;
+        }
+
+        lock (s_iconBytesMutationLock)
+        {
+            long prevLen = s_iconBytesCache.TryGetValue(cacheKey, out byte[]? existing)
+                ? (existing?.LongLength ?? 0)
+                : 0;
+            s_iconBytesCache[cacheKey] = bytes;
+            s_totalIconCacheBytes += bytes.LongLength - prevLen;
+        }
+
         s_iconBytesLastAccess[cacheKey] = Stopwatch.GetTimestamp();
     }
+
+    internal static byte[]? GetCachedIconBytesForTest(string cacheKey) =>
+        s_iconBytesCache.TryGetValue(cacheKey, out byte[]? bytes) ? bytes : null;
+
+    internal static bool HasCachedIconBytesForTest(string cacheKey) =>
+        s_iconBytesCache.ContainsKey(cacheKey);
+
+    internal static void RemoveCachedIconBytesForTest(string cacheKey) =>
+        RemoveCachedIconBytes(cacheKey, out _);
 
     private static bool RemoveCachedIconBytes(
         string cacheKey,
         out byte[]? bytes)
     {
-        bool removed = s_iconBytesCache.TryRemove(cacheKey, out bytes);
+        bool removed;
+        lock (s_iconBytesMutationLock)
+        {
+            removed = s_iconBytesCache.TryRemove(cacheKey, out bytes);
+            if (removed)
+            {
+                s_totalIconCacheBytes -= bytes?.LongLength ?? 0;
+            }
+        }
+
         s_iconBytesLastAccess.TryRemove(cacheKey, out _);
+        UnindexIconByteKeyAllScopes(cacheKey);
         return removed;
     }
 

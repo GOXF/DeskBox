@@ -1,5 +1,5 @@
 using DeskBox.Services;
-using H.NotifyIcon.Core;
+using DeskBox.Platform;
 
 namespace DeskBox;
 
@@ -87,28 +87,9 @@ public partial class App
             return;
         }
 
-        if (_trayIcon is null)
+        if (TryShowTrayBalloonNotification(title, message, TrayBalloonIconKind.Info, largeIcon: true))
         {
-            return;
-        }
-
-        try
-        {
-            _trayIcon.ShowNotification(
-                title,
-                message,
-                NotificationIcon.Info,
-                customIconHandle: null,
-                largeIcon: true,
-                sound: false,
-                respectQuietTime: true,
-                realtime: false,
-                timeout: TimeSpan.FromSeconds(8));
             _forkDevUpdateNotifiedSha = info.RemoteSha;
-        }
-        catch (Exception ex)
-        {
-            Log($"[DevUpdate] Tray notification failed: {ex.Message}");
         }
     }
 }
